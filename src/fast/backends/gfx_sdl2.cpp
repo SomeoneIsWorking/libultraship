@@ -747,6 +747,35 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
     }
 
     SyncFramerateWithTime();
+
+    // --- SoH3D headless frame dump (oracle/verification tool) ---
+    // Inert unless SOH_FRAMEDUMP=<path.ppm> is set. Dumps the final window
+    // framebuffer at frame SOH_FRAMEDUMP_FRAME (default 300) then exits, so we
+    // can capture renders headlessly (Xvfb GL content isn't grabbable via X).
+    {
+        static const char* dumpPath = getenv("SOH_FRAMEDUMP");
+        if (dumpPath != nullptr) {
+            static long targetFrame =
+                getenv("SOH_FRAMEDUMP_FRAME") ? atol(getenv("SOH_FRAMEDUMP_FRAME")) : 300;
+            static long frame = 0;
+            if (++frame == targetFrame) {
+                int w = 0, h = 0;
+                SDL_GL_GetDrawableSize(mWnd, &w, &h);
+                std::vector<uint8_t> px((size_t)w * h * 4);
+                glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                FILE* f = fopen(dumpPath, "wb");
+                if (f) {
+                    fprintf(f, "P6\n%d %d\n255\n", w, h);
+                    for (int y = h - 1; y >= 0; --y) // GL is bottom-up; flip vertically
+                        for (int x = 0; x < w; ++x)
+                            fwrite(&px[((size_t)y * w + x) * 4], 1, 3, f);
+                    fclose(f);
+                }
+                exit(0);
+            }
+        }
+    }
+
     SDL_GL_SwapWindow(mWnd);
 }
 
