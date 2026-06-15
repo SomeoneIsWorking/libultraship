@@ -25,6 +25,7 @@
 // It links the generated soh3d_kibako_model.c directly (raw Vtx[]/Gfx[]/tex
 // arrays, no ResourceManager needed for the geometry itself).
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -47,9 +48,36 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 
-// The generated model under test (raw C arrays). Declared extern; linked in.
+// The generated models under test (raw C arrays). Declared extern; linked in.
+// Each is gated by a HAVE_* define from CMake (only the .c files that exist are
+// compiled into the harness, since they are ROM-derived / gitignored).
 extern "C" {
+#ifdef HAVE_KIBAKO
 extern Gfx soh3d_kibako_model_dl[];
+#endif
+#ifdef HAVE_POT
+extern Gfx soh3d_pot_model_dl[];
+#endif
+#ifdef HAVE_GS
+extern Gfx soh3d_gs_model_dl[];
+#endif
+}
+
+// name -> model dlist, for --model selection. Only entries whose .c was linked.
+static Gfx* SelectModel(const std::string& name) {
+#ifdef HAVE_KIBAKO
+    if (name == "kibako")
+        return soh3d_kibako_model_dl;
+#endif
+#ifdef HAVE_POT
+    if (name == "pot")
+        return soh3d_pot_model_dl;
+#endif
+#ifdef HAVE_GS
+    if (name == "gs")
+        return soh3d_gs_model_dl;
+#endif
+    return nullptr;
 }
 
 namespace Fast {
@@ -383,11 +411,11 @@ struct BuiltDlist {
     std::unordered_map<Mtx*, MtxF> mtxReplacements;
 };
 
-static void BuildDlist(BuiltDlist& b) {
+static void BuildDlist(BuiltDlist& b, Gfx* modelDl) {
     // Copy the model dlist into a mutable buffer (up to and including G_ENDDL).
     for (int i = 0;; i++) {
-        b.model.push_back(soh3d_kibako_model_dl[i]);
-        if ((uint8_t)(soh3d_kibako_model_dl[i].words.w0 >> 24) == 0xDF) // G_ENDDL
+        b.model.push_back(modelDl[i]);
+        if ((uint8_t)(modelDl[i].words.w0 >> 24) == 0xDF) // G_ENDDL
             break;
     }
 
@@ -417,18 +445,60 @@ static void BuildDlist(BuiltDlist& b) {
         b.model[i].words.w1 = (uintptr_t)hi;
     }
 
-    // Identity projection; modelview maps the model (x:[-300,300] y:[0,480] z~240)
-    // into NDC [-1,1]. Convention (GfxSpVertex): clip_j = sum_k ob[k]*MP[k][j] +
-    // MP[3][j], so translation lives in row [3][*].
+    // Auto-fit: scan the model's G_VTX commands for the vertex bbox, then build a
+    // modelview that centres + uniformly scales the model into NDC. This avoids
+    // per-model magic constants and works for any model (crate/pot/gs/...).
+    // F3DEX2 vertex load: opcode G_VTX (0x01 under F3DEX_GBI_2; verified by dumping
+    // the generated dlist — index 12 is op 0x01, n=30 for the 30-vertex crate).
+    // n = (w0>>12)&0xFF vertices at w1; each Vtx is 16 bytes, int16 ob[3] at offset 0.
+    float minp[3] = { 1e30f, 1e30f, 1e30f }, maxp[3] = { -1e30f, -1e30f, -1e30f };
+    size_t nverts = 0;
+    for (const Gfx& g : b.model) {
+        if ((uint8_t)(g.words.w0 >> 24) != G_VTX) // 0x01
+            continue;
+        uint32_t n = (g.words.w0 >> 12) & 0xFF;
+        const uint8_t* vp = (const uint8_t*)(uintptr_t)g.words.w1;
+        if (!vp)
+            continue;
+        for (uint32_t k = 0; k < n; k++) {
+            const int16_t* ob = (const int16_t*)(vp + (size_t)k * 16);
+            for (int c = 0; c < 3; c++) {
+                float v = (float)ob[c];
+                minp[c] = std::min(minp[c], v);
+                maxp[c] = std::max(maxp[c], v);
+            }
+            nverts++;
+        }
+    }
+    float cx = 0, cy = 0, cz = 0, halfXY = 1, halfZ = 1;
+    if (nverts) {
+        cx = (minp[0] + maxp[0]) * 0.5f;
+        cy = (minp[1] + maxp[1]) * 0.5f;
+        cz = (minp[2] + maxp[2]) * 0.5f;
+        halfXY = std::max(std::max(maxp[0] - minp[0], maxp[1] - minp[1]) * 0.5f, 1.0f);
+        halfZ = std::max((maxp[2] - minp[2]) * 0.5f, 1.0f);
+    }
+    printf("[HARNESS] model bbox: x[%.0f..%.0f] y[%.0f..%.0f] z[%.0f..%.0f] (%zu verts)\n", minp[0], maxp[0], minp[1],
+           maxp[1], minp[2], maxp[2], nverts);
+
+    // Identity projection; modelview centres the model and scales it to ~80% of NDC.
+    // Convention (GfxSpVertex): clip_j = sum_k ob[k]*MP[k][j] + MP[3][j], so the
+    // translation lives in row [3][*]. Uniform x/y scale preserves aspect (the
+    // 320x240 viewport maps to the 4:3 render target). z maps the model's depth
+    // span into ~[0.1,0.9] so nothing clips against the near/far planes.
+    const float fit = 0.8f / halfXY;
+    const float fitZ = 0.4f / halfZ;
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++)
             b.mtxReplacements[&b.projMtx].mf[i][j] = (i == j) ? 1.0f : 0.0f;
     MtxF& mv = b.mtxReplacements[&b.mvMtx];
     memset(mv.mf, 0, sizeof(mv.mf));
-    mv.mf[0][0] = 1.0f / 800.0f;
-    mv.mf[1][1] = 1.0f / 400.0f;
-    mv.mf[2][2] = 1.0f / 2000.0f;
-    mv.mf[3][1] = -240.0f / 400.0f;
+    mv.mf[0][0] = fit;
+    mv.mf[1][1] = fit;
+    mv.mf[2][2] = fitZ;
+    mv.mf[3][0] = -cx * fit;
+    mv.mf[3][1] = -cy * fit;
+    mv.mf[3][2] = 0.5f - cz * fitZ;
     mv.mf[3][3] = 1.0f;
 
     // Standard full-screen 320x240 native viewport (scale = half-dim*4).
@@ -463,8 +533,9 @@ static void BuildDlist(BuiltDlist& b) {
 
 int main(int argc, char** argv) {
     bool glMode = false;
-    std::string outPath = "scratch/render/kibako_lus.ppm";
+    std::string outPath; // default derived from model below
     std::string o2rArg;
+    std::string modelName = "kibako";
     uint32_t W = 640, H = 480;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -474,6 +545,8 @@ int main(int argc, char** argv) {
             outPath = argv[++i];
         else if (a == "--o2r" && i + 1 < argc)
             o2rArg = argv[++i];
+        else if (a == "--model" && i + 1 < argc)
+            modelName = argv[++i];
         else if (a == "--size" && i + 1 < argc) {
             unsigned w, h;
             if (sscanf(argv[++i], "%ux%u", &w, &h) == 2) {
@@ -481,6 +554,15 @@ int main(int argc, char** argv) {
                 H = h;
             }
         }
+    }
+    if (outPath.empty())
+        outPath = "scratch/render/" + modelName + "_lus.ppm";
+
+    Gfx* modelDl = SelectModel(modelName);
+    if (!modelDl) {
+        fprintf(stderr, "[HARNESS] unknown/unbuilt model '%s' (have: kibako/pot/gs if their .c was generated)\n",
+                modelName.c_str());
+        return 2;
     }
 
     auto* ctx = Ship::Context::CreateUninitializedInstance("soh3d_harness", "soh3d_harness", "");
@@ -518,9 +600,10 @@ int main(int argc, char** argv) {
     gfx->Init(wapi.get(), rapi, "soh3d_harness", false, W, H, 0, 0);
 
     BuiltDlist b;
-    BuildDlist(b);
+    BuildDlist(b, modelDl);
 
-    printf("[HARNESS] running crate dlist through LUS interpreter (%s, %ux%u)...\n", glMode ? "GL" : "recording", W, H);
+    printf("[HARNESS] running '%s' dlist through LUS interpreter (%s, %ux%u)...\n", modelName.c_str(),
+           glMode ? "GL" : "recording", W, H);
     fflush(stdout);
     gfx->StartFrame();
     gfx->Run(b.dl.data(), b.mtxReplacements);

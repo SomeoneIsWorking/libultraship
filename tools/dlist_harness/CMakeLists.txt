@@ -1,23 +1,34 @@
 # SoH3D dlist render harness — drives the Fast3D interpreter headlessly over a
 # generated CMB->F3DEX2 model dlist (see dlist_harness.cpp).
 #
-# The model under test is the generated (ROM-derived, gitignored) crate source in
-# soh/src/soh3d. It is compiled directly into the harness (raw Vtx/Gfx/tex arrays,
-# no ResourceManager).
+# The models under test are the generated (ROM-derived, gitignored) sources in
+# soh/src/soh3d. Each is compiled directly into the harness (raw Vtx/Gfx/tex
+# arrays, no ResourceManager). Whichever ones exist are linked and exposed via
+# --model <name>; the harness needs at least one.
 
 set(SOH3D_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../soh/src/soh3d")
-set(SOH3D_MODEL_SRC "${SOH3D_DIR}/soh3d_kibako_model.c")
 
-if(NOT EXISTS "${SOH3D_MODEL_SRC}")
-    message(WARNING "soh3d_dlist_harness: ${SOH3D_MODEL_SRC} not found — "
+set(SOH3D_MODEL_SRCS "")
+set(SOH3D_MODEL_DEFS "")
+foreach(m kibako pot gs)
+    if(EXISTS "${SOH3D_DIR}/soh3d_${m}_model.c")
+        list(APPEND SOH3D_MODEL_SRCS "${SOH3D_DIR}/soh3d_${m}_model.c")
+        string(TOUPPER "${m}" M_UP)
+        list(APPEND SOH3D_MODEL_DEFS "HAVE_${M_UP}")
+    endif()
+endforeach()
+
+if(NOT SOH3D_MODEL_SRCS)
+    message(WARNING "soh3d_dlist_harness: no soh3d_*_model.c found in ${SOH3D_DIR} — "
                     "regenerate with tools/cmb_to_c.py. Skipping harness target.")
     return()
 endif()
 
 add_executable(soh3d_dlist_harness
     dlist_harness.cpp
-    "${SOH3D_MODEL_SRC}"
+    ${SOH3D_MODEL_SRCS}
 )
+target_compile_definitions(soh3d_dlist_harness PRIVATE ${SOH3D_MODEL_DEFS})
 
 target_include_directories(soh3d_dlist_harness PRIVATE "${SOH3D_DIR}")
 set_property(TARGET soh3d_dlist_harness PROPERTY CXX_STANDARD 20)
