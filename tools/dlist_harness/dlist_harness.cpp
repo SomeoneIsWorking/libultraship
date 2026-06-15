@@ -50,6 +50,7 @@
 #include "asset/ctr_rom.h"
 #include "asset/zar.h"
 #include "asset/cmb.h"
+#include "asset/csab.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -600,8 +601,28 @@ static bool BuildSoH3DDlist(BuiltDlist& b, const std::string& zarPath, int model
     if (!cf) { fprintf(stderr, "[HARNESS] no .cmb in %s\n", zarPath.c_str()); return false; }
     SoH3D::Cmb cmb(zar.read(*cf));
     if (!cmb.ok()) { fprintf(stderr, "[HARNESS] Cmb: %s\n", cmb.error().c_str()); return false; }
+    // Auto-fit bbox from the SKINNED groups when an anim is requested (same env the
+    // provider reads), so a deformed pose isn't clipped by a bind-pose-sized fit.
+    std::vector<SoH3D::CmbDrawGroup> bboxGroups;
+    const char* animEnv = getenv("SOH3D_ANIM");
+    if (animEnv && *animEnv) {
+        std::string an(animEnv);
+        std::string full = (an.rfind("Anim/", 0) == 0) ? an : ("Anim/" + an + ".csab");
+        const SoH3D::ZarFile* af = nullptr;
+        for (const auto& f : zar.files()) if (f.name == full) { af = &f; break; }
+        if (af) {
+            SoH3D::Csab anim(zar.read(*af));
+            float frame = getenv("SOH3D_FRAME") ? (float)atof(getenv("SOH3D_FRAME")) : 0.0f;
+            if (anim.ok()) {
+                std::vector<std::array<float, 16>> sm;
+                anim.skinMatrices(cmb, frame, sm);
+                bboxGroups = cmb.buildDrawGroupsSkinned(sm.data(), sm.size());
+            }
+        }
+    }
+    if (bboxGroups.empty()) bboxGroups = cmb.buildDrawGroups();
     float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
-    for (const auto& g : cmb.buildDrawGroups())
+    for (const auto& g : bboxGroups)
         for (const auto& v : g.verts)
             for (int k = 0; k < 3; k++) { lo[k] = std::min(lo[k], v.pos[k]); hi[k] = std::max(hi[k], v.pos[k]); }
     float ctr[3], ext[3];
