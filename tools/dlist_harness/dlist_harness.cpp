@@ -64,6 +64,9 @@ extern Gfx soh3d_gs_model_dl[];
 #ifdef HAVE_HINTSTONE
 extern Gfx soh3d_hintstone_model_dl[];
 #endif
+#ifdef HAVE_GELDWOMAN
+extern Gfx soh3d_geldwoman_model_dl[];
+#endif
 }
 
 // name -> model dlist, for --model selection. Only entries whose .c was linked.
@@ -83,6 +86,10 @@ static Gfx* SelectModel(const std::string& name) {
 #ifdef HAVE_HINTSTONE
     if (name == "hintstone")
         return soh3d_hintstone_model_dl;
+#endif
+#ifdef HAVE_GELDWOMAN
+    if (name == "geldwoman")
+        return soh3d_geldwoman_model_dl;
 #endif
     return nullptr;
 }
@@ -416,6 +423,7 @@ struct BuiltDlist {
     Vp vp{};                  // referenced by gsSPViewport (must outlive Run)
     Mtx projMtx{}, mvMtx{};   // mtx_replacement keys (addresses matter, contents unused)
     std::unordered_map<Mtx*, MtxF> mtxReplacements;
+    std::string view = "xy";  // screen plane: xy (front), zy (side), xz (top)
 };
 
 static void BuildDlist(BuiltDlist& b, Gfx* modelDl) {
@@ -437,10 +445,21 @@ static void BuildDlist(BuiltDlist& b, Gfx* modelDl) {
         if ((uint8_t)(b.model[i].words.w0 >> 24) != 0xFD) // G_SETTIMG
             continue;
         uint32_t siz = (b.model[i].words.w0 >> 19) & 0x3; // 0:4b 1:8b 2:16b 3:32b
+        // Texel count comes from the texture's LoadBlock, which cmb_to_c emits as
+        // EITHER the wide form (op 0x47, lrs in full w1) for >4096 texels OR the
+        // plain form (op 0xF3, lrs in w1 bits[23:12]) for <=4096. Search forward
+        // to this texture's load, stopping at the next G_SETTIMG.
         uint32_t texels = 0;
         for (size_t j = i + 1; j < b.model.size(); j++) {
-            if ((uint8_t)(b.model[j].words.w0 >> 24) == 0x47) { // LoadBlockWide
+            uint8_t op = (uint8_t)(b.model[j].words.w0 >> 24);
+            if (op == 0xFD) // next G_SETTIMG — this texture had no load (shouldn't happen)
+                break;
+            if (op == 0x47) { // G_LOADBLOCK_WIDE
                 texels = (uint32_t)(b.model[j].words.w1 & 0xFFFFFFFF) + 1;
+                break;
+            }
+            if (op == 0xF3) { // G_LOADBLOCK (plain): lrs = w1[23:12]
+                texels = ((uint32_t)(b.model[j].words.w1 >> 12) & 0xFFF) + 1;
                 break;
             }
         }
@@ -477,35 +496,41 @@ static void BuildDlist(BuiltDlist& b, Gfx* modelDl) {
             nverts++;
         }
     }
-    float cx = 0, cy = 0, cz = 0, halfXY = 1, halfZ = 1;
-    if (nverts) {
-        cx = (minp[0] + maxp[0]) * 0.5f;
-        cy = (minp[1] + maxp[1]) * 0.5f;
-        cz = (minp[2] + maxp[2]) * 0.5f;
-        halfXY = std::max(std::max(maxp[0] - minp[0], maxp[1] - minp[1]) * 0.5f, 1.0f);
-        halfZ = std::max((maxp[2] - minp[2]) * 0.5f, 1.0f);
-    }
+    float ctr[3] = { 0, 0, 0 }, ext[3] = { 1, 1, 1 };
+    if (nverts)
+        for (int c = 0; c < 3; c++) {
+            ctr[c] = (minp[c] + maxp[c]) * 0.5f;
+            ext[c] = std::max((maxp[c] - minp[c]) * 0.5f, 1.0f);
+        }
     printf("[HARNESS] model bbox: x[%.0f..%.0f] y[%.0f..%.0f] z[%.0f..%.0f] (%zu verts)\n", minp[0], maxp[0], minp[1],
            maxp[1], minp[2], maxp[2], nverts);
 
+    // Choose which model axis maps to screen-horizontal (aH), screen-vertical (aV)
+    // and depth (aD), per the --view plane. Default "xy" (look down -z) suits props
+    // authored +Y up; characters whose rest space faces along X want "zy" (look
+    // down +x) to see the front. The 3rd axis becomes depth.
+    int aH = 0, aV = 1, aD = 2; // xy
+    if (b.view == "zy") { aH = 2; aV = 1; aD = 0; }
+    else if (b.view == "xz") { aH = 0; aV = 2; aD = 1; }
+
     // Identity projection; modelview centres the model and scales it to ~80% of NDC.
     // Convention (GfxSpVertex): clip_j = sum_k ob[k]*MP[k][j] + MP[3][j], so the
-    // translation lives in row [3][*]. Uniform x/y scale preserves aspect (the
-    // 320x240 viewport maps to the 4:3 render target). z maps the model's depth
-    // span into ~[0.1,0.9] so nothing clips against the near/far planes.
-    const float fit = 0.8f / halfXY;
-    const float fitZ = 0.4f / halfZ;
+    // translation lives in row [3][*]. Uniform H/V scale preserves aspect (the
+    // 320x240 viewport maps to the 4:3 render target). The depth axis maps into
+    // ~[0.1,0.9] so nothing clips against the near/far planes.
+    const float fit = 0.8f / std::max(ext[aH], ext[aV]);
+    const float fitZ = 0.4f / ext[aD];
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++)
             b.mtxReplacements[&b.projMtx].mf[i][j] = (i == j) ? 1.0f : 0.0f;
     MtxF& mv = b.mtxReplacements[&b.mvMtx];
     memset(mv.mf, 0, sizeof(mv.mf));
-    mv.mf[0][0] = fit;
-    mv.mf[1][1] = fit;
-    mv.mf[2][2] = fitZ;
-    mv.mf[3][0] = -cx * fit;
-    mv.mf[3][1] = -cy * fit;
-    mv.mf[3][2] = 0.5f - cz * fitZ;
+    mv.mf[aH][0] = fit;
+    mv.mf[aV][1] = fit;
+    mv.mf[aD][2] = fitZ;
+    mv.mf[3][0] = -ctr[aH] * fit;
+    mv.mf[3][1] = -ctr[aV] * fit;
+    mv.mf[3][2] = 0.5f - ctr[aD] * fitZ;
     mv.mf[3][3] = 1.0f;
 
     // Standard full-screen 320x240 native viewport (scale = half-dim*4).
@@ -543,6 +568,7 @@ int main(int argc, char** argv) {
     std::string outPath; // default derived from model below
     std::string o2rArg;
     std::string modelName = "kibako";
+    std::string viewPlane = "xy";
     uint32_t W = 640, H = 480;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -554,6 +580,8 @@ int main(int argc, char** argv) {
             o2rArg = argv[++i];
         else if (a == "--model" && i + 1 < argc)
             modelName = argv[++i];
+        else if (a == "--view" && i + 1 < argc)
+            viewPlane = argv[++i];
         else if (a == "--size" && i + 1 < argc) {
             unsigned w, h;
             if (sscanf(argv[++i], "%ux%u", &w, &h) == 2) {
@@ -607,6 +635,7 @@ int main(int argc, char** argv) {
     gfx->Init(wapi.get(), rapi, "soh3d_harness", false, W, H, 0, 0);
 
     BuiltDlist b;
+    b.view = viewPlane;
     BuildDlist(b, modelDl);
 
     printf("[HARNESS] running '%s' dlist through LUS interpreter (%s, %ux%u)...\n", modelName.c_str(),
