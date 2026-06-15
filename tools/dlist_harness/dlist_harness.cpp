@@ -61,6 +61,9 @@ extern Gfx soh3d_pot_model_dl[];
 #ifdef HAVE_GS
 extern Gfx soh3d_gs_model_dl[];
 #endif
+#ifdef HAVE_HINTSTONE
+extern Gfx soh3d_hintstone_model_dl[];
+#endif
 }
 
 // name -> model dlist, for --model selection. Only entries whose .c was linked.
@@ -76,6 +79,10 @@ static Gfx* SelectModel(const std::string& name) {
 #ifdef HAVE_GS
     if (name == "gs")
         return soh3d_gs_model_dl;
+#endif
+#ifdef HAVE_HINTSTONE
+    if (name == "hintstone")
+        return soh3d_hintstone_model_dl;
 #endif
     return nullptr;
 }

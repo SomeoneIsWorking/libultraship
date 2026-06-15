@@ -10,7 +10,7 @@ set(SOH3D_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../soh/src/soh3d")
 
 set(SOH3D_MODEL_SRCS "")
 set(SOH3D_MODEL_DEFS "")
-foreach(m kibako pot gs)
+foreach(m kibako pot gs hintstone)
     if(EXISTS "${SOH3D_DIR}/soh3d_${m}_model.c")
         list(APPEND SOH3D_MODEL_SRCS "${SOH3D_DIR}/soh3d_${m}_model.c")
         string(TOUPPER "${m}" M_UP)
