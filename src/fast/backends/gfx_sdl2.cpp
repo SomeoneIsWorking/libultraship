@@ -737,6 +737,29 @@ void GfxWindowBackendSDL2::SyncFramerateWithTime() const {
     previous_time = t;
 }
 
+// SoH3D: on-demand frame-dump trigger, set by the interactive REPL in soh3d.c.
+// gSoh3dDumpPending=1 captures the current frame to gSoh3dDumpPath without exiting.
+extern "C" {
+char gSoh3dDumpPath[1024] = { 0 };
+volatile int gSoh3dDumpPending = 0;
+}
+
+// Write the current GL window framebuffer to a binary PPM (P6), flipped to top-down.
+static void Soh3dWritePpm(SDL_Window* wnd, const char* path) {
+    int w = 0, h = 0;
+    SDL_GL_GetDrawableSize(wnd, &w, &h);
+    std::vector<uint8_t> px((size_t)w * h * 4);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    FILE* f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P6\n%d %d\n255\n", w, h);
+        for (int y = h - 1; y >= 0; --y) // GL is bottom-up; flip vertically
+            for (int x = 0; x < w; ++x)
+                fwrite(&px[((size_t)y * w + x) * 4], 1, 3, f);
+        fclose(f);
+    }
+}
+
 void GfxWindowBackendSDL2::SwapBuffersBegin() {
     bool nextVsyncEnabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_VSYNC_ENABLED, 1);
 
@@ -759,21 +782,18 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
                 getenv("SOH_FRAMEDUMP_FRAME") ? atol(getenv("SOH_FRAMEDUMP_FRAME")) : 300;
             static long frame = 0;
             if (++frame == targetFrame) {
-                int w = 0, h = 0;
-                SDL_GL_GetDrawableSize(mWnd, &w, &h);
-                std::vector<uint8_t> px((size_t)w * h * 4);
-                glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-                FILE* f = fopen(dumpPath, "wb");
-                if (f) {
-                    fprintf(f, "P6\n%d %d\n255\n", w, h);
-                    for (int y = h - 1; y >= 0; --y) // GL is bottom-up; flip vertically
-                        for (int x = 0; x < w; ++x)
-                            fwrite(&px[((size_t)y * w + x) * 4], 1, 3, f);
-                    fclose(f);
-                }
+                Soh3dWritePpm(mWnd, dumpPath);
                 exit(0);
             }
         }
+    }
+    // --- SoH3D on-demand frame dump (REPL) ---
+    // The interactive REPL (soh3d.c) sets gSoh3dDumpPath + gSoh3dDumpPending=1 to
+    // capture the CURRENT frame to an arbitrary path WITHOUT exiting, so a single
+    // long-lived instance can be poked and dumped repeatedly.
+    if (gSoh3dDumpPending) {
+        Soh3dWritePpm(mWnd, gSoh3dDumpPath);
+        gSoh3dDumpPending = 0;
     }
 
     SDL_GL_SwapWindow(mWnd);
