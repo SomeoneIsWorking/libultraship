@@ -177,6 +177,7 @@
 #define G_TEXRECT_WIDE 0x37
 #define G_FILLWIDERECT 0x38
 #define G_REGBLENDEDTEX 0x3f
+#define G_SOH3D_DRAW 0x41
 #define G_MOVEMEM_OTR 0x42
 #define G_LOADBLOCK_WIDE 0x47
 #define G_VTX_WIDE 0x48
@@ -2768,6 +2769,15 @@ typedef union Gfx {
         _g0->words.w1 = (uintptr_t)timg;                 \
         _g1->words.w0 = (uintptr_t)mask;                 \
         _g1->words.w1 = (uintptr_t)replc;                \
+    }
+
+// SoH3D direct-GL model draw: handle in w1, flat tint RGB packed in w0[0:24].
+#define gSPSoH3DDraw(pkt, handle, tintR, tintG, tintB)                                            \
+    {                                                                                             \
+        Gfx* _g = (Gfx*)(pkt);                                                                    \
+        _g->words.w0 = _SHIFTL(G_SOH3D_DRAW, 24, 8) |                                             \
+                       _SHIFTL(((tintR) & 0xFF) << 16 | ((tintG) & 0xFF) << 8 | ((tintB) & 0xFF), 0, 24); \
+        _g->words.w1 = (uintptr_t)(handle);                                                       \
     }
 
 #define gsSPSetFB(pkt, fb)                      \

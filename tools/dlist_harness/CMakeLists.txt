@@ -27,6 +27,11 @@ endif()
 add_executable(soh3d_dlist_harness
     dlist_harness.cpp
     ${SOH3D_MODEL_SRCS}
+    "${SOH3D_DIR}/asset/ctr_rom.cpp"
+    "${SOH3D_DIR}/asset/zar.cpp"
+    "${SOH3D_DIR}/asset/cmb.cpp"
+    "${SOH3D_DIR}/asset/pica_texture.cpp"
+    "${SOH3D_DIR}/soh3d_model.cpp"
 )
 target_compile_definitions(soh3d_dlist_harness PRIVATE ${SOH3D_MODEL_DEFS})
 

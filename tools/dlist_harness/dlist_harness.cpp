@@ -44,9 +44,18 @@
 #include <fast/backends/gfx_window_manager_api.h>
 #include <fast/backends/gfx_opengl.h> // GfxRenderingAPIOGL + GL prototypes (SDL_opengl.h on Linux)
 #include <libultraship/libultra/gbi.h>
+#include <fast/soh3d_gl.h> // SoH3D direct-GL renderer (the --soh3d path under test)
+
+// SoH3D runtime asset loader (pure C++; reads a model straight from the .3ds).
+#include "asset/ctr_rom.h"
+#include "asset/zar.h"
+#include "asset/cmb.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+
+// Provider + scale exposed by soh3d_model.cpp (compiled into the harness).
+extern "C" void SoH3D_EnsureModelProvider(void);
 
 // The generated models under test (raw C arrays). Declared extern; linked in.
 // Each is gated by a HAVE_* define from CMake (only the .c files that exist are
@@ -570,17 +579,137 @@ static void BuildDlist(BuiltDlist& b, Gfx* modelDl) {
     b.dl.push_back(cEnd);
 }
 
+// --- SoH3D direct-GL path harness ---------------------------------------------
+// Reproduces the IN-GAME path headlessly: emit the OTR_G_SOH3D_DRAW opcode (which
+// runs SoH3D_GL_Draw) into a dlist, followed by a normal Fast3D triangle. If our GL
+// draw corrupts the interpreter's GL state, that trailing triangle's DrawTriangles
+// crashes here — the exact in-game symptom, but in ~1s with no game boot.
+static Vtx g_canary[3];
+
+static bool BuildSoH3DDlist(BuiltDlist& b, const std::string& zarPath, int modelId, float rx, float ry, float rz) {
+    // Load the CMB (same loader the game uses) to get the model bbox for an
+    // auto-fit modelview, and to confirm the asset path is good.
+    const char* rom = getenv("SOH3D_3DS_ROM");
+    if (!rom || !*rom) { fprintf(stderr, "[HARNESS] SOH3D_3DS_ROM not set\n"); return false; }
+    SoH3D::CtrRom r(rom);
+    if (!r.ok()) { fprintf(stderr, "[HARNESS] CtrRom: %s\n", r.error().c_str()); return false; }
+    auto zb = r.read(zarPath);
+    if (zb.empty()) { fprintf(stderr, "[HARNESS] zar not found: %s\n", zarPath.c_str()); return false; }
+    SoH3D::Zar zar(std::move(zb));
+    const SoH3D::ZarFile* cf = zar.ok() ? zar.firstWithSuffix(".cmb") : nullptr;
+    if (!cf) { fprintf(stderr, "[HARNESS] no .cmb in %s\n", zarPath.c_str()); return false; }
+    SoH3D::Cmb cmb(zar.read(*cf));
+    if (!cmb.ok()) { fprintf(stderr, "[HARNESS] Cmb: %s\n", cmb.error().c_str()); return false; }
+    float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+    for (const auto& g : cmb.buildDrawGroups())
+        for (const auto& v : g.verts)
+            for (int k = 0; k < 3; k++) { lo[k] = std::min(lo[k], v.pos[k]); hi[k] = std::max(hi[k], v.pos[k]); }
+    float ctr[3], ext[3];
+    for (int k = 0; k < 3; k++) { ctr[k] = (lo[k] + hi[k]) * 0.5f; ext[k] = std::max((hi[k] - lo[k]) * 0.5f, 1.0f); }
+    printf("[HARNESS] soh3d bbox x[%.0f,%.0f] y[%.0f,%.0f] z[%.0f,%.0f]\n", lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
+
+    // Identity projection; modelview = Scale(fit) * R(rx,ry,rz) about the model
+    // centre, into ~80% NDC. Convention clip_j = sum_k pos_k*MV[k][j] + MV[3][j], so
+    // MV[k][j] = S_j * R_{jk} and MV[3][j] = bias_j - sum_k MV[k][j]*ctr_k.
+    const float fit = 0.8f / std::max(ext[0], ext[1]);
+    const float fitZ = 0.4f / ext[2];
+    const float S[3] = { fit, fit, fitZ };
+    auto rad = [](float d) { return d * 3.14159265358979f / 180.0f; };
+    float cx = cosf(rad(rx)), sx = sinf(rad(rx)), cyr = cosf(rad(ry)), syr = sinf(rad(ry)), cz = cosf(rad(rz)),
+          sz = sinf(rad(rz));
+    float Rx[3][3] = { { 1, 0, 0 }, { 0, cx, -sx }, { 0, sx, cx } };
+    float Ry[3][3] = { { cyr, 0, syr }, { 0, 1, 0 }, { -syr, 0, cyr } };
+    float Rz[3][3] = { { cz, -sz, 0 }, { sz, cz, 0 }, { 0, 0, 1 } };
+    auto mul3 = [](const float A[3][3], const float B[3][3], float O[3][3]) {
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++) { O[i][j] = 0; for (int k = 0; k < 3; k++) O[i][j] += A[i][k] * B[k][j]; }
+    };
+    float Rzy[3][3], R[3][3];
+    mul3(Rz, Ry, Rzy);
+    mul3(Rzy, Rx, R); // R = Rz*Ry*Rx
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) b.mtxReplacements[&b.projMtx].mf[i][j] = (i == j) ? 1.0f : 0.0f;
+    MtxF& mv = b.mtxReplacements[&b.mvMtx];
+    memset(mv.mf, 0, sizeof(mv.mf));
+    float bias[3] = { 0.0f, 0.0f, 0.5f };
+    for (int j = 0; j < 3; j++) {
+        for (int k = 0; k < 3; k++) mv.mf[k][j] = S[j] * R[j][k];
+        float t = bias[j];
+        for (int k = 0; k < 3; k++) t -= mv.mf[k][j] * ctr[k];
+        mv.mf[3][j] = t;
+    }
+    mv.mf[3][3] = 1.0f;
+
+    b.vp.vp.vscale[0] = (SCREEN_WIDTH / 2) * 4;  b.vp.vp.vscale[1] = (SCREEN_HEIGHT / 2) * 4;
+    b.vp.vp.vscale[2] = G_MAXZ;                  b.vp.vp.vscale[3] = 0;
+    b.vp.vp.vtrans[0] = (SCREEN_WIDTH / 2) * 4;  b.vp.vp.vtrans[1] = (SCREEN_HEIGHT / 2) * 4;
+    b.vp.vp.vtrans[2] = 0;                       b.vp.vp.vtrans[3] = 0;
+
+    // A TINY shaded canary triangle tucked in the bbox corner (in-frame but out of
+    // the way), to exercise the interpreter's vtx/tri/DrawTriangles path: a PRE one
+    // makes the interpreter apply its framebuffer/viewport/shader to GL (it does so
+    // lazily on first draw, mimicking the in-game scene drawing before the actor),
+    // and a POST one catches GL-state corruption from our draw.
+    int16_t d = (int16_t)(ext[0] * 0.05f);
+    int16_t bx = (int16_t)lo[0], by = (int16_t)lo[1], bz = (int16_t)ctr[2];
+    Vtx mk[3] = {};
+    mk[0].v.ob[0] = bx;       mk[0].v.ob[1] = by;     mk[0].v.ob[2] = bz;
+    mk[1].v.ob[0] = bx + d;   mk[1].v.ob[1] = by;     mk[1].v.ob[2] = bz;
+    mk[2].v.ob[0] = bx;       mk[2].v.ob[1] = by + d; mk[2].v.ob[2] = bz;
+    for (int i = 0; i < 3; i++) { mk[i].v.cn[0] = 255; mk[i].v.cn[1] = 0; mk[i].v.cn[2] = 0; mk[i].v.cn[3] = 255; }
+    memcpy(g_canary, mk, sizeof(mk));
+
+    SoH3D_EnsureModelProvider();
+
+    Gfx cViewport = gsSPViewport(&b.vp);
+    Gfx cScissor = gsDPSetScissor(G_SC_NON_INTERLACE, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+    Gfx cProj = gsSPMatrix(&b.projMtx, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
+    Gfx cMv = gsSPMatrix(&b.mvMtx, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+    Gfx cEnd = gsSPEndDisplayList();
+    b.dl.push_back(cViewport);
+    b.dl.push_back(cScissor);
+    b.dl.push_back(cProj);
+    b.dl.push_back(cMv);
+    // PRE-canary: a Fast3D draw to make the interpreter apply its framebuffer +
+    // viewport + scissor + shader to GL (it does so lazily on first draw), faithfully
+    // mimicking in-game where the scene renders before the actor's SoH3D draw.
+    { Gfx g = gsDPSetCombineMode(G_CC_SHADE, G_CC_SHADE); b.dl.push_back(g); }
+    { Gfx g = gsSPVertex(g_canary, 3, 0); b.dl.push_back(g); }
+    { Gfx g = gsSP1Triangle(0, 1, 2, 0); b.dl.push_back(g); }
+    // The SoH3D direct-GL model draw under test.
+    { Gfx g; gSPSoH3DDraw(&g, modelId, 255, 255, 255); b.dl.push_back(g); }
+    // POST-canary: another Fast3D triangle, to catch GL-state corruption from our draw.
+    { Gfx g = gsSPVertex(g_canary, 3, 0); b.dl.push_back(g); }
+    { Gfx g = gsSP1Triangle(0, 1, 2, 0); b.dl.push_back(g); }
+    b.dl.push_back(cEnd);
+    return true;
+}
+
 int main(int argc, char** argv) {
     bool glMode = false;
     std::string outPath; // default derived from model below
     std::string o2rArg;
     std::string modelName = "kibako";
     std::string viewPlane = "xy";
+    bool soh3dMode = false;
+    std::string zarPath = "/actor/zelda_ge1.zar";
+    float rx = 0, ry = 0, rz = 0; // --soh3d model orientation (degrees)
     uint32_t W = 640, H = 480;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--gl")
             glMode = true;
+        else if (a == "--soh3d") {
+            soh3dMode = true;
+            glMode = true; // the SoH3D direct-GL path requires the real GL backend
+        } else if (a == "--zar" && i + 1 < argc)
+            zarPath = argv[++i];
+        else if (a == "--rotx" && i + 1 < argc)
+            rx = (float)atof(argv[++i]);
+        else if (a == "--roty" && i + 1 < argc)
+            ry = (float)atof(argv[++i]);
+        else if (a == "--rotz" && i + 1 < argc)
+            rz = (float)atof(argv[++i]);
         else if (a == "--out" && i + 1 < argc)
             outPath = argv[++i];
         else if (a == "--o2r" && i + 1 < argc)
@@ -598,13 +727,16 @@ int main(int argc, char** argv) {
         }
     }
     if (outPath.empty())
-        outPath = "scratch/render/" + modelName + "_lus.ppm";
+        outPath = soh3dMode ? "scratch/render/soh3d_gl.ppm" : "scratch/render/" + modelName + "_lus.ppm";
 
-    Gfx* modelDl = SelectModel(modelName);
-    if (!modelDl) {
-        fprintf(stderr, "[HARNESS] unknown/unbuilt model '%s' (have: kibako/pot/gs if their .c was generated)\n",
-                modelName.c_str());
-        return 2;
+    Gfx* modelDl = nullptr;
+    if (!soh3dMode) {
+        modelDl = SelectModel(modelName);
+        if (!modelDl) {
+            fprintf(stderr, "[HARNESS] unknown/unbuilt model '%s' (have: kibako/pot/gs if their .c was generated)\n",
+                    modelName.c_str());
+            return 2;
+        }
     }
 
     auto* ctx = Ship::Context::CreateUninitializedInstance("soh3d_harness", "soh3d_harness", "");
@@ -643,10 +775,15 @@ int main(int argc, char** argv) {
 
     BuiltDlist b;
     b.view = viewPlane;
-    BuildDlist(b, modelDl);
+    if (soh3dMode) {
+        if (!BuildSoH3DDlist(b, zarPath, 0, rx, ry, rz))
+            return 2;
+    } else {
+        BuildDlist(b, modelDl);
+    }
 
-    printf("[HARNESS] running '%s' dlist through LUS interpreter (%s, %ux%u)...\n", modelName.c_str(),
-           glMode ? "GL" : "recording", W, H);
+    printf("[HARNESS] running '%s' dlist through LUS interpreter (%s, %ux%u)...\n",
+           soh3dMode ? zarPath.c_str() : modelName.c_str(), glMode ? "GL" : "recording", W, H);
     fflush(stdout);
     gfx->StartFrame();
     gfx->Run(b.dl.data(), b.mtxReplacements);

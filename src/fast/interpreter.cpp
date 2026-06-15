@@ -26,6 +26,7 @@
 
 #include "fast/interpreter.h"
 #include "fast/lus_gbi.h"
+#include "fast/soh3d_gl.h"
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
 
@@ -4066,6 +4067,21 @@ bool gfx_read_fb_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
+// SoH3D direct-GL model draw. Runs on the main thread with GL current and the
+// interpreter's current MP_matrix valid, INSIDE the scene pass -> correct depth.
+// Flush pending Fast3D geometry first so ordering is preserved.
+bool gfx_soh3d_draw_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+    gfx->Flush();
+    int handle = (int)(intptr_t)cmd->words.w1;
+    uint32_t tint = (uint32_t)(cmd->words.w0 & 0xFFFFFF);
+    uint8_t r = (tint >> 16) & 0xFF, g = (tint >> 8) & 0xFF, b = tint & 0xFF;
+    bool invertY = gfx->mRapi->GetClipParameters().invertY;
+    SoH3D_GL_Draw(handle, &gfx->mRsp->MP_matrix[0][0], invertY ? 1 : 0, r, g, b);
+    return false;
+}
+
 bool gfx_register_blended_texture_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -4568,6 +4584,7 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_REGBLENDEDTEX,
       { "G_REGBLENDEDTEX", gfx_register_blended_texture_handler_custom } },         // G_REGBLENDEDTEX (0x3f)
     { OTR_G_SETINTENSITY, { "G_SETINTENSITY", gfx_set_intensity_handler_custom } }, // G_SETINTENSITY (0x40)
+    { OTR_G_SOH3D_DRAW, { "G_SOH3D_DRAW", gfx_soh3d_draw_handler_custom } },         // G_SOH3D_DRAW (0x41)
     { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } },      // OTR_G_MOVEMEM_HASH
     { OTR_G_PUSH_SHADER, { "G_PUSH_SHADER", gfx_push_shader } },
     { OTR_G_POP_SHADER, { "G_POP_SHADER", gfx_pop_shader } },

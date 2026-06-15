@@ -92,6 +92,12 @@ void GfxRenderingAPIOGL::LoadShader(ShaderProgram* new_prg) {
     mCurrentShaderProgram = new_prg;
     if (new_prg != mLastLoadedShader) {
         glUseProgram(new_prg->openglProgramId);
+        // VertexArraySetAttribs captures the CURRENTLY-bound GL_ARRAY_BUFFER into the
+        // vertex attribs. Bind our streaming VBO explicitly rather than relying on it
+        // having stayed bound since Init — otherwise external GL (e.g. the SoH3D
+        // direct-GL draw, or being the first draw of a frame) can leave a different
+        // buffer bound, making the attribs reference client memory and crash.
+        glBindBuffer(GL_ARRAY_BUFFER, mOpenglVbo);
         VertexArraySetAttribs(new_prg);
         mLastLoadedShader = new_prg;
     }
@@ -703,6 +709,9 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
     SetPerDrawUniforms();
 
     // printf("flushing %d tris\n", buf_vbo_num_tris);
+    // Bind our streaming VBO explicitly (don't assume it stayed bound since Init):
+    // the attrib pointers are offsets into it, and external GL may have rebound it.
+    glBindBuffer(GL_ARRAY_BUFFER, mOpenglVbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * buf_vbo_len, buf_vbo, GL_STREAM_DRAW);
     glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
 }
