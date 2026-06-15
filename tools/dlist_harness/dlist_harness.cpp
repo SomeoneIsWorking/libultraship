@@ -67,6 +67,9 @@ extern Gfx soh3d_hintstone_model_dl[];
 #ifdef HAVE_GELDWOMAN
 extern Gfx soh3d_geldwoman_model_dl[];
 #endif
+#ifdef HAVE_CHILDLINK
+extern Gfx soh3d_childlink_model_dl[];
+#endif
 }
 
 // name -> model dlist, for --model selection. Only entries whose .c was linked.
@@ -90,6 +93,10 @@ static Gfx* SelectModel(const std::string& name) {
 #ifdef HAVE_GELDWOMAN
     if (name == "geldwoman")
         return soh3d_geldwoman_model_dl;
+#endif
+#ifdef HAVE_CHILDLINK
+    if (name == "childlink")
+        return soh3d_childlink_model_dl;
 #endif
     return nullptr;
 }
