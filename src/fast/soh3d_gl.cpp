@@ -42,23 +42,30 @@ struct GlModel {
     GLuint vbo = 0;
     std::vector<GlGroup> groups;
     std::vector<GLuint> textures;
+    std::vector<float> bones;  // flat row-major 16*boneCount; empty = bind pose (identity)
+    int boneCount = 0;
 };
 
 std::unordered_map<int, GlModel> g_models; // keyed by stable model id
 SoH3DModelProvider g_provider = nullptr;
 
 GLuint g_program = 0;
-GLint g_locPos = -1, g_locNrm = -1, g_locUv = -1;
-GLint g_uMP = -1, g_uInvertY = -1, g_uTint = -1, g_uAlphaRef = -1, g_uTex = -1;
+GLint g_locPos = -1, g_locNrm = -1, g_locUv = -1, g_locBoneId = -1, g_locBoneW = -1;
+GLint g_uMP = -1, g_uInvertY = -1, g_uTint = -1, g_uAlphaRef = -1, g_uTex = -1, g_uBones = -1;
 bool g_progFailed = false;
 
+// GPU skinning: pos_skinned = sum_i aBoneW[i] * uBones[aBoneId[i]] * pos. uBones is
+// an array of affine matrices, so the result's w = sum_i aBoneW[i] = 1 (weights sum
+// to 1). uBones defaults to identity (set via glUniformMatrix per draw) -> bind pose.
 const char* kVert =
     "#version 130\n"
-    "in vec3 aPos; in vec3 aNrm; in vec2 aUv;\n"
-    "uniform mat4 uMP; uniform float uInvertY;\n"
+    "in vec3 aPos; in vec3 aNrm; in vec2 aUv; in vec4 aBoneId; in vec4 aBoneW;\n"
+    "uniform mat4 uMP; uniform float uInvertY; uniform mat4 uBones[32];\n"
     "out vec2 vUv;\n"
     "void main(){\n"
-    "  vec4 c = uMP * vec4(aPos, 1.0);\n"
+    "  vec4 sp = vec4(0.0);\n"
+    "  for (int i = 0; i < 4; i++) sp += aBoneW[i] * (uBones[int(aBoneId[i])] * vec4(aPos, 1.0));\n"
+    "  vec4 c = uMP * vec4(sp.xyz, 1.0);\n"
     "  c.y *= uInvertY;\n"
     "  gl_Position = c;\n"
     "  vUv = vec2(aUv.x, 1.0 - aUv.y);\n" // PICA/CMB UVs are top-origin; GL samples bottom-origin
@@ -103,6 +110,8 @@ bool ensureProgram() {
     glBindAttribLocation(p, 0, "aPos");
     glBindAttribLocation(p, 1, "aNrm");
     glBindAttribLocation(p, 2, "aUv");
+    glBindAttribLocation(p, 3, "aBoneId");
+    glBindAttribLocation(p, 4, "aBoneW");
     glLinkProgram(p);
     GLint ok = 0;
     glGetProgramiv(p, GL_LINK_STATUS, &ok);
@@ -118,12 +127,13 @@ bool ensureProgram() {
     g_program = p;
     const GLubyte* ver = glGetString(GL_VERSION);
     fprintf(stderr, "[SoH3D_GL] program=%u GL_VERSION=%s\n", g_program, ver ? (const char*)ver : "?");
-    g_locPos = 0; g_locNrm = 1; g_locUv = 2;
+    g_locPos = 0; g_locNrm = 1; g_locUv = 2; g_locBoneId = 3; g_locBoneW = 4;
     g_uMP = glGetUniformLocation(p, "uMP");
     g_uInvertY = glGetUniformLocation(p, "uInvertY");
     g_uTint = glGetUniformLocation(p, "uTint");
     g_uAlphaRef = glGetUniformLocation(p, "uAlphaRef");
     g_uTex = glGetUniformLocation(p, "uTex");
+    g_uBones = glGetUniformLocation(p, "uBones");
     return true;
 }
 
@@ -140,6 +150,14 @@ GLint mapWrap(unsigned glWrap) {
 
 extern "C" void SoH3D_GL_SetModelProvider(SoH3DModelProvider fn) {
     g_provider = fn;
+}
+
+extern "C" void SoH3D_GL_SetBones(int modelId, const float* mats16, int n) {
+    GlModel& m = g_models[modelId];
+    if (n > SOH3D_GL_MAX_BONES) n = SOH3D_GL_MAX_BONES;
+    if (!mats16 || n <= 0) { m.bones.clear(); m.boneCount = 0; return; }
+    m.bones.assign(mats16, mats16 + (size_t)n * 16);
+    m.boneCount = n;
 }
 
 // Upload a model's CPU data (from the provider) to GL. GL must be current.
@@ -221,8 +239,8 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
     struct AttribSave {
         GLint enabled, buffer, size, type, normalized, stride;
         void* pointer;
-    } as[3];
-    for (int i = 0; i < 3; i++) {
+    } as[5];
+    for (int i = 0; i < 5; i++) {
         glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &as[i].enabled);
         glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &as[i].buffer);
         glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_SIZE, &as[i].size);
@@ -239,6 +257,20 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
     glUniform3f(g_uTint, r / 255.0f, g / 255.0f, b / 255.0f);
     glUniform1i(g_uTex, 0);
 
+    // uBones: identity by default (-> bind pose), else the model's per-frame skin
+    // matrices. Stored row-major (M*v, like matApplyPos); GLSL does column-major m*v,
+    // so upload with transpose=GL_TRUE. Unused slots stay identity.
+    {
+        float bones[SOH3D_GL_MAX_BONES * 16];
+        for (int k = 0; k < SOH3D_GL_MAX_BONES; k++) {
+            float* d = bones + k * 16;
+            for (int e = 0; e < 16; e++) d[e] = (e % 5 == 0) ? 1.0f : 0.0f; // identity
+        }
+        int nb = m.boneCount < SOH3D_GL_MAX_BONES ? m.boneCount : SOH3D_GL_MAX_BONES;
+        if (!m.bones.empty()) memcpy(bones, m.bones.data(), (size_t)nb * 16 * sizeof(float));
+        glUniformMatrix4fv(g_uBones, SOH3D_GL_MAX_BONES, GL_TRUE, bones);
+    }
+
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
     glDepthMask(GL_TRUE);
@@ -251,10 +283,14 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
     glEnableVertexAttribArray(0);
     glEnableVertexAttribArray(1);
     glEnableVertexAttribArray(2);
+    glEnableVertexAttribArray(3);
+    glEnableVertexAttribArray(4);
     const GLsizei stride = sizeof(SoH3DGlVtx);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, pos));
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, nrm));
     glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, uv));
+    glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, boneIds));
+    glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, weights));
 
     GLint curFbo = 0, vp[4] = { 0, 0, 0, 0 };
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &curFbo);
@@ -281,8 +317,9 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
                     mp16[3], mp16[12], mp16[13], mp16[14], mp16[15]);
     }
 
-    // --- restore Fast3D state, including the exact attrib 0..2 setup ---
-    for (int i = 0; i < 3; i++) {
+    // --- restore Fast3D state, including the exact attrib 0..4 setup (we enable
+    // 3/4 for skinning; Fast3D leaves them disabled, so restoring returns them so) ---
+    for (int i = 0; i < 5; i++) {
         glBindBuffer(GL_ARRAY_BUFFER, (GLuint)as[i].buffer);
         glVertexAttribPointer(i, as[i].size, (GLenum)as[i].type, (GLboolean)as[i].normalized, as[i].stride,
                               as[i].pointer);

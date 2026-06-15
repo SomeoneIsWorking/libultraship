@@ -13,11 +13,19 @@ extern "C" {
 #endif
 
 // One interleaved render vertex (model space). Matches SoH3D::CmbVertex layout.
+// boneIds/weights drive GPU skinning: pos_skinned = sum_i weights[i] *
+// uBones[boneIds[i]] * pos. With uBones = identity this is the bind pose (weights
+// sum to 1), so a model with no animation set renders unchanged. Up to 4 bones/vtx.
 typedef struct SoH3DGlVtx {
     float pos[3];
     float nrm[3];
     float uv[2];
+    float boneIds[4];
+    float weights[4];
 } SoH3DGlVtx;
+
+// Max bones in the skinning uniform array (covers OoT3D characters; childlink=25).
+#define SOH3D_GL_MAX_BONES 32
 
 // One per-material draw batch (triangle list).
 typedef struct SoH3DGlGroup {
@@ -48,6 +56,12 @@ void SoH3D_GL_SetModelProvider(SoH3DModelProvider fn);
 // mp16 = the interpreter's current MP_matrix (row-major float[4][4]). invertY
 // mirrors the target FBO's invertY (negate clip.y). tint multiplies the texture.
 void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsigned char r, unsigned char g, unsigned char b);
+
+// Set the per-bone skinning matrices for a model (row-major float[16] each, indexed
+// by bone id). Applied as the shader's uBones at the next draw. n is clamped to
+// SOH3D_GL_MAX_BONES. Passing n==0 resets to the bind pose (identity). Cheap — just
+// stores the matrices; call once per game frame after computing the animated pose.
+void SoH3D_GL_SetBones(int modelId, const float* mats16, int n);
 
 #ifdef __cplusplus
 }

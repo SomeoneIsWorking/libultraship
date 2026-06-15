@@ -57,6 +57,7 @@
 
 // Provider + scale exposed by soh3d_model.cpp (compiled into the harness).
 extern "C" void SoH3D_EnsureModelProvider(void);
+extern "C" void SoH3D_UpdateAnim(int modelId, const char* animName, float frame);
 
 // The generated models under test (raw C arrays). Declared extern; linked in.
 // Each is gated by a HAVE_* define from CMake (only the .c files that exist are
@@ -681,6 +682,13 @@ static bool BuildSoH3DDlist(BuiltDlist& b, const std::string& zarPath, int model
     memcpy(g_canary, mk, sizeof(mk));
 
     SoH3D_EnsureModelProvider();
+    // GPU skinning: set the model's animated pose (uBones) for this frame. The VBO
+    // itself is model-space (bind pose); the shader applies these matrices. Same
+    // frame as the bbox fit above, so the rendered pose matches the auto-fit.
+    if (animEnv && *animEnv) {
+        float frame = getenv("SOH3D_FRAME") ? (float)atof(getenv("SOH3D_FRAME")) : 0.0f;
+        SoH3D_UpdateAnim(modelId, animEnv, frame);
+    }
 
     Gfx cViewport = gsSPViewport(&b.vp);
     Gfx cScissor = gsDPSetScissor(G_SC_NON_INTERLACE, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
