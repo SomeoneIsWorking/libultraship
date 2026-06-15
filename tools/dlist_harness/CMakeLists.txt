@@ -21,8 +21,17 @@ add_executable(soh3d_dlist_harness
 
 target_include_directories(soh3d_dlist_harness PRIVATE "${SOH3D_DIR}")
 set_property(TARGET soh3d_dlist_harness PROPERTY CXX_STANDARD 20)
-# Must match libultraship's GBI ucode (set PRIVATE there, so it doesn't propagate):
-# the gbi.h opcode macros are selected at compile time and must encode F3DEX2,
-# or the interpreter walks the dlist with the wrong opcodes/stride.
-target_compile_definitions(soh3d_dlist_harness PRIVATE F3DEX_GBI_2)
+# Both defines are set PRIVATE on libultraship, so they don't propagate to us:
+#  - F3DEX_GBI_2: the gbi.h opcode macros are selected at compile time and must
+#    encode F3DEX2, or the interpreter walks the dlist with the wrong opcodes/stride.
+#  - ENABLE_OPENGL: gates the GfxRenderingAPIOGL class declaration in gfx_opengl.h
+#    (needed by the --gl real-rasteriser mode) and selects the GL_GLEXT_PROTOTYPES
+#    desktop-GL include path.
+target_compile_definitions(soh3d_dlist_harness PRIVATE F3DEX_GBI_2 ENABLE_OPENGL)
 target_link_libraries(soh3d_dlist_harness PRIVATE libultraship)
+
+# --gl mode renders through the real OpenGL backend in an EGL *surfaceless*
+# context (no window / no X server). Link GLVND OpenGL + EGL directly (libultraship
+# pulls these in PRIVATEly, so the symbols aren't re-exported to this executable).
+find_package(OpenGL REQUIRED COMPONENTS OpenGL EGL)
+target_link_libraries(soh3d_dlist_harness PRIVATE OpenGL::OpenGL OpenGL::EGL)
