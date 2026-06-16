@@ -205,7 +205,7 @@ static bool uploadModel(GlModel& m, const SoH3DGlGroup* groups, int groupCount, 
 }
 
 extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsigned char r, unsigned char g,
-                              unsigned char b) {
+                              unsigned char b, float aspectAdj) {
     if (!ensureProgram()) return;
     GlModel& m = g_models[modelId];
     if (!m.uploaded && !m.failed) {
@@ -263,7 +263,19 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
 
     // --- our draw state ---
     glUseProgram(g_program);
-    glUniformMatrix4fv(g_uMP, 1, GL_FALSE, mp16); // row-major matches GLSL col-major load (see header math)
+    // Mirror Fast3D's per-vertex `x = AdjXForAspectRatio(x)` (interpreter.cpp): scale
+    // the clip-space X output of MP by the same factor the N64 actors get. clip.x =
+    // sum_k ob[k]*MP[k][0] + MP[3][0], i.e. column 0 of MP in &MP[0][0] row-major =
+    // indices 0,4,8,12. Without this the OoT3D scene/models render at the un-squeezed
+    // 4:3 X while N64 actors are squeezed to the wide FB -> they shear apart off-center
+    // as the camera pans (the "props move differently via camera" bug).
+    float mp[16];
+    memcpy(mp, mp16, sizeof(mp));
+    mp[0] *= aspectAdj;
+    mp[4] *= aspectAdj;
+    mp[8] *= aspectAdj;
+    mp[12] *= aspectAdj;
+    glUniformMatrix4fv(g_uMP, 1, GL_FALSE, mp); // row-major matches GLSL col-major load (see header math)
     glUniform1f(g_uInvertY, invertY ? -1.0f : 1.0f);
     glUniform3f(g_uTint, r / 255.0f, g / 255.0f, b / 255.0f);
     glUniform1i(g_uTex, 0);

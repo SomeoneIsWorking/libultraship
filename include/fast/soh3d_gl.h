@@ -55,7 +55,12 @@ void SoH3D_GL_SetModelProvider(SoH3DModelProvider fn);
 // Draw a model by stable id (uploads lazily via the provider on first use).
 // mp16 = the interpreter's current MP_matrix (row-major float[4][4]). invertY
 // mirrors the target FBO's invertY (negate clip.y). tint multiplies the texture.
-void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsigned char r, unsigned char g, unsigned char b);
+// aspectAdj = the per-vertex clip-space X scale Fast3D applies to N64 vertices
+// (Interpreter::AdjXForAspectRatio: (4/3)/(w/h) for the resizable game FB, 1.0 for
+// fixed-aspect FBs). The N64 actors get it; without applying the SAME factor here
+// the OoT3D scene/models shear horizontally vs the N64 actors as the camera pans.
+void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsigned char r, unsigned char g, unsigned char b,
+                   float aspectAdj);
 
 // Set the per-bone skinning matrices for a model (row-major float[16] each, indexed
 // by bone id). Applied as the shader's uBones at the next draw. n is clamped to

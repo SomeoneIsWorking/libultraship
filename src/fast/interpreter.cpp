@@ -4093,7 +4093,12 @@ bool gfx_soh3d_draw_handler_custom(F3DGfx** cmd0) {
     uint32_t tint = (uint32_t)(cmd->words.w0 & 0xFFFFFF);
     uint8_t r = (tint >> 16) & 0xFF, g = (tint >> 8) & 0xFF, b = tint & 0xFF;
     bool invertY = gfx->mRapi->GetClipParameters().invertY;
-    SoH3D_GL_Draw(handle, &gfx->mRsp->MP_matrix[0][0], invertY ? 1 : 0, r, g, b);
+    // N64 vertices get `x = AdjXForAspectRatio(x)` per-vertex (see gfx_sp_vertex); the
+    // GL draw must apply the SAME clip-X scale or the OoT3D scene shears vs the N64
+    // actors off-center as the camera pans. AdjXForAspectRatio(1.0f) yields the factor
+    // (and 1.0 for fixed-aspect FBs), capturing the FB exception identically.
+    float aspectAdj = gfx->AdjXForAspectRatio(1.0f);
+    SoH3D_GL_Draw(handle, &gfx->mRsp->MP_matrix[0][0], invertY ? 1 : 0, r, g, b, aspectAdj);
     return false;
 }
 

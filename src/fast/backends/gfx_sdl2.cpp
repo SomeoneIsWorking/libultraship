@@ -788,12 +788,32 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
     {
         static const char* dumpPath = getenv("SOH_FRAMEDUMP");
         if (dumpPath != nullptr) {
-            static long targetFrame =
-                getenv("SOH_FRAMEDUMP_FRAME") ? atol(getenv("SOH_FRAMEDUMP_FRAME")) : 300;
             static long frame = 0;
-            if (++frame == targetFrame) {
-                Soh3dWritePpm(mWnd, dumpPath);
-                exit(0);
+            ++frame;
+            // Sequence mode (SOH_FRAMEDUMP_SEQ=1): dump every STEP frames from START to
+            // END into <path>_<frame>.ppm, then exit. Captures a whole camera pan /
+            // animation in ONE headless run so screen-fixed vs world-locked geometry can
+            // be compared frame-to-frame (the camera moves between dumps). Single-frame
+            // mode (default) dumps once at SOH_FRAMEDUMP_FRAME then exits.
+            static const bool seq = getenv("SOH_FRAMEDUMP_SEQ") != nullptr;
+            if (seq) {
+                static long start = getenv("SOH_FRAMEDUMP_START") ? atol(getenv("SOH_FRAMEDUMP_START")) : 1;
+                static long end = getenv("SOH_FRAMEDUMP_END") ? atol(getenv("SOH_FRAMEDUMP_END")) : 300;
+                static long step = getenv("SOH_FRAMEDUMP_STEP") ? atol(getenv("SOH_FRAMEDUMP_STEP")) : 10;
+                if (frame >= start && frame <= end && (frame - start) % step == 0) {
+                    char p[1100];
+                    snprintf(p, sizeof(p), "%s_%04ld.ppm", dumpPath, frame);
+                    Soh3dWritePpm(mWnd, p);
+                }
+                if (frame >= end) {
+                    exit(0);
+                }
+            } else {
+                static long targetFrame = getenv("SOH_FRAMEDUMP_FRAME") ? atol(getenv("SOH_FRAMEDUMP_FRAME")) : 300;
+                if (frame == targetFrame) {
+                    Soh3dWritePpm(mWnd, dumpPath);
+                    exit(0);
+                }
             }
         }
     }
