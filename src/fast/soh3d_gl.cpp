@@ -34,6 +34,11 @@ struct GlGroup {
     int alphaTest = 0;
     float alphaRef = 0;
     GLint wrapS = GL_REPEAT, wrapT = GL_REPEAT;
+    int blendEnable = 0;
+    GLenum blendSrcRGB = GL_SRC_ALPHA, blendDstRGB = GL_ONE_MINUS_SRC_ALPHA, blendEqRGB = GL_FUNC_ADD;
+    GLenum blendSrcA = GL_ONE, blendDstA = GL_ZERO, blendEqA = GL_FUNC_ADD;
+    float blendColor[4] = { 0, 0, 0, 1 };
+    int depthWrite = 1;
 };
 
 struct GlModel {
@@ -183,6 +188,15 @@ static bool uploadModel(GlModel& m, const SoH3DGlGroup* groups, int groupCount, 
         g.alphaRef = groups[i].alphaRef;
         g.wrapS = mapWrap(groups[i].wrapS);
         g.wrapT = mapWrap(groups[i].wrapT);
+        g.blendEnable = groups[i].blendEnable;
+        g.blendSrcRGB = groups[i].blendSrcRGB;
+        g.blendDstRGB = groups[i].blendDstRGB;
+        g.blendEqRGB = groups[i].blendEqRGB;
+        g.blendSrcA = groups[i].blendSrcA;
+        g.blendDstA = groups[i].blendDstA;
+        g.blendEqA = groups[i].blendEqA;
+        g.depthWrite = groups[i].depthWrite;
+        for (int k = 0; k < 4; k++) g.blendColor[k] = groups[i].blendColor[k];
         all.insert(all.end(), groups[i].verts, groups[i].verts + groups[i].vertCount);
         m.groups.push_back(g);
     }
@@ -299,11 +313,10 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
 
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
-    glDepthMask(GL_TRUE);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_CULL_FACE);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    // Blend/depth-write are now set PER GROUP from the CMB material (below), not globally,
+    // so additive light-shaft materials (dst = GL_ONE) stop rendering as opaque trapezoids.
 
     glBindBuffer(GL_ARRAY_BUFFER, m.vbo);
     glEnableVertexAttribArray(0);
@@ -324,6 +337,19 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
     int totalDrawn = 0;
     for (const GlGroup& grp : m.groups) {
         glUniform1f(g_uAlphaRef, grp.alphaTest ? grp.alphaRef : 0.0f);
+        // Per-material blend + depth-write. Opaque materials (blendEnable=0) write depth
+        // and don't blend; translucent ones use the CMB's GL blend funcs/equations and
+        // (typically) skip depth write so they don't occlude. Additive volumes are
+        // order-independent, so drawing them in this single pass is fine.
+        if (grp.blendEnable) {
+            glEnable(GL_BLEND);
+            glBlendFuncSeparate(grp.blendSrcRGB, grp.blendDstRGB, grp.blendSrcA, grp.blendDstA);
+            glBlendEquationSeparate(grp.blendEqRGB, grp.blendEqA);
+            glBlendColor(grp.blendColor[0], grp.blendColor[1], grp.blendColor[2], grp.blendColor[3]);
+        } else {
+            glDisable(GL_BLEND);
+        }
+        glDepthMask(grp.depthWrite ? GL_TRUE : GL_FALSE);
         if (grp.texIndex >= 0 && grp.texIndex < (int)m.textures.size()) {
             glBindTexture(GL_TEXTURE_2D, m.textures[grp.texIndex]);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, grp.wrapS);
@@ -360,6 +386,11 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
     if (prevDepth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
     if (prevScissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
     glDepthMask(prevDepthMask);
+    // Per-group draw left the blend func/equation/color at whatever the last group used;
+    // Fast3D sets src/dst per combiner but assumes FUNC_ADD and never touches blend color,
+    // so reset those to GL defaults to avoid corrupting subsequent Fast3D draws.
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendColor(0.0f, 0.0f, 0.0f, 0.0f);
 }
 
 #endif // ENABLE_OPENGL

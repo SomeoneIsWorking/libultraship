@@ -35,6 +35,15 @@ typedef struct SoH3DGlGroup {
     int alphaTest;       // 0/1
     float alphaRef;      // [0,1] discard threshold when alphaTest
     unsigned wrapS, wrapT; // GL wrap enums (0x2901 REPEAT, 0x2900 CLAMP, ...)
+    // Per-material blend state (GL enum values from the CMB, used verbatim). When
+    // blendEnable is 0 the material is opaque (depth-write, no blend). Additive
+    // light-shaft materials have blendDstRGB = GL_ONE; honoring this is what stops
+    // them rendering as opaque trapezoids.
+    int blendEnable;          // 0/1
+    unsigned blendSrcRGB, blendDstRGB, blendEqRGB; // glBlendFuncSeparate / glBlendEquationSeparate
+    unsigned blendSrcA, blendDstA, blendEqA;
+    float blendColor[4];      // glBlendColor (for CONSTANT_COLOR/ALPHA factors)
+    int depthWrite;           // 0/1 (translucent volumes disable depth write)
 } SoH3DGlGroup;
 
 // One decoded texture (RGBA8, w*h*4 bytes, row 0 = top).
