@@ -64,7 +64,7 @@ GLuint g_program = 0;
 GLuint g_vao = 0;
 GLint g_locPos = -1, g_locNrm = -1, g_locUv = -1, g_locBoneId = -1, g_locBoneW = -1;
 GLint g_uMP = -1, g_uInvertY = -1, g_uTint = -1, g_uAlphaRef = -1, g_uTex = -1, g_uBones = -1, g_uSkin = -1;
-GLint g_uDepthOffset = -1;
+GLint g_uDepthOffset = -1, g_uMV = -1, g_uLit = -1;
 bool g_progFailed = false;
 
 // GPU skinning: pos_skinned = sum_i aBoneW[i] * uBones[aBoneId[i]] * pos. uBones is
@@ -73,8 +73,8 @@ bool g_progFailed = false;
 const char* kVert =
     "#version 130\n"
     "in vec3 aPos; in vec3 aNrm; in vec2 aUv; in vec4 aBoneId; in vec4 aBoneW; in vec4 aColor;\n"
-    "uniform mat4 uMP; uniform float uInvertY; uniform mat4 uBones[32]; uniform float uSkin;\n"
-    "out vec2 vUv; out vec4 vColor;\n"
+    "uniform mat4 uMP; uniform mat4 uMV; uniform float uInvertY; uniform mat4 uBones[32]; uniform float uSkin;\n"
+    "out vec2 vUv; out vec4 vColor; out vec3 vNrmView;\n"
     "void main(){\n"
     "  vColor = aColor;\n"
     // Skinning (uSkin>0.5) blends the vertex by its bones; at the bind pose / no anim
@@ -83,24 +83,35 @@ const char* kVert =
     // per-vertex index into a uniform array is undefined-ish on some drivers (ACO on
     // radeonsi collapsed scene geometry to garbage triangles; llvmpipe tolerated it).
     "  vec4 sp;\n"
+    "  vec3 nM;\n"
     "  if (uSkin > 0.5) {\n"
-    "    sp = vec4(0.0);\n"
-    "    for (int i = 0; i < 4; i++) sp += aBoneW[i] * (uBones[int(aBoneId[i])] * vec4(aPos, 1.0));\n"
+    "    sp = vec4(0.0); nM = vec3(0.0);\n"
+    "    for (int i = 0; i < 4; i++) {\n"
+    "      sp += aBoneW[i] * (uBones[int(aBoneId[i])] * vec4(aPos, 1.0));\n"
+    "      nM += aBoneW[i] * (mat3(uBones[int(aBoneId[i])]) * aNrm);\n" // skin the normal too (for lighting)
+    "    }\n"
     "  } else {\n"
-    "    sp = vec4(aPos, 1.0);\n"
+    "    sp = vec4(aPos, 1.0); nM = aNrm;\n"
     "  }\n"
     "  vec4 c = uMP * vec4(sp.xyz, 1.0);\n"
     "  c.y *= uInvertY;\n"
     "  gl_Position = c;\n"
+    // View-space normal for the fragment lighting term (uMV = modelview, no projection / no
+    // aspect squeeze). Uniform model scale -> mat3(uMV) is a rotation*scale; frag renormalizes.
+    "  vNrmView = mat3(uMV) * nM;\n"
     "  vUv = vec2(aUv.x, 1.0 - aUv.y);\n" // PICA/CMB UVs are top-origin; GL samples bottom-origin
     "}\n";
 
 const char* kFrag =
     "#version 130\n"
-    "in vec2 vUv; in vec4 vColor;\n"
+    "in vec2 vUv; in vec4 vColor; in vec3 vNrmView;\n"
     "uniform sampler2D uTex; uniform vec3 uTint; uniform float uAlphaRef;\n"
-    "uniform float uDepthOffset;\n"
+    "uniform float uDepthOffset; uniform float uLit;\n"
     "out vec4 frag;\n"
+    // Camera-space key light for the character FORM term. Fixed in view space (upper-right,
+    // toward the camera) so models gain consistent volume as the camera orbits. The scene's
+    // colour/time-of-day still comes from uTint; this only shapes brightness across the surface.
+    "const vec3 kLightDir = normalize(vec3(0.40, 0.55, 0.73));\n"
     "void main(){\n"
     "  vec4 t = texture(uTex, vUv);\n"
     "  if (t.a < uAlphaRef) discard;\n"
@@ -108,10 +119,16 @@ const char* kFrag =
     // camera so they don't z-fight the base ground/wall. 0 for normal materials.
     "  gl_FragDepth = gl_FragCoord.z + uDepthOffset;\n"
     // OoT3D modulates the texture by the per-vertex color (baked scene lighting: dimmed
-    // walls, ground AO) and the vertex alpha (additive light-shaft / god-ray falloff),
-    // then by the scene-ambient tint. Vertex color defaults to white -> untinted models
-    // unchanged.
-    "  frag = vec4(t.rgb * vColor.rgb * uTint, t.a * vColor.a);\n"
+    // walls, ground AO) and the vertex alpha, then by the scene-ambient tint. Character/prop
+    // models carry NO baked lighting (flat vColor) -> they looked flat; add a half-Lambert
+    // diffuse FORM term (uLit) using the model normal so they read as 3D. Scene geometry
+    // (uLit==0) keeps its baked vColor untouched.
+    "  vec3 shade = uTint;\n"
+    "  if (uLit > 0.5) {\n"
+    "    float hl = dot(normalize(vNrmView), kLightDir) * 0.5 + 0.5;\n" // half-Lambert wrap [0,1]
+    "    shade = uTint * (0.55 + 0.45 * hl);\n"                          // 0.55 ambient floor -> never black
+    "  }\n"
+    "  frag = vec4(t.rgb * vColor.rgb * shade, t.a * vColor.a);\n"
     "}\n";
 
 GLuint compile(GLenum type, const char* src) {
@@ -169,6 +186,8 @@ bool ensureProgram() {
     g_uBones = glGetUniformLocation(p, "uBones");
     g_uSkin = glGetUniformLocation(p, "uSkin");
     g_uDepthOffset = glGetUniformLocation(p, "uDepthOffset");
+    g_uMV = glGetUniformLocation(p, "uMV");
+    g_uLit = glGetUniformLocation(p, "uLit");
     glGenVertexArrays(1, &g_vao); // our isolated VAO (never touch Fast3D's)
     return true;
 }
@@ -183,6 +202,10 @@ GLint mapWrap(unsigned glWrap) {
 }
 
 } // namespace
+
+// Character/prop lighting gate, toggled by soh3d.c's REPL (`light 0|1`) and seeded from env
+// SOH3D_LIGHT. -1 = uninit (read env on first draw), 0 = off (flat tint), 1 = on (half-Lambert form).
+extern "C" int gSoH3dLightEnable = -1;
 
 extern "C" void SoH3D_GL_SetModelProvider(SoH3DModelProvider fn) {
     g_provider = fn;
@@ -318,8 +341,8 @@ void endPass(const SavedGl& s) {
 
 // Draw one already-uploaded model with the given MP/invertY/tint, using the model's currently
 // set skinning pose. Assumes beginPass installed the common state and the VAO is g_vao.
-void drawOne(GlModel& m, const float* mp16, int invertY, unsigned char r, unsigned char g, unsigned char b,
-             float aspectAdj) {
+void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int invertY, unsigned char r,
+             unsigned char g, unsigned char b, float aspectAdj) {
     // Mirror Fast3D's per-vertex `x = AdjXForAspectRatio(x)` (interpreter.cpp): scale the
     // clip-space X output of MP by the factor the N64 actors get (MP column 0 = row-major
     // indices 0,4,8,12). Without it the OoT3D content shears vs N64 actors as the camera pans.
@@ -330,6 +353,11 @@ void drawOne(GlModel& m, const float* mp16, int invertY, unsigned char r, unsign
     mp[8] *= aspectAdj;
     mp[12] *= aspectAdj;
     glUniformMatrix4fv(g_uMP, 1, GL_FALSE, mp); // row-major matches GLSL col-major load (header math)
+    // Modelview (no projection, no aspect squeeze) -> view-space normal for the lighting term.
+    // Global gate (REPL `light 0|1` / env SOH3D_LIGHT, default on) to A/B or disable the form term.
+    if (gSoH3dLightEnable < 0) { const char* e = getenv("SOH3D_LIGHT"); gSoH3dLightEnable = (e && e[0] == '0') ? 0 : 1; }
+    glUniformMatrix4fv(g_uMV, 1, GL_FALSE, mv16);
+    glUniform1f(g_uLit, (lit && gSoH3dLightEnable) ? 1.0f : 0.0f);
     glUniform1f(g_uInvertY, invertY ? -1.0f : 1.0f);
     glUniform3f(g_uTint, r / 255.0f, g / 255.0f, b / 255.0f);
 
@@ -382,6 +410,8 @@ void drawOne(GlModel& m, const float* mp16, int invertY, unsigned char r, unsign
 struct DrawItem {
     int modelId;
     float mp[16];
+    float mv[16]; // modelview (for the view-space normal lighting term)
+    int lit;      // 1 = apply the half-Lambert form term (characters/props); 0 = scene geometry
     int invertY;
     unsigned char r, g, b;
     float aspectAdj;
@@ -403,15 +433,17 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
     if (nodraw) return;
     SavedGl s;
     beginPass(s);
-    drawOne(*m, mp16, invertY, r, g, b, aspectAdj);
+    drawOne(*m, mp16, mp16, /*lit=*/0, invertY, r, g, b, aspectAdj); // legacy path: no lighting
     endPass(s);
 }
 
-extern "C" void SoH3D_GL_Submit(int modelId, const float* mp16, int invertY, unsigned char r, unsigned char g,
-                                unsigned char b, float aspectAdj) {
+extern "C" void SoH3D_GL_Submit(int modelId, const float* mp16, const float* mv16, int lit, int invertY,
+                                unsigned char r, unsigned char g, unsigned char b, float aspectAdj) {
     DrawItem it;
     it.modelId = modelId;
     memcpy(it.mp, mp16, sizeof(it.mp));
+    memcpy(it.mv, mv16 ? mv16 : mp16, sizeof(it.mv));
+    it.lit = lit;
     it.invertY = invertY;
     it.r = r;
     it.g = g;
@@ -437,7 +469,7 @@ extern "C" void SoH3D_GL_RenderPass(void) {
     for (const DrawItem& it : g_drawList) {
         GlModel* m = ensureUploaded(it.modelId);
         if (!m) continue;
-        drawOne(*m, it.mp, it.invertY, it.r, it.g, it.b, it.aspectAdj);
+        drawOne(*m, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.aspectAdj);
         drawn++;
     }
     endPass(s);

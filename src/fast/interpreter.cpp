@@ -4122,13 +4122,21 @@ bool gfx_soh3d_draw_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
     int handle = (int)(intptr_t)cmd->words.w1;
+    // The emitter packs a "lit" flag into the handle's high bit (modelIds are small): 1 = apply the
+    // character/prop lighting term, 0 = scene geometry (keeps its baked vertex colours). Mask it off
+    // to recover the model id.
+    int lit = (handle < 0) ? 1 : 0; // bit 31
+    int modelId = handle & 0x7FFFFFFF;
     uint32_t tint = (uint32_t)(cmd->words.w0 & 0xFFFFFF);
     uint8_t r = (tint >> 16) & 0xFF, g = (tint >> 8) & 0xFF, b = tint & 0xFF;
     bool invertY = gfx->mRapi->GetClipParameters().invertY;
     // N64 vertices get `x = AdjXForAspectRatio(x)` per-vertex (see gfx_sp_vertex); our draw must
     // apply the SAME clip-X scale or the OoT3D scene shears vs the N64 actors as the camera pans.
     float aspectAdj = gfx->AdjXForAspectRatio(1.0f);
-    SoH3D_GL_Submit(handle, &gfx->mRsp->MP_matrix[0][0], invertY ? 1 : 0, r, g, b, aspectAdj);
+    // Modelview (no projection) for the view-space normal: top of the current modelview stack, the
+    // same matrix MP_matrix was built from (gSPMatrix LOAD set it just before this opcode).
+    const float* mv = &gfx->mRsp->modelview_matrix_stack[gfx->mRsp->modelview_matrix_stack_size - 1][0][0];
+    SoH3D_GL_Submit(modelId, &gfx->mRsp->MP_matrix[0][0], mv, lit, invertY ? 1 : 0, r, g, b, aspectAdj);
     return false;
 }
 

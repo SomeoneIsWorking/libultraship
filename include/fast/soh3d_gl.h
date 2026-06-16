@@ -81,10 +81,12 @@ void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsigned char r,
 // per-draw state-leak surface entirely (see [[soh3d-gl-state-leak]]).
 //
 // Submit: capture one draw item (called from the OTR_G_SOH3D_DRAW handler with that item's
-// MP matrix snapshot). Same args as SoH3D_GL_Draw. The model's current skinning pose
-// (SoH3D_GL_SetBones, keyed by modelId) is used at RenderPass time, as with the inline path.
-void SoH3D_GL_Submit(int modelId, const float* mp16, int invertY, unsigned char r, unsigned char g, unsigned char b,
-                     float aspectAdj);
+// MP + MV matrix snapshots). mv16 = the modelview (no projection) for the view-space normal used
+// by the lighting term; lit=1 applies the half-Lambert form term (characters/props), 0 = scene
+// geometry (keeps baked vColor). The model's current skinning pose (SoH3D_GL_SetBones, keyed by
+// modelId) is used at RenderPass time, as with the inline path.
+void SoH3D_GL_Submit(int modelId, const float* mp16, const float* mv16, int lit, int invertY, unsigned char r,
+                     unsigned char g, unsigned char b, float aspectAdj);
 // RenderPass: draw every submitted item in one bracketed pass, then clear the list. Called
 // from the OTR_G_SOH3D_RENDERPASS opcode, emitted once per frame after the actor draw-all
 // (so our content composites after Fast3D's opaque 3D, before the 2D/UI pass).
