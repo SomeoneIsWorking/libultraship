@@ -189,10 +189,11 @@ static void ErrorHandler(int sig, siginfo_t* sigInfo, void* data) {
         snprintf(intToCharBuffer, sizeof(intToCharBuffer), "%i ", (int)i);
         WRITE_VAR_LINE(crashHandler, intToCharBuffer, functionName.c_str());
     }
-    // Headless (env SOH_HEADLESS=1): don't pop a GUI crash dialog on the user's desktop;
-    // the crash log is already written to stderr/the log file.
-    const char* headlessEnv = getenv("SOH_HEADLESS");
-    if (headlessEnv == nullptr || headlessEnv[0] != '1') {
+    // No GUI crash dialog: it pops a blocking zenity window on the user's desktop (the dev
+    // workflow relaunches constantly), and the crash log is already written to stderr/the log
+    // file + printed below. Re-enable by setting SOH_CRASH_DIALOG=1 if a popup is ever wanted.
+    const char* crashDialog = getenv("SOH_CRASH_DIALOG");
+    if (crashDialog != nullptr && crashDialog[0] == '1') {
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, (Context::GetRawInstance()->GetName() + " has crashed").c_str(),
                                  (Context::GetRawInstance()->GetName() +
                                   " has crashed. Please upload the logs to the support channel in discord.")
