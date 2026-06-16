@@ -64,10 +64,11 @@ bool g_progFailed = false;
 // to 1). uBones defaults to identity (set via glUniformMatrix per draw) -> bind pose.
 const char* kVert =
     "#version 130\n"
-    "in vec3 aPos; in vec3 aNrm; in vec2 aUv; in vec4 aBoneId; in vec4 aBoneW;\n"
+    "in vec3 aPos; in vec3 aNrm; in vec2 aUv; in vec4 aBoneId; in vec4 aBoneW; in vec4 aColor;\n"
     "uniform mat4 uMP; uniform float uInvertY; uniform mat4 uBones[32]; uniform float uSkin;\n"
-    "out vec2 vUv;\n"
+    "out vec2 vUv; out vec4 vColor;\n"
     "void main(){\n"
+    "  vColor = aColor;\n"
     // Skinning (uSkin>0.5) blends the vertex by its bones; at the bind pose / no anim
     // (uSkin==0) this reduces to the raw position (weights sum to 1, uBones identity),
     // so we skip it AND the dynamic uniform-array index uBones[int(aBoneId[i])] — that
@@ -88,13 +89,17 @@ const char* kVert =
 
 const char* kFrag =
     "#version 130\n"
-    "in vec2 vUv;\n"
+    "in vec2 vUv; in vec4 vColor;\n"
     "uniform sampler2D uTex; uniform vec3 uTint; uniform float uAlphaRef;\n"
     "out vec4 frag;\n"
     "void main(){\n"
     "  vec4 t = texture(uTex, vUv);\n"
     "  if (t.a < uAlphaRef) discard;\n"
-    "  frag = vec4(t.rgb * uTint, t.a);\n"
+    // OoT3D modulates the texture by the per-vertex color (baked scene lighting: dimmed
+    // walls, ground AO) and the vertex alpha (additive light-shaft / god-ray falloff),
+    // then by the scene-ambient tint. Vertex color defaults to white -> untinted models
+    // unchanged.
+    "  frag = vec4(t.rgb * vColor.rgb * uTint, t.a * vColor.a);\n"
     "}\n";
 
 GLuint compile(GLenum type, const char* src) {
@@ -127,6 +132,7 @@ bool ensureProgram() {
     glBindAttribLocation(p, 2, "aUv");
     glBindAttribLocation(p, 3, "aBoneId");
     glBindAttribLocation(p, 4, "aBoneW");
+    glBindAttribLocation(p, 5, "aColor");
     glLinkProgram(p);
     GLint ok = 0;
     glGetProgramiv(p, GL_LINK_STATUS, &ok);
@@ -264,8 +270,8 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
     struct AttribSave {
         GLint enabled, buffer, size, type, normalized, stride;
         void* pointer;
-    } as[5];
-    for (int i = 0; i < 5; i++) {
+    } as[6];
+    for (int i = 0; i < 6; i++) {
         glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &as[i].enabled);
         glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &as[i].buffer);
         glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_SIZE, &as[i].size);
@@ -324,12 +330,14 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
     glEnableVertexAttribArray(2);
     glEnableVertexAttribArray(3);
     glEnableVertexAttribArray(4);
+    glEnableVertexAttribArray(5);
     const GLsizei stride = sizeof(SoH3DGlVtx);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, pos));
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, nrm));
     glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, uv));
     glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, boneIds));
     glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, weights));
+    glVertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, color));
 
     GLint curFbo = 0, vp[4] = { 0, 0, 0, 0 };
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &curFbo);
@@ -369,9 +377,10 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
                     mp16[3], mp16[12], mp16[13], mp16[14], mp16[15]);
     }
 
-    // --- restore Fast3D state, including the exact attrib 0..4 setup (we enable
-    // 3/4 for skinning; Fast3D leaves them disabled, so restoring returns them so) ---
-    for (int i = 0; i < 5; i++) {
+    // --- restore Fast3D state, including the exact attrib 0..5 setup (we enable
+    // 3/4/5 for skinning + vertex color; Fast3D leaves them disabled, so restoring
+    // returns them so) ---
+    for (int i = 0; i < 6; i++) {
         glBindBuffer(GL_ARRAY_BUFFER, (GLuint)as[i].buffer);
         glVertexAttribPointer(i, as[i].size, (GLenum)as[i].type, (GLboolean)as[i].normalized, as[i].stride,
                               as[i].pointer);
@@ -386,11 +395,14 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
     if (prevDepth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
     if (prevScissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
     glDepthMask(prevDepthMask);
-    // Per-group draw left the blend func/equation/color at whatever the last group used;
-    // Fast3D sets src/dst per combiner but assumes FUNC_ADD and never touches blend color,
-    // so reset those to GL defaults to avoid corrupting subsequent Fast3D draws.
+    // Reset blend func/equation to gfx_opengl's PERMANENT assumption. The Fast3D OpenGL
+    // backend (GfxRenderingAPIOGL) sets glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    // ONCE at init and never again — it only toggles GL_BLEND enable per draw (SetUseAlpha).
+    // So whatever func/equation our per-group additive draws left would leak into every
+    // later Fast3D draw (UI/sprites/bushes/skybox = transparent + whitened). Restoring the
+    // exact init values keeps gfx_opengl's implicit cache consistent with GL.
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glBlendEquation(GL_FUNC_ADD);
-    glBlendColor(0.0f, 0.0f, 0.0f, 0.0f);
 }
 
 #endif // ENABLE_OPENGL

@@ -22,6 +22,7 @@ typedef struct SoH3DGlVtx {
     float uv[2];
     float boneIds[4];
     float weights[4];
+    float color[4]; // per-vertex RGBA (OoT3D baked lighting / additive falloff)
 } SoH3DGlVtx;
 
 // Max bones in the skinning uniform array (covers OoT3D characters; childlink=25).
