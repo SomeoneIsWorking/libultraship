@@ -56,6 +56,12 @@ std::unordered_map<int, GlModel> g_models; // keyed by stable model id
 SoH3DModelProvider g_provider = nullptr;
 
 GLuint g_program = 0;
+// Our own Vertex Array Object. Fast3D's GL backend renders on its OWN VAO (gfx_opengl.cpp
+// creates mOpenglVao once at init and assumes it stays configured), so we must NOT mutate
+// the bound VAO's attrib state — we draw inside g_vao and restore the previous VAO binding,
+// leaving Fast3D's vertex state pristine. This is what prevents our attrib setup leaking into
+// Fast3D's 2D/skybox draws (the recurring striped-UI corruption). See [[soh3d-gl-state-leak]].
+GLuint g_vao = 0;
 GLint g_locPos = -1, g_locNrm = -1, g_locUv = -1, g_locBoneId = -1, g_locBoneW = -1;
 GLint g_uMP = -1, g_uInvertY = -1, g_uTint = -1, g_uAlphaRef = -1, g_uTex = -1, g_uBones = -1, g_uSkin = -1;
 GLint g_uDepthOffset = -1;
@@ -163,6 +169,7 @@ bool ensureProgram() {
     g_uBones = glGetUniformLocation(p, "uBones");
     g_uSkin = glGetUniformLocation(p, "uSkin");
     g_uDepthOffset = glGetUniformLocation(p, "uDepthOffset");
+    glGenVertexArrays(1, &g_vao); // our isolated VAO (never touch Fast3D's)
     return true;
 }
 
@@ -256,12 +263,14 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
     if (nodraw < 0) { const char* e = getenv("SOH3D_GL_NODRAW"); nodraw = (e && e[0] == '1') ? 1 : 0; }
     if (nodraw) return;
 
-    // --- save the global GL state we touch. The interpreter renders on the DEFAULT
-    // VAO (no VAO on the desktop GL path), so its vertex-attrib pointers live in the
-    // global state we're about to overwrite. Save & restore attribs 0..2 exactly
-    // (enabled/buffer/size/type/normalized/stride/pointer) so the interpreter's next
-    // glDrawArrays still fetches from ITS buffer — not ours (llvmpipe does CPU vertex
-    // fetch, so a stale pointer reads past our VBO and segfaults). ---
+    // --- save the global GL state we touch. ALL vertex-array state (attrib enable/format/
+    // pointer/source-buffer) is isolated in our own VAO (g_vao), so we never disturb Fast3D's
+    // VAO — we just save its binding here and rebind it at the end. The remaining saved state
+    // (program, array-buffer, active texture, texture binding, blend/cull/depth/scissor
+    // enables, depth mask) is global context state not captured by a VAO, so it's still
+    // saved/restored explicitly. ---
+    GLint prevVao = 0;
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVao);
     GLint prevProg = 0, prevArrayBuf = 0, prevActiveTex = 0, prevTexBind = 0;
     glGetIntegerv(GL_CURRENT_PROGRAM, &prevProg);
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevArrayBuf);
@@ -275,21 +284,9 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
     glActiveTexture(GL_TEXTURE0);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTexBind);
 
-    struct AttribSave {
-        GLint enabled, buffer, size, type, normalized, stride;
-        void* pointer;
-    } as[6];
-    for (int i = 0; i < 6; i++) {
-        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &as[i].enabled);
-        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &as[i].buffer);
-        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_SIZE, &as[i].size);
-        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_TYPE, &as[i].type);
-        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &as[i].normalized);
-        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &as[i].stride);
-        glGetVertexAttribPointerv(i, GL_VERTEX_ATTRIB_ARRAY_POINTER, &as[i].pointer);
-    }
-
-    // --- our draw state ---
+    // --- our draw state. Bind our isolated VAO so every glEnableVertexAttribArray /
+    // glVertexAttribPointer below records into g_vao, leaving Fast3D's VAO untouched. ---
+    glBindVertexArray(g_vao);
     glUseProgram(g_program);
     // Mirror Fast3D's per-vertex `x = AdjXForAspectRatio(x)` (interpreter.cpp): scale
     // the clip-space X output of MP by the same factor the N64 actors get. clip.x =
@@ -386,15 +383,11 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
                     mp16[3], mp16[12], mp16[13], mp16[14], mp16[15]);
     }
 
-    // --- restore Fast3D state, including the exact attrib 0..5 setup (we enable
-    // 3/4/5 for skinning + vertex color; Fast3D leaves them disabled, so restoring
-    // returns them so) ---
-    for (int i = 0; i < 6; i++) {
-        glBindBuffer(GL_ARRAY_BUFFER, (GLuint)as[i].buffer);
-        glVertexAttribPointer(i, as[i].size, (GLenum)as[i].type, (GLboolean)as[i].normalized, as[i].stride,
-                              as[i].pointer);
-        if (as[i].enabled) glEnableVertexAttribArray(i); else glDisableVertexAttribArray(i);
-    }
+    // --- restore Fast3D state. Rebinding its VAO restores ALL its vertex-array state in one
+    // shot (our attrib changes stayed in g_vao), so there's no per-attrib save/restore to get
+    // wrong — this is what fixes the recurring leak. The remaining global state is restored
+    // explicitly below. ---
+    glBindVertexArray((GLuint)prevVao);
     glBindTexture(GL_TEXTURE_2D, (GLuint)prevTexBind);
     glActiveTexture((GLenum)prevActiveTex);
     glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prevArrayBuf);
