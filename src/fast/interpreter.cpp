@@ -46,6 +46,20 @@
 
 std::stack<std::string> currentDir;
 
+// --- SoH3D auto-scale measure state (see OTR_G_SOH3D_MEASURE / gfx_soh3d_measure_*) ---
+// While measuring, GfxSpVertex accumulates the actor's drawn WORLD-SPACE HEIGHT. The top
+// modelview = model.view (pre-projection), with the view a rigid camera transform. The
+// actor's model-space up (0,1,0) maps through its RotateY-only matrix to world up, so the
+// eye-space image of (0,1,0) is the world-up axis in eye space; projecting each vertex's
+// eye position onto it and taking the range gives the world-space height. Height (not the
+// bbox diagonal) is what the manual scales were calibrated against, so it matches the OoT3D
+// model's local Y extent without the aspect-ratio bias a diagonal introduces. Reported to
+// soh3d.c on the end bracket to derive the OoT3D model's scale.
+static bool s_soh3dMeasuring = false;
+static int s_soh3dMeasureKey = 0;
+static float s_soh3dMeasHMin, s_soh3dMeasHMax;
+extern "C" void SoH3D_MeasureResult(int key, float height); // implemented in soh/src/soh3d/soh3d.c
+
 #define SEG_ADDR(seg, addr) (addr | (seg << 24) | 1)
 #define SUPPORT_CHECK(x) assert(x)
 
@@ -1504,6 +1518,22 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
             world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
+        }
+
+        if (s_soh3dMeasuring) {
+            // World-up axis in eye space = (top modelview) applied to direction (0,1,0).
+            float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
+            float ux = mv[1][0], uy = mv[1][1], uz = mv[1][2];
+            float ulen = sqrtf(ux * ux + uy * uy + uz * uz);
+            if (ulen > 1e-6f) {
+                ux /= ulen; uy /= ulen; uz /= ulen;
+                float ex = v->ob[0] * mv[0][0] + v->ob[1] * mv[1][0] + v->ob[2] * mv[2][0] + mv[3][0];
+                float ey = v->ob[0] * mv[0][1] + v->ob[1] * mv[1][1] + v->ob[2] * mv[2][1] + mv[3][1];
+                float ez = v->ob[0] * mv[0][2] + v->ob[1] * mv[1][2] + v->ob[2] * mv[2][2] + mv[3][2];
+                float h = ex * ux + ey * uy + ez * uz; // signed height along world up (eye space)
+                if (h < s_soh3dMeasHMin) s_soh3dMeasHMin = h;
+                if (h > s_soh3dMeasHMax) s_soh3dMeasHMax = h;
+            }
         }
 
         x = AdjXForAspectRatio(x);
@@ -4102,6 +4132,26 @@ bool gfx_soh3d_draw_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
+// SoH3D auto-scale measure bracket. Begin (w0 bit0 = 1): start accumulating the
+// eye-space bbox in GfxSpVertex. End (bit0 = 0): finalize the bbox diagonal and report
+// it to soh3d.c keyed by w1, so it can derive the OoT3D model's world scale next frame.
+bool gfx_soh3d_measure_handler_custom(F3DGfx** cmd0) {
+    F3DGfx* cmd = *cmd0;
+    int key = (int)(intptr_t)cmd->words.w1;
+    bool begin = (cmd->words.w0 & 0x1) != 0;
+    if (begin) {
+        s_soh3dMeasuring = true;
+        s_soh3dMeasureKey = key;
+        s_soh3dMeasHMin = 1e30f;
+        s_soh3dMeasHMax = -1e30f;
+    } else if (s_soh3dMeasuring) {
+        s_soh3dMeasuring = false;
+        float height = (s_soh3dMeasHMin <= s_soh3dMeasHMax) ? (s_soh3dMeasHMax - s_soh3dMeasHMin) : 0.0f;
+        SoH3D_MeasureResult(key, height);
+    }
+    return false;
+}
+
 bool gfx_register_blended_texture_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -4605,6 +4655,7 @@ static constexpr UcodeHandler otrHandlers = {
       { "G_REGBLENDEDTEX", gfx_register_blended_texture_handler_custom } },         // G_REGBLENDEDTEX (0x3f)
     { OTR_G_SETINTENSITY, { "G_SETINTENSITY", gfx_set_intensity_handler_custom } }, // G_SETINTENSITY (0x40)
     { OTR_G_SOH3D_DRAW, { "G_SOH3D_DRAW", gfx_soh3d_draw_handler_custom } },         // G_SOH3D_DRAW (0x41)
+    { OTR_G_SOH3D_MEASURE, { "G_SOH3D_MEASURE", gfx_soh3d_measure_handler_custom } }, // G_SOH3D_MEASURE (0x4a)
     { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } },      // OTR_G_MOVEMEM_HASH
     { OTR_G_PUSH_SHADER, { "G_PUSH_SHADER", gfx_push_shader } },
     { OTR_G_POP_SHADER, { "G_POP_SHADER", gfx_pop_shader } },

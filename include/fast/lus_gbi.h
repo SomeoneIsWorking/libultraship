@@ -75,6 +75,10 @@ constexpr int8_t RDP_G_SETTARGETINTERPINDEX = OPCODE(0x46);
 constexpr int8_t RDP_G_LOADBLOCK_WIDE = OPCODE(0x47);
 constexpr int8_t RDP_G_VTX_WIDE = OPCODE(0x48);
 constexpr int8_t RDP_G_TRI1_WIDE = OPCODE(0x49);
+// SoH3D auto-scale measure bracket: w1=key, w0 bit0 = phase (1=begin, 0=end). While
+// "measuring" the interpreter accumulates the eye-space bbox of every vertex it loads,
+// so the N64 actor's drawn world size can be measured to derive the OoT3D model scale.
+constexpr int8_t OTR_G_SOH3D_MEASURE = OPCODE(0x4a);
 
 /*
  * The following commands are the "generated" RDP commands; the user
