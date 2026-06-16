@@ -51,7 +51,7 @@ SoH3DModelProvider g_provider = nullptr;
 
 GLuint g_program = 0;
 GLint g_locPos = -1, g_locNrm = -1, g_locUv = -1, g_locBoneId = -1, g_locBoneW = -1;
-GLint g_uMP = -1, g_uInvertY = -1, g_uTint = -1, g_uAlphaRef = -1, g_uTex = -1, g_uBones = -1;
+GLint g_uMP = -1, g_uInvertY = -1, g_uTint = -1, g_uAlphaRef = -1, g_uTex = -1, g_uBones = -1, g_uSkin = -1;
 bool g_progFailed = false;
 
 // GPU skinning: pos_skinned = sum_i aBoneW[i] * uBones[aBoneId[i]] * pos. uBones is
@@ -60,11 +60,21 @@ bool g_progFailed = false;
 const char* kVert =
     "#version 130\n"
     "in vec3 aPos; in vec3 aNrm; in vec2 aUv; in vec4 aBoneId; in vec4 aBoneW;\n"
-    "uniform mat4 uMP; uniform float uInvertY; uniform mat4 uBones[32];\n"
+    "uniform mat4 uMP; uniform float uInvertY; uniform mat4 uBones[32]; uniform float uSkin;\n"
     "out vec2 vUv;\n"
     "void main(){\n"
-    "  vec4 sp = vec4(0.0);\n"
-    "  for (int i = 0; i < 4; i++) sp += aBoneW[i] * (uBones[int(aBoneId[i])] * vec4(aPos, 1.0));\n"
+    // Skinning (uSkin>0.5) blends the vertex by its bones; at the bind pose / no anim
+    // (uSkin==0) this reduces to the raw position (weights sum to 1, uBones identity),
+    // so we skip it AND the dynamic uniform-array index uBones[int(aBoneId[i])] — that
+    // per-vertex index into a uniform array is undefined-ish on some drivers (ACO on
+    // radeonsi collapsed scene geometry to garbage triangles; llvmpipe tolerated it).
+    "  vec4 sp;\n"
+    "  if (uSkin > 0.5) {\n"
+    "    sp = vec4(0.0);\n"
+    "    for (int i = 0; i < 4; i++) sp += aBoneW[i] * (uBones[int(aBoneId[i])] * vec4(aPos, 1.0));\n"
+    "  } else {\n"
+    "    sp = vec4(aPos, 1.0);\n"
+    "  }\n"
     "  vec4 c = uMP * vec4(sp.xyz, 1.0);\n"
     "  c.y *= uInvertY;\n"
     "  gl_Position = c;\n"
@@ -134,6 +144,7 @@ bool ensureProgram() {
     g_uAlphaRef = glGetUniformLocation(p, "uAlphaRef");
     g_uTex = glGetUniformLocation(p, "uTex");
     g_uBones = glGetUniformLocation(p, "uBones");
+    g_uSkin = glGetUniformLocation(p, "uSkin");
     return true;
 }
 
@@ -269,6 +280,9 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
         int nb = m.boneCount < SOH3D_GL_MAX_BONES ? m.boneCount : SOH3D_GL_MAX_BONES;
         if (!m.bones.empty()) memcpy(bones, m.bones.data(), (size_t)nb * 16 * sizeof(float));
         glUniformMatrix4fv(g_uBones, SOH3D_GL_MAX_BONES, GL_TRUE, bones);
+        // Only run the skinning blend (and its per-vertex uniform-array index) when a
+        // pose is actually uploaded; rooms / bind-pose models use the raw position.
+        glUniform1f(g_uSkin, (!m.bones.empty() && m.boneCount > 0) ? 1.0f : 0.0f);
     }
 
     glEnable(GL_DEPTH_TEST);
