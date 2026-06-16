@@ -45,6 +45,7 @@ typedef struct SoH3DGlGroup {
     unsigned blendSrcA, blendDstA, blendEqA;
     float blendColor[4];      // glBlendColor (for CONSTANT_COLOR/ALPHA factors)
     int depthWrite;           // 0/1 (translucent volumes disable depth write)
+    float polygonOffset;      // window-depth bias for decals (gl_FragDepth += this); 0 = none
 } SoH3DGlGroup;
 
 // One decoded texture (RGBA8, w*h*4 bytes, row 0 = top).

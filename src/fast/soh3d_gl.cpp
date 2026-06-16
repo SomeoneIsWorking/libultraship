@@ -39,6 +39,7 @@ struct GlGroup {
     GLenum blendSrcA = GL_ONE, blendDstA = GL_ZERO, blendEqA = GL_FUNC_ADD;
     float blendColor[4] = { 0, 0, 0, 1 };
     int depthWrite = 1;
+    float polygonOffset = 0.0f; // window-depth bias for decals (gl_FragDepth += this)
 };
 
 struct GlModel {
@@ -57,6 +58,7 @@ SoH3DModelProvider g_provider = nullptr;
 GLuint g_program = 0;
 GLint g_locPos = -1, g_locNrm = -1, g_locUv = -1, g_locBoneId = -1, g_locBoneW = -1;
 GLint g_uMP = -1, g_uInvertY = -1, g_uTint = -1, g_uAlphaRef = -1, g_uTex = -1, g_uBones = -1, g_uSkin = -1;
+GLint g_uDepthOffset = -1;
 bool g_progFailed = false;
 
 // GPU skinning: pos_skinned = sum_i aBoneW[i] * uBones[aBoneId[i]] * pos. uBones is
@@ -91,10 +93,14 @@ const char* kFrag =
     "#version 130\n"
     "in vec2 vUv; in vec4 vColor;\n"
     "uniform sampler2D uTex; uniform vec3 uTint; uniform float uAlphaRef;\n"
+    "uniform float uDepthOffset;\n"
     "out vec4 frag;\n"
     "void main(){\n"
     "  vec4 t = texture(uTex, vUv);\n"
     "  if (t.a < uAlphaRef) discard;\n"
+    // Decal depth bias (OoT3D polygon offset): pull flagged coplanar decals toward the
+    // camera so they don't z-fight the base ground/wall. 0 for normal materials.
+    "  gl_FragDepth = gl_FragCoord.z + uDepthOffset;\n"
     // OoT3D modulates the texture by the per-vertex color (baked scene lighting: dimmed
     // walls, ground AO) and the vertex alpha (additive light-shaft / god-ray falloff),
     // then by the scene-ambient tint. Vertex color defaults to white -> untinted models
@@ -156,6 +162,7 @@ bool ensureProgram() {
     g_uTex = glGetUniformLocation(p, "uTex");
     g_uBones = glGetUniformLocation(p, "uBones");
     g_uSkin = glGetUniformLocation(p, "uSkin");
+    g_uDepthOffset = glGetUniformLocation(p, "uDepthOffset");
     return true;
 }
 
@@ -202,6 +209,7 @@ static bool uploadModel(GlModel& m, const SoH3DGlGroup* groups, int groupCount, 
         g.blendDstA = groups[i].blendDstA;
         g.blendEqA = groups[i].blendEqA;
         g.depthWrite = groups[i].depthWrite;
+        g.polygonOffset = groups[i].polygonOffset;
         for (int k = 0; k < 4; k++) g.blendColor[k] = groups[i].blendColor[k];
         all.insert(all.end(), groups[i].verts, groups[i].verts + groups[i].vertCount);
         m.groups.push_back(g);
@@ -345,6 +353,7 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
     int totalDrawn = 0;
     for (const GlGroup& grp : m.groups) {
         glUniform1f(g_uAlphaRef, grp.alphaTest ? grp.alphaRef : 0.0f);
+        glUniform1f(g_uDepthOffset, grp.polygonOffset);
         // Per-material blend + depth-write. Opaque materials (blendEnable=0) write depth
         // and don't blend; translucent ones use the CMB's GL blend funcs/equations and
         // (typically) skip depth write so they don't occlude. Additive volumes are
