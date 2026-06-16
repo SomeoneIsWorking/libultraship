@@ -4112,23 +4112,33 @@ bool gfx_read_fb_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
-// SoH3D direct-GL model draw. Runs on the main thread with GL current and the
-// interpreter's current MP_matrix valid, INSIDE the scene pass -> correct depth.
-// Flush pending Fast3D geometry first so ordering is preserved.
+// SoH3D model draw opcode. Rather than drawing inline (interleaved with Fast3D, fighting its
+// cached GL state), CAPTURE this draw — its model id, the interpreter's current MP_matrix
+// snapshot, tint and clip params — into the SoH3D draw list. The whole list is rendered later
+// in one bracketed pass (OTR_G_SOH3D_RENDERPASS). Capturing MP here is essential: it's this
+// item's matrix (set by the preceding gSPMatrix); the render-pass opcode comes later when
+// MP_matrix is something else.
 bool gfx_soh3d_draw_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    gfx->Flush();
     int handle = (int)(intptr_t)cmd->words.w1;
     uint32_t tint = (uint32_t)(cmd->words.w0 & 0xFFFFFF);
     uint8_t r = (tint >> 16) & 0xFF, g = (tint >> 8) & 0xFF, b = tint & 0xFF;
     bool invertY = gfx->mRapi->GetClipParameters().invertY;
-    // N64 vertices get `x = AdjXForAspectRatio(x)` per-vertex (see gfx_sp_vertex); the
-    // GL draw must apply the SAME clip-X scale or the OoT3D scene shears vs the N64
-    // actors off-center as the camera pans. AdjXForAspectRatio(1.0f) yields the factor
-    // (and 1.0 for fixed-aspect FBs), capturing the FB exception identically.
+    // N64 vertices get `x = AdjXForAspectRatio(x)` per-vertex (see gfx_sp_vertex); our draw must
+    // apply the SAME clip-X scale or the OoT3D scene shears vs the N64 actors as the camera pans.
     float aspectAdj = gfx->AdjXForAspectRatio(1.0f);
-    SoH3D_GL_Draw(handle, &gfx->mRsp->MP_matrix[0][0], invertY ? 1 : 0, r, g, b, aspectAdj);
+    SoH3D_GL_Submit(handle, &gfx->mRsp->MP_matrix[0][0], invertY ? 1 : 0, r, g, b, aspectAdj);
+    return false;
+}
+
+// SoH3D render-pass opcode (emitted once per frame after the actor draw-all). Flush Fast3D's
+// pending geometry so its opaque 3D is committed first, then render all collected SoH3D draws
+// in one GL-state-bracketed pass (own the OoT3D frame instead of injecting inline).
+bool gfx_soh3d_renderpass_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    gfx->Flush();
+    SoH3D_GL_RenderPass();
     return false;
 }
 
@@ -4656,6 +4666,8 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_SETINTENSITY, { "G_SETINTENSITY", gfx_set_intensity_handler_custom } }, // G_SETINTENSITY (0x40)
     { OTR_G_SOH3D_DRAW, { "G_SOH3D_DRAW", gfx_soh3d_draw_handler_custom } },         // G_SOH3D_DRAW (0x41)
     { OTR_G_SOH3D_MEASURE, { "G_SOH3D_MEASURE", gfx_soh3d_measure_handler_custom } }, // G_SOH3D_MEASURE (0x4a)
+    { OTR_G_SOH3D_RENDERPASS,
+      { "G_SOH3D_RENDERPASS", gfx_soh3d_renderpass_handler_custom } }, // G_SOH3D_RENDERPASS (0x4b)
     { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } },      // OTR_G_MOVEMEM_HASH
     { OTR_G_PUSH_SHADER, { "G_PUSH_SHADER", gfx_push_shader } },
     { OTR_G_POP_SHADER, { "G_POP_SHADER", gfx_pop_shader } },

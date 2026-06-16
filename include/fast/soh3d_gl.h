@@ -73,6 +73,26 @@ void SoH3D_GL_SetModelProvider(SoH3DModelProvider fn);
 void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsigned char r, unsigned char g, unsigned char b,
                    float aspectAdj);
 
+// --- Dedicated SoH3D render pass (own the OoT3D frame instead of injecting inline) ---
+// Rather than executing a GL draw the instant the OTR_G_SOH3D_DRAW opcode is hit
+// (interleaved with Fast3D's draws, fighting its cached GL state), SoH3D draws are
+// COLLECTED during display-list interpretation and rendered together in ONE pass with our
+// own GL state set up once and Fast3D's state saved/restored exactly once. This removes the
+// per-draw state-leak surface entirely (see [[soh3d-gl-state-leak]]).
+//
+// Submit: capture one draw item (called from the OTR_G_SOH3D_DRAW handler with that item's
+// MP matrix snapshot). Same args as SoH3D_GL_Draw. The model's current skinning pose
+// (SoH3D_GL_SetBones, keyed by modelId) is used at RenderPass time, as with the inline path.
+void SoH3D_GL_Submit(int modelId, const float* mp16, int invertY, unsigned char r, unsigned char g, unsigned char b,
+                     float aspectAdj);
+// RenderPass: draw every submitted item in one bracketed pass, then clear the list. Called
+// from the OTR_G_SOH3D_RENDERPASS opcode, emitted once per frame after the actor draw-all
+// (so our content composites after Fast3D's opaque 3D, before the 2D/UI pass).
+void SoH3D_GL_RenderPass(void);
+// FrameBegin: drop any items left unrendered (a frame that emitted draws but no render pass,
+// e.g. a scene transition early-out) so they can't leak into the next frame.
+void SoH3D_GL_FrameBegin(void);
+
 // Set the per-bone skinning matrices for a model (row-major float[16] each, indexed
 // by bone id). Applied as the shader's uBones at the next draw. n is clamped to
 // SOH3D_GL_MAX_BONES. Passing n==0 resets to the bind pose (identity). Cheap — just

@@ -239,9 +239,9 @@ static bool uploadModel(GlModel& m, const SoH3DGlGroup* groups, int groupCount, 
     return true;
 }
 
-extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsigned char r, unsigned char g,
-                              unsigned char b, float aspectAdj) {
-    if (!ensureProgram()) return;
+// Ensure a model's GPU data is uploaded (lazy, via the provider). Returns the model or
+// nullptr if it has no usable geometry. GL must be current.
+static GlModel* ensureUploaded(int modelId) {
     GlModel& m = g_models[modelId];
     if (!m.uploaded && !m.failed) {
         const SoH3DGlGroup* groups = nullptr;
@@ -255,59 +255,86 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
             m.failed = true;
         }
     }
-    if (!m.uploaded) return;
+    return m.uploaded ? &m : nullptr;
+}
 
-    // Diagnostic: SOH3D_GL_NODRAW=1 skips the actual GL draw (keeps the upload) to
-    // isolate whether the crash is our draw/state vs the handler/opcode itself.
-    static int nodraw = -1;
-    if (nodraw < 0) { const char* e = getenv("SOH3D_GL_NODRAW"); nodraw = (e && e[0] == '1') ? 1 : 0; }
-    if (nodraw) return;
+namespace {
 
-    // --- save the global GL state we touch. ALL vertex-array state (attrib enable/format/
-    // pointer/source-buffer) is isolated in our own VAO (g_vao), so we never disturb Fast3D's
-    // VAO — we just save its binding here and rebind it at the end. The remaining saved state
-    // (program, array-buffer, active texture, texture binding, blend/cull/depth/scissor
-    // enables, depth mask) is global context state not captured by a VAO, so it's still
-    // saved/restored explicitly. ---
-    GLint prevVao = 0;
-    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVao);
-    GLint prevProg = 0, prevArrayBuf = 0, prevActiveTex = 0, prevTexBind = 0;
-    glGetIntegerv(GL_CURRENT_PROGRAM, &prevProg);
-    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevArrayBuf);
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActiveTex);
-    GLboolean prevBlend = glIsEnabled(GL_BLEND);
-    GLboolean prevCull = glIsEnabled(GL_CULL_FACE);
-    GLboolean prevDepth = glIsEnabled(GL_DEPTH_TEST);
-    GLboolean prevScissor = glIsEnabled(GL_SCISSOR_TEST);
-    GLboolean prevDepthMask = GL_TRUE;
-    glGetBooleanv(GL_DEPTH_WRITEMASK, &prevDepthMask);
+// Fast3D GL state we touch and must hand back exactly as it was (or as gfx_opengl assumes
+// it constant). All vertex-array state is isolated in g_vao, so only this global context
+// state needs explicit save/restore. See [[soh3d-gl-state-leak]] / gfx_opengl.cpp.
+struct SavedGl {
+    GLint vao, prog, arrayBuf, activeTex, texBind, depthFunc;
+    GLboolean blend, cull, depth, scissor, depthMask;
+};
+
+// Open our render pass: snapshot Fast3D's state, then install OUR common state once (isolated
+// VAO, our program, depth test on / LEQUAL, scissor+cull off). Per-item uniforms/attribs and
+// per-group blend/depth-write are set inside drawOne.
+void beginPass(SavedGl& s) {
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &s.vao);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &s.prog);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s.arrayBuf);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &s.activeTex);
+    glGetIntegerv(GL_DEPTH_FUNC, &s.depthFunc);
+    s.blend = glIsEnabled(GL_BLEND);
+    s.cull = glIsEnabled(GL_CULL_FACE);
+    s.depth = glIsEnabled(GL_DEPTH_TEST);
+    s.scissor = glIsEnabled(GL_SCISSOR_TEST);
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &s.depthMask);
     glActiveTexture(GL_TEXTURE0);
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTexBind);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &s.texBind);
 
-    // --- our draw state. Bind our isolated VAO so every glEnableVertexAttribArray /
-    // glVertexAttribPointer below records into g_vao, leaving Fast3D's VAO untouched. ---
-    glBindVertexArray(g_vao);
+    glBindVertexArray(g_vao); // our isolated VAO; attrib changes stay here, off Fast3D's VAO
     glUseProgram(g_program);
-    // Mirror Fast3D's per-vertex `x = AdjXForAspectRatio(x)` (interpreter.cpp): scale
-    // the clip-space X output of MP by the same factor the N64 actors get. clip.x =
-    // sum_k ob[k]*MP[k][0] + MP[3][0], i.e. column 0 of MP in &MP[0][0] row-major =
-    // indices 0,4,8,12. Without this the OoT3D scene/models render at the un-squeezed
-    // 4:3 X while N64 actors are squeezed to the wide FB -> they shear apart off-center
-    // as the camera pans (the "props move differently via camera" bug).
+    glUniform1i(g_uTex, 0);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
+    // Blend + depth-write are set per group from the CMB material inside drawOne.
+}
+
+// Close our render pass: restore everything to Fast3D's snapshot, and deterministically reset
+// the state gfx_opengl sets ONCE at init and never again (blendFunc/equation, depthFunc) so its
+// implicit cache stays consistent with GL. NOT a glGet round-trip for those (see memory: that
+// restored garbage). depthFunc IS save/restored because it's the live value Fast3D last set.
+void endPass(const SavedGl& s) {
+    glBindVertexArray((GLuint)s.vao); // restores ALL Fast3D vertex-array state in one shot
+    glBindTexture(GL_TEXTURE_2D, (GLuint)s.texBind);
+    glActiveTexture((GLenum)s.activeTex);
+    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)s.arrayBuf);
+    glUseProgram((GLuint)s.prog);
+    if (s.blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    if (s.cull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+    if (s.depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (s.scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    glDepthMask(s.depthMask);
+    glDepthFunc((GLenum)s.depthFunc);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); // gfx_opengl's permanent init assumption
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendColor(0.0f, 0.0f, 0.0f, 0.0f); // we set blendColor per group; Fast3D never does -> reset
+}
+
+// Draw one already-uploaded model with the given MP/invertY/tint, using the model's currently
+// set skinning pose. Assumes beginPass installed the common state and the VAO is g_vao.
+void drawOne(GlModel& m, const float* mp16, int invertY, unsigned char r, unsigned char g, unsigned char b,
+             float aspectAdj) {
+    // Mirror Fast3D's per-vertex `x = AdjXForAspectRatio(x)` (interpreter.cpp): scale the
+    // clip-space X output of MP by the factor the N64 actors get (MP column 0 = row-major
+    // indices 0,4,8,12). Without it the OoT3D content shears vs N64 actors as the camera pans.
     float mp[16];
     memcpy(mp, mp16, sizeof(mp));
     mp[0] *= aspectAdj;
     mp[4] *= aspectAdj;
     mp[8] *= aspectAdj;
     mp[12] *= aspectAdj;
-    glUniformMatrix4fv(g_uMP, 1, GL_FALSE, mp); // row-major matches GLSL col-major load (see header math)
+    glUniformMatrix4fv(g_uMP, 1, GL_FALSE, mp); // row-major matches GLSL col-major load (header math)
     glUniform1f(g_uInvertY, invertY ? -1.0f : 1.0f);
     glUniform3f(g_uTint, r / 255.0f, g / 255.0f, b / 255.0f);
-    glUniform1i(g_uTex, 0);
 
-    // uBones: identity by default (-> bind pose), else the model's per-frame skin
-    // matrices. Stored row-major (M*v, like matApplyPos); GLSL does column-major m*v,
-    // so upload with transpose=GL_TRUE. Unused slots stay identity.
+    // uBones: identity by default (bind pose), else the model's per-frame skin matrices.
+    // Row-major (M*v), uploaded transposed for GLSL's column-major m*v. Unused slots identity.
     {
         float bones[SOH3D_GL_MAX_BONES * 16];
         for (int k = 0; k < SOH3D_GL_MAX_BONES; k++) {
@@ -317,25 +344,11 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
         int nb = m.boneCount < SOH3D_GL_MAX_BONES ? m.boneCount : SOH3D_GL_MAX_BONES;
         if (!m.bones.empty()) memcpy(bones, m.bones.data(), (size_t)nb * 16 * sizeof(float));
         glUniformMatrix4fv(g_uBones, SOH3D_GL_MAX_BONES, GL_TRUE, bones);
-        // Only run the skinning blend (and its per-vertex uniform-array index) when a
-        // pose is actually uploaded; rooms / bind-pose models use the raw position.
         glUniform1f(g_uSkin, (!m.bones.empty() && m.boneCount > 0) ? 1.0f : 0.0f);
     }
 
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LEQUAL);
-    glDisable(GL_SCISSOR_TEST);
-    glDisable(GL_CULL_FACE);
-    // Blend/depth-write are now set PER GROUP from the CMB material (below), not globally,
-    // so additive light-shaft materials (dst = GL_ONE) stop rendering as opaque trapezoids.
-
     glBindBuffer(GL_ARRAY_BUFFER, m.vbo);
-    glEnableVertexAttribArray(0);
-    glEnableVertexAttribArray(1);
-    glEnableVertexAttribArray(2);
-    glEnableVertexAttribArray(3);
-    glEnableVertexAttribArray(4);
-    glEnableVertexAttribArray(5);
+    for (int a = 0; a <= 5; a++) glEnableVertexAttribArray(a);
     const GLsizei stride = sizeof(SoH3DGlVtx);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, pos));
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, nrm));
@@ -344,17 +357,9 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
     glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, weights));
     glVertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, color));
 
-    GLint curFbo = 0, vp[4] = { 0, 0, 0, 0 };
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &curFbo);
-    glGetIntegerv(GL_VIEWPORT, vp);
-    int totalDrawn = 0;
     for (const GlGroup& grp : m.groups) {
         glUniform1f(g_uAlphaRef, grp.alphaTest ? grp.alphaRef : 0.0f);
         glUniform1f(g_uDepthOffset, grp.polygonOffset);
-        // Per-material blend + depth-write. Opaque materials (blendEnable=0) write depth
-        // and don't blend; translucent ones use the CMB's GL blend funcs/equations and
-        // (typically) skip depth write so they don't occlude. Additive volumes are
-        // order-independent, so drawing them in this single pass is fine.
         if (grp.blendEnable) {
             glEnable(GL_BLEND);
             glBlendFuncSeparate(grp.blendSrcRGB, grp.blendDstRGB, grp.blendSrcA, grp.blendDstA);
@@ -370,41 +375,81 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, grp.wrapT);
         }
         glDrawArrays(GL_TRIANGLES, grp.first, grp.count);
-        totalDrawn += grp.count;
     }
+}
+
+// One collected draw (captured at OTR_G_SOH3D_DRAW time; rendered later in the pass).
+struct DrawItem {
+    int modelId;
+    float mp[16];
+    int invertY;
+    unsigned char r, g, b;
+    float aspectAdj;
+};
+std::vector<DrawItem> g_drawList;
+
+} // namespace
+
+// Inline single-model draw (legacy entry; still used by any direct caller). Brackets one model
+// in its own pass. The collected path (Submit/RenderPass) is preferred — it brackets the whole
+// frame's SoH3D content once.
+extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsigned char r, unsigned char g,
+                              unsigned char b, float aspectAdj) {
+    if (!ensureProgram()) return;
+    GlModel* m = ensureUploaded(modelId);
+    if (!m) return;
+    static int nodraw = -1;
+    if (nodraw < 0) { const char* e = getenv("SOH3D_GL_NODRAW"); nodraw = (e && e[0] == '1') ? 1 : 0; }
+    if (nodraw) return;
+    SavedGl s;
+    beginPass(s);
+    drawOne(*m, mp16, invertY, r, g, b, aspectAdj);
+    endPass(s);
+}
+
+extern "C" void SoH3D_GL_Submit(int modelId, const float* mp16, int invertY, unsigned char r, unsigned char g,
+                                unsigned char b, float aspectAdj) {
+    DrawItem it;
+    it.modelId = modelId;
+    memcpy(it.mp, mp16, sizeof(it.mp));
+    it.invertY = invertY;
+    it.r = r;
+    it.g = g;
+    it.b = b;
+    it.aspectAdj = aspectAdj;
+    g_drawList.push_back(it);
+}
+
+extern "C" void SoH3D_GL_FrameBegin(void) {
+    g_drawList.clear();
+}
+
+extern "C" void SoH3D_GL_RenderPass(void) {
+    if (g_drawList.empty()) return;
+    if (!ensureProgram()) { g_drawList.clear(); return; }
+    static int nodraw = -1;
+    if (nodraw < 0) { const char* e = getenv("SOH3D_GL_NODRAW"); nodraw = (e && e[0] == '1') ? 1 : 0; }
+    if (nodraw) { g_drawList.clear(); return; }
+
+    SavedGl s;
+    beginPass(s);
+    int drawn = 0;
+    for (const DrawItem& it : g_drawList) {
+        GlModel* m = ensureUploaded(it.modelId);
+        if (!m) continue;
+        drawOne(*m, it.mp, it.invertY, it.r, it.g, it.b, it.aspectAdj);
+        drawn++;
+    }
+    endPass(s);
+
     {
         static int dbg = -1;
         if (dbg < 0) { const char* e = getenv("SOH3D_GL_DBG"); dbg = (e && e[0] == '1') ? 1 : 0; }
         if (dbg)
-            fprintf(stderr,
-                    "[SoH3D_GL] drew %d verts -> fbo=%d vp=[%d,%d,%d,%d] invertY=%d glerr=0x%x  MP row0=[%.3f %.3f %.3f "
-                    "%.3f] row3=[%.3f %.3f %.3f %.3f]\n",
-                    totalDrawn, curFbo, vp[0], vp[1], vp[2], vp[3], invertY, glGetError(), mp16[0], mp16[1], mp16[2],
-                    mp16[3], mp16[12], mp16[13], mp16[14], mp16[15]);
+            fprintf(stderr, "[SoH3D_GL] render pass: %d/%zu items glerr=0x%x\n", drawn, g_drawList.size(),
+                    glGetError());
     }
-
-    // --- restore Fast3D state. Rebinding its VAO restores ALL its vertex-array state in one
-    // shot (our attrib changes stayed in g_vao), so there's no per-attrib save/restore to get
-    // wrong — this is what fixes the recurring leak. The remaining global state is restored
-    // explicitly below. ---
-    glBindVertexArray((GLuint)prevVao);
-    glBindTexture(GL_TEXTURE_2D, (GLuint)prevTexBind);
-    glActiveTexture((GLenum)prevActiveTex);
-    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prevArrayBuf);
-    glUseProgram((GLuint)prevProg);
-    if (prevBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
-    if (prevCull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
-    if (prevDepth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
-    if (prevScissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
-    glDepthMask(prevDepthMask);
-    // Reset blend func/equation to gfx_opengl's PERMANENT assumption. The Fast3D OpenGL
-    // backend (GfxRenderingAPIOGL) sets glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-    // ONCE at init and never again — it only toggles GL_BLEND enable per draw (SetUseAlpha).
-    // So whatever func/equation our per-group additive draws left would leak into every
-    // later Fast3D draw (UI/sprites/bushes/skybox = transparent + whitened). Restoring the
-    // exact init values keeps gfx_opengl's implicit cache consistent with GL.
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glBlendEquation(GL_FUNC_ADD);
+    g_drawList.clear();
 }
 
 #endif // ENABLE_OPENGL
