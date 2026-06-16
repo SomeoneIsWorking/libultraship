@@ -21,6 +21,12 @@ void SDLAudioPlayer::DoClose() {
 }
 
 bool SDLAudioPlayer::DoInit() {
+    // Headless mode (env SOH_HEADLESS=1): use SDL's dummy audio driver so no sound is
+    // played out of the user's speakers. Set before SDL inits its audio subsystem.
+    const char* headlessEnv = getenv("SOH_HEADLESS");
+    if (headlessEnv != nullptr && headlessEnv[0] == '1') {
+        SDL_setenv("SDL_AUDIODRIVER", "dummy", 1);
+    }
     if (SDL_Init(SDL_INIT_AUDIO) != 0) {
         SPDLOG_ERROR("SDL init error: {}", SDL_GetError());
         return false;
@@ -43,7 +49,8 @@ bool SDLAudioPlayer::DoInit() {
         return false;
     }
 
-    SPDLOG_INFO("SDL Audio initialized: {} channels, {} Hz", mNumChannels, this->GetSampleRate());
+    SPDLOG_INFO("SDL Audio initialized: {} channels, {} Hz, driver={}", mNumChannels, this->GetSampleRate(),
+                SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?");
 
     SDL_PauseAudioDevice(mDevice, 0);
     return true;

@@ -2405,6 +2405,21 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
     uint32_t entryCount = high_index + 1;
     uint32_t byteCount = entryCount * 2;
 
+    // No texture source set -> the preceding G_SETTIMG was deliberately skipped because
+    // its source couldn't be resolved (see gfx_set_timg_handler_rdp: an unresolved N64
+    // segment address, or a resource not yet loaded). That skip was only half applied:
+    // SETTIMG bailed but left texture_to_load with no/stale source, so this dependent
+    // palette load would memcpy from a null/garbage pointer and crash (intermittently on
+    // the first frame of a scene, before any valid SETTIMG has run). Honour the same
+    // skip here — with no source there is no palette to load — and report it (mirrors the
+    // null-texture handling in ImportTexture*). This COMPLETES SoH's own skip semantics.
+    if (src == nullptr) {
+        SPDLOG_WARN("GfxDpLoadTlut: skipping palette load (tile={}, tmem={}, entries={}) — no texture source; the "
+                    "preceding G_SETTIMG was skipped (unresolved segment / resource not loaded)",
+                    tile, tmem, entryCount);
+        return;
+    }
+
     if (tmem >= 256) {
         // N64 TMEM palette area starts at tmem word 256. Each CI4 palette = 16 entries = 16 tmem words.
         uint32_t paletteByteOffset = (tmem - 256) * 2;

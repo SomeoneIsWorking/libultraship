@@ -379,6 +379,16 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     Uint32 flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
 #endif
 
+    // Headless mode (env SOH_HEADLESS=1): create the window HIDDEN so nothing appears on
+    // the user's desktop. The GL context + framebuffer still exist, so rendering and
+    // SOH_FRAMEDUMP keep working — this is true offscreen operation even on a Wayland
+    // session (where a SHOWN window would otherwise pop up regardless of DISPLAY).
+    const char* headlessEnv = getenv("SOH_HEADLESS");
+    bool headless = headlessEnv != nullptr && headlessEnv[0] == '1';
+    if (headless) {
+        flags = (flags & ~(Uint32)SDL_WINDOW_SHOWN) | SDL_WINDOW_HIDDEN;
+    }
+
     if (use_opengl) {
         flags = flags | SDL_WINDOW_OPENGL;
     } else {
