@@ -64,7 +64,7 @@ GLuint g_program = 0;
 GLuint g_vao = 0;
 GLint g_locPos = -1, g_locNrm = -1, g_locUv = -1, g_locBoneId = -1, g_locBoneW = -1;
 GLint g_uMP = -1, g_uInvertY = -1, g_uTint = -1, g_uAlphaRef = -1, g_uTex = -1, g_uBones = -1, g_uSkin = -1;
-GLint g_uDepthOffset = -1, g_uMV = -1, g_uLit = -1;
+GLint g_uDepthOffset = -1, g_uMV = -1, g_uLit = -1, g_uLightDir = -1;
 bool g_progFailed = false;
 
 // GPU skinning: pos_skinned = sum_i aBoneW[i] * uBones[aBoneId[i]] * pos. uBones is
@@ -96,8 +96,12 @@ const char* kVert =
     "  vec4 c = uMP * vec4(sp.xyz, 1.0);\n"
     "  c.y *= uInvertY;\n"
     "  gl_Position = c;\n"
-    // View-space normal for the fragment lighting term (uMV = modelview, no projection / no
-    // aspect squeeze). Uniform model scale -> mat3(uMV) is a rotation*scale; frag renormalizes.
+    // WORLD-space normal for the fragment lighting term. uMV is the N64 "modelview" = the
+    // model->world matrix ONLY: OoT folds the camera/viewing transform into the PROJECTION
+    // matrix (z_view.c loads viewing with G_MTX_PROJECTION|G_MTX_MUL), so the modelview stack
+    // top carries no view. Hence mat3(uMV)*nM lands in WORLD space, and the light dir we
+    // compare against (uLightDir) is the scene's world-space sun direction. Uniform model
+    // scale -> mat3(uMV) is rotation*scale; the frag renormalizes.
     "  vNrmView = mat3(uMV) * nM;\n"
     "  vUv = vec2(aUv.x, 1.0 - aUv.y);\n" // PICA/CMB UVs are top-origin; GL samples bottom-origin
     "}\n";
@@ -106,12 +110,12 @@ const char* kFrag =
     "#version 130\n"
     "in vec2 vUv; in vec4 vColor; in vec3 vNrmView;\n"
     "uniform sampler2D uTex; uniform vec3 uTint; uniform float uAlphaRef;\n"
-    "uniform float uDepthOffset; uniform float uLit;\n"
+    "uniform float uDepthOffset; uniform float uLit; uniform vec3 uLightDir;\n"
     "out vec4 frag;\n"
-    // Camera-space key light for the character FORM term. Fixed in view space (upper-right,
-    // toward the camera) so models gain consistent volume as the camera orbits. The scene's
-    // colour/time-of-day still comes from uTint; this only shapes brightness across the surface.
-    "const vec3 kLightDir = normalize(vec3(0.40, 0.55, 0.73));\n"
+    // uLightDir = the scene's WORLD-space key-light (sun) direction TO the light, set per frame
+    // from play->envCtx.lightSettings.light1Dir (soh3d.c SoH3D_UpdateLight) so the form shading
+    // tracks time of day / the world, not the camera. The scene's colour still comes from uTint;
+    // this only shapes brightness across the surface. (vNrmView is a world-space normal, see vert.)
     "void main(){\n"
     "  vec4 t = texture(uTex, vUv);\n"
     "  if (t.a < uAlphaRef) discard;\n"
@@ -125,7 +129,7 @@ const char* kFrag =
     // (uLit==0) keeps its baked vColor untouched.
     "  vec3 shade = uTint;\n"
     "  if (uLit > 0.5) {\n"
-    "    float hl = dot(normalize(vNrmView), kLightDir) * 0.5 + 0.5;\n" // half-Lambert wrap [0,1]
+    "    float hl = dot(normalize(vNrmView), normalize(uLightDir)) * 0.5 + 0.5;\n" // half-Lambert wrap [0,1]
     "    shade = uTint * (0.55 + 0.45 * hl);\n"                          // 0.55 ambient floor -> never black
     "  }\n"
     "  frag = vec4(t.rgb * vColor.rgb * shade, t.a * vColor.a);\n"
@@ -188,6 +192,7 @@ bool ensureProgram() {
     g_uDepthOffset = glGetUniformLocation(p, "uDepthOffset");
     g_uMV = glGetUniformLocation(p, "uMV");
     g_uLit = glGetUniformLocation(p, "uLit");
+    g_uLightDir = glGetUniformLocation(p, "uLightDir");
     glGenVertexArrays(1, &g_vao); // our isolated VAO (never touch Fast3D's)
     return true;
 }
@@ -206,6 +211,17 @@ GLint mapWrap(unsigned glWrap) {
 // Character/prop lighting gate, toggled by soh3d.c's REPL (`light 0|1`) and seeded from env
 // SOH3D_LIGHT. -1 = uninit (read env on first draw), 0 = off (flat tint), 1 = on (half-Lambert form).
 extern "C" int gSoH3dLightEnable = -1;
+
+// World-space key-light (sun) direction TO the light, set once per frame by soh3d.c
+// (SoH3D_UpdateLight, from envCtx.lightSettings.light1Dir) and read by the render pass into
+// uLightDir. Default = the old fixed direction so legacy/uninit draws look as before.
+extern "C" float gSoH3dLightDirWorld[3] = { 0.40f, 0.55f, 0.73f };
+
+extern "C" void SoH3D_GL_SetLightDir(const float dirWorld[3]) {
+    gSoH3dLightDirWorld[0] = dirWorld[0];
+    gSoH3dLightDirWorld[1] = dirWorld[1];
+    gSoH3dLightDirWorld[2] = dirWorld[2];
+}
 
 extern "C" void SoH3D_GL_SetModelProvider(SoH3DModelProvider fn) {
     g_provider = fn;
@@ -311,6 +327,7 @@ void beginPass(SavedGl& s) {
     glBindVertexArray(g_vao); // our isolated VAO; attrib changes stay here, off Fast3D's VAO
     glUseProgram(g_program);
     glUniform1i(g_uTex, 0);
+    glUniform3fv(g_uLightDir, 1, gSoH3dLightDirWorld); // scene sun dir (world space), per frame
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
     glDisable(GL_SCISSOR_TEST);

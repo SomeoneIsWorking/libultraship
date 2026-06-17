@@ -95,6 +95,12 @@ void SoH3D_GL_RenderPass(void);
 // e.g. a scene transition early-out) so they can't leak into the next frame.
 void SoH3D_GL_FrameBegin(void);
 
+// Set the scene's world-space key-light (sun) direction (direction TO the light, the F3DEX
+// convention OoT stores in lightSettings.light1Dir). Used by the character/prop half-Lambert
+// FORM term so shading tracks time of day. Need not be normalized (the shader renormalizes).
+// Call once per frame before the render pass; defaults to a fixed direction until first set.
+void SoH3D_GL_SetLightDir(const float dirWorld[3]);
+
 // Set the per-bone skinning matrices for a model (row-major float[16] each, indexed
 // by bone id). Applied as the shader's uBones at the next draw. n is clamped to
 // SOH3D_GL_MAX_BONES. Passing n==0 resets to the bind pose (identity). Cheap — just
