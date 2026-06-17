@@ -4169,7 +4169,18 @@ bool gfx_soh3d_draw_handler_custom(F3DGfx** cmd0) {
 bool gfx_soh3d_renderpass_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     gfx->Flush();
+    // The SoH3D GL pass uses the CURRENT GL viewport (it sets none of its own). Fast3D only
+    // pushes the GL viewport when it rasterizes a triangle, so a gsSPViewport with no following
+    // Fast3D draw (the charcompare side-by-side split: the 3DS half is drawn purely by SoH3D,
+    // after the N64 half's triangles left the GL viewport on the LEFT) never reaches the GPU.
+    // Apply the current N64 viewport here so the SoH3D models land in their intended rect.
+    // In-game this equals the full-screen viewport the last triangle already set (a no-op), then
+    // we force a reapply so subsequent Fast3D geometry re-establishes its own viewport/scissor.
+    gfx->mRapi->SetViewport(gfx->mRdp->viewport.x, gfx->mRdp->viewport.y, gfx->mRdp->viewport.width,
+                            gfx->mRdp->viewport.height);
     SoH3D_GL_RenderPass();
+    gfx->mRenderingState.viewport = {};
+    gfx->mRdp->viewport_or_scissor_changed = true;
     return false;
 }
 
