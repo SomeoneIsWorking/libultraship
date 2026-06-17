@@ -56,14 +56,22 @@ std::unordered_map<int, GlModel> g_models; // keyed by stable model id
 SoH3DModelProvider g_provider = nullptr;
 
 // Emit-time pose snapshots, captured when each actor's draw opcode is written (after its SetBones,
-// before later same-modelId actors overwrite g_models[modelId].bones). Consumed by Submit in
-// modelId-FIFO order. See the long note in SoH3D_GL_Submit.
-struct EmitPose {
-    int modelId;
+// before later same-modelId actors overwrite g_models[modelId].bones). Stored per modelId in EMIT
+// ORDER for THIS logic frame (g_curPoses) and the previous one (g_prevPoses). The k-th submit of a
+// modelId in a subframe pairs with the k-th emit, so same-model actors keep their own poses AND we
+// can interpolate each between its previous- and current-frame pose (see SoH3D_GL_RenderPass).
+struct ItemPose {
     std::vector<float> bones;
-    int boneCount;
+    int boneCount = 0;
 };
-std::vector<EmitPose> g_poseQueue;
+std::unordered_map<int, std::vector<ItemPose>> g_curPoses;  // this logic frame, per modelId
+std::unordered_map<int, std::vector<ItemPose>> g_prevPoses; // last logic frame, per modelId
+
+// Frame-interpolation step for the CURRENT subframe replay (0 = previous logic frame, 1 = current),
+// set per subframe by RunCommands (OTRGlobals.cpp). The game records gfx once per logic frame and
+// replays it N times with interpolated matrices; we lerp each bone pose by this so the skinned
+// limbs interpolate to the render FPS like the N64 matrix stack does, instead of snapping at 20fps.
+extern "C" float gSoH3dInterpStep = 1.0f;
 
 GLuint g_program = 0;
 // Our own Vertex Array Object. Fast3D's GL backend renders on its OWN VAO (gfx_opengl.cpp
@@ -246,19 +254,17 @@ extern "C" void SoH3D_GL_SetBones(int modelId, const float* mats16, int n) {
 }
 
 extern "C" void SoH3D_GL_EmitPose(int modelId) {
-    // Snapshot this actor's just-set pose at EMIT time so it survives later same-modelId SetBones
-    // calls; Submit pairs it back by modelId-FIFO. Called from SoH3D_EmitModelDraw before the draw
-    // opcode. No bones set -> push an empty entry so the FIFO still pairs 1:1 with the draws.
-    EmitPose p;
-    p.modelId = modelId;
+    // Snapshot this actor's just-set pose at EMIT time (during dlist build, logic-frame rate) so it
+    // survives later same-modelId SetBones calls. Appended in emit order; the k-th submit of this
+    // modelId in a subframe pairs with the k-th entry here. Called from SoH3D_EmitModelDraw before
+    // the draw opcode. No bones set -> push an empty entry so emit/submit stay 1:1.
+    ItemPose p;
     auto it = g_models.find(modelId);
     if (it != g_models.end() && !it->second.bones.empty()) {
         p.bones = it->second.bones;
         p.boneCount = it->second.boneCount;
-    } else {
-        p.boneCount = 0;
     }
-    g_poseQueue.push_back(std::move(p));
+    g_curPoses[modelId].push_back(std::move(p));
 }
 
 // Upload a model's CPU data (from the provider) to GL. GL must be current.
@@ -459,7 +465,8 @@ struct DrawItem {
     int invertY;
     unsigned char r, g, b;
     float aspectAdj;
-    std::vector<float> bones; // per-item skin pose snapshot (so same-modelId actors keep own poses)
+    std::vector<float> bones;     // this-frame skin pose (so same-modelId actors keep own poses)
+    std::vector<float> prevBones; // same item's previous-frame pose (for FPS interpolation); may be empty
     int boneCount = 0;
 };
 std::vector<DrawItem> g_drawList;
@@ -497,23 +504,23 @@ extern "C" void SoH3D_GL_Submit(int modelId, const float* mp16, const float* mv1
     it.g = g;
     it.b = b;
     it.aspectAdj = aspectAdj;
-    // Per-item pose. The pose can't be read from g_models[modelId] HERE: Submit runs at dlist
-    // INTERPRET time, by which point every actor has already done its SetBones during dlist BUILD,
-    // so a later same-modelId actor has overwritten g_models[modelId].bones. Instead the pose is
-    // snapshotted at EMIT time into g_poseQueue (SoH3D_GL_EmitPose, called right after SetBones);
-    // here we consume the matching entry in FIFO order. Same-modelId emits and Submits preserve
-    // relative order (sequential POLY_OPA), so the first queued pose for this modelId is this item's.
-    for (auto q = g_poseQueue.begin(); q != g_poseQueue.end(); ++q) {
-        if (q->modelId == modelId) {
-            it.bones = std::move(q->bones);
-            it.boneCount = q->boneCount;
-            g_poseQueue.erase(q);
-            break;
-        }
-    }
-    if (it.bones.empty()) {
-        // No emit-time pose (e.g. the legacy inline path, or an unposed model): fall back to the
-        // model's current bones so single-actor behaviour is unchanged.
+    // Per-item pose pairing. Submit runs at dlist INTERPRET time (and re-runs once per interpolation
+    // subframe), by which point g_models[modelId].bones holds only the LAST actor's pose. So pair by
+    // EMIT ORDER: this is the k-th submit of `modelId` in the current subframe (k = how many items of
+    // this modelId are already collected), which corresponds to the k-th EmitPose this logic frame.
+    // Carry both that pose (cur) and the same slot's previous-frame pose (prev) for FPS interpolation.
+    size_t k = 0;
+    for (const DrawItem& d : g_drawList)
+        if (d.modelId == modelId) k++;
+    auto cit = g_curPoses.find(modelId);
+    if (cit != g_curPoses.end() && k < cit->second.size() && !cit->second[k].bones.empty()) {
+        it.bones = cit->second[k].bones;
+        it.boneCount = cit->second[k].boneCount;
+        auto pit = g_prevPoses.find(modelId);
+        if (pit != g_prevPoses.end() && k < pit->second.size() && pit->second[k].boneCount == it.boneCount)
+            it.prevBones = pit->second[k].bones; // same skeleton last frame -> interpolate toward cur
+    } else {
+        // No emit-time pose (legacy inline path / unposed model): fall back to the model's bones.
         auto mit = g_models.find(modelId);
         if (mit != g_models.end() && !mit->second.bones.empty()) {
             it.bones = mit->second.bones;
@@ -525,7 +532,10 @@ extern "C" void SoH3D_GL_Submit(int modelId, const float* mp16, const float* mv1
 
 extern "C" void SoH3D_GL_FrameBegin(void) {
     g_drawList.clear();
-    g_poseQueue.clear(); // drop any emit-time poses left unconsumed (e.g. a dropped/early-out frame)
+    // Rotate this logic frame's emit-ordered poses into "previous" so the next frame can interpolate
+    // each item from where it was. (Called once per logic frame, before the actors emit their poses.)
+    g_prevPoses = std::move(g_curPoses);
+    g_curPoses.clear();
 }
 
 extern "C" void SoH3D_GL_RenderPass(void) {
@@ -538,11 +548,23 @@ extern "C" void SoH3D_GL_RenderPass(void) {
     SavedGl s;
     beginPass(s);
     int drawn = 0;
+    // Interpolate each item's skin pose toward this subframe's step, matching the per-subframe matrix
+    // interpolation the rest of the scene gets — so skinned limbs animate at the render FPS instead of
+    // snapping at the 20fps logic rate. Component-wise matrix lerp, the same blend frame_interpolation
+    // applies to recorded N64 matrices. step>=1 or no prev pose -> use cur directly (no work).
+    std::vector<float> lerped;
+    float step = gSoH3dInterpStep;
     for (const DrawItem& it : g_drawList) {
         GlModel* m = ensureUploaded(it.modelId);
         if (!m) continue;
-        drawOne(*m, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.aspectAdj,
-                it.bones.empty() ? nullptr : it.bones.data(), it.boneCount);
+        const float* pose = it.bones.empty() ? nullptr : it.bones.data();
+        if (pose && step < 0.999f && !it.prevBones.empty() && it.prevBones.size() == it.bones.size()) {
+            lerped.resize(it.bones.size());
+            float w = 1.0f - step;
+            for (size_t i = 0; i < it.bones.size(); i++) lerped[i] = w * it.prevBones[i] + step * it.bones[i];
+            pose = lerped.data();
+        }
+        drawOne(*m, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.aspectAdj, pose, it.boneCount);
         drawn++;
     }
     endPass(s);
