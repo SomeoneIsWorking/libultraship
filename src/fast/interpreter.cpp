@@ -3934,6 +3934,29 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
     }
 #else
     if (i <= 0x0FFFFFFF) {
+        // DIAGNOSTIC (SoH3D): the "sky bug" — a non-deterministic scene-load race where a texture's
+        // N64 segment base is still 0 when its display list first runs, so SegAddr can't resolve it.
+        // The texture is skipped here, leaving a stale GL binding that paints garbage (a HUD icon, a
+        // sky stripe). The downstream null guards (GfxDpLoadTlut/ImportTexture) only prevent the
+        // crash. This logs WHICH draw is the culprit: the segment number + the OPEN_DISPS breadcrumb
+        // (innermost game code file:line) so the next occurrence is identifiable. Capped to avoid
+        // spam; only ever fires on the (rare) unresolved-segment path.
+        static int reported = 0;
+        if (reported < 64) {
+            reported++;
+            uintptr_t w1 = cmd->words.w1;
+            uint32_t segNum = (w1 & 1) ? (uint32_t)(w1 >> 24) : 0xFFFFFFFFu;
+            std::string crumb;
+            const auto& disp = g_exec_stack.getDisp();
+            for (size_t k = disp.size(); k-- > 0 && crumb.size() < 240;) {
+                crumb += disp[k].file ? disp[k].file : "?";
+                crumb += ":" + std::to_string(disp[k].line);
+                if (k) crumb += " <- ";
+            }
+            SPDLOG_WARN("SoH3D SKYBUG: unresolved texture segment {} (w1=0x{:08X}, segBase=0) skipped; "
+                        "drawn by [{}]",
+                        segNum, (uint32_t)w1, crumb.empty() ? "(no OPEN_DISPS context)" : crumb);
+        }
         return false;
     }
 #endif
