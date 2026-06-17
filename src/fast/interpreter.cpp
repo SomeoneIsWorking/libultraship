@@ -79,6 +79,80 @@ extern "C" void Cc_BboxMeasureEnd(float* mn, float* mx) {
     }
 }
 
+// --- SoH3D "RenderDoc-lite" draw dump (env SOH3D_GFXDUMP=<path>) -------------------------------
+// Captures, per draw BATCH (a run of triangles under one modelview-stack top), the modelview / MP
+// matrices + their 3x3 determinant SIGN (handedness), the object-space vertex bbox + count, sample
+// transformed clip positions, and triangle winding stats (front/back by the SAME screen-space cross
+// the culler uses) plus how many the active cull mode drops. Batches are keyed by their object-space
+// vertex bbox, so the SAME geometry drawn in charcompare and in the live game can be matched and
+// their matrices / winding compared — the tool for "is a limb's geometry inverted vs the game?".
+// One frame only: SOH3D_GFXDUMP=<path> [SOH3D_GFXDUMP_FRAME=<n, default 0>]
+//                 [SOH3D_GFXDUMP_FILTER=<substr the current DL OTR path must contain>].
+namespace {
+struct GfxDumpBatch {
+    bool open = false;
+    bool matCaptured = false;
+    char dlName[192] = "";
+    float mv[4][4] = {}, mp[4][4] = {};
+    float objMin[3] = { 1e30f, 1e30f, 1e30f }, objMax[3] = { -1e30f, -1e30f, -1e30f };
+    int vtxCount = 0;
+    int triCount = 0, triFront = 0, triBack = 0, triCulled = 0;
+    int cullMode = 0; // 0=none 1=front 2=back 3=both (microcode-resolved at capture)
+    uint32_t geomMode = 0;
+    int numLights = 0;
+    int sampleN = 0;
+    float sampleClip[3][4] = {};
+    int sampleNrm[3][3] = {};  // raw vertex normal/color bytes (signed) for the sample verts
+    int sampleShade[3][4] = {}; // computed loaded-vertex RGBA shade after the lighting block
+    int litSample[3] = {};      // 1 = this vert went through the G_LIGHTING path, 0 = vertex-color
+};
+static FILE* s_gfxDump = nullptr;
+static int s_gfxDumpState = 0; // 0=uninit, 1=armed(waiting for target frame), 2=done
+static int s_gfxDumpTargetFrame = 0;
+static int s_gfxDumpFrameCtr = 0;
+static std::string s_gfxDumpFilter;
+static char s_gfxCurDlName[192] = "";
+static GfxDumpBatch s_gfxBatch;
+static int s_gfxBatchIdx = 0;
+
+inline bool GfxDumpActive() {
+    return s_gfxDump != nullptr;
+}
+inline float Det3(const float m[4][4]) {
+    return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+           m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+           m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+}
+static void GfxDumpFlushBatch() {
+    GfxDumpBatch& b = s_gfxBatch;
+    if (!s_gfxDump || !b.open || b.vtxCount == 0) {
+        b = GfxDumpBatch();
+        return;
+    }
+    if (s_gfxDumpFilter.empty() || std::string(b.dlName).find(s_gfxDumpFilter) != std::string::npos) {
+        float mvDet = Det3(b.mv), mpDet = Det3(b.mp);
+        fprintf(s_gfxDump,
+                "BATCH %d dl='%s' cull=%s lit=%d numLights=%d geomMode=0x%X\n"
+                "  obj.bbox min(%.1f,%.1f,%.1f) max(%.1f,%.1f,%.1f) verts=%d tris=%d front=%d back=%d culled=%d\n"
+                "  mv.det3=%+.5g (%s)  mp.det3=%+.5g (%s)\n",
+                s_gfxBatchIdx, b.dlName,
+                b.cullMode == 0 ? "none" : (b.cullMode == 2 ? "BACK" : (b.cullMode == 1 ? "FRONT" : "BOTH")),
+                (b.geomMode & G_LIGHTING) ? 1 : 0, b.numLights, b.geomMode, b.objMin[0], b.objMin[1], b.objMin[2],
+                b.objMax[0], b.objMax[1], b.objMax[2], b.vtxCount, b.triCount, b.triFront, b.triBack, b.triCulled,
+                mvDet, mvDet < 0 ? "FLIPPED" : "ok", mpDet, mpDet < 0 ? "FLIPPED" : "ok");
+        for (int r = 0; r < 4; r++)
+            fprintf(s_gfxDump, "  mv[%d] %+.4f %+.4f %+.4f %+.4f\n", r, b.mv[r][0], b.mv[r][1], b.mv[r][2], b.mv[r][3]);
+        for (int s = 0; s < b.sampleN; s++)
+            fprintf(s_gfxDump, "  v[%d] clip(%+.2f,%+.2f,%+.2f,%+.2f) nrm(%d,%d,%d) lit=%d shade(%d,%d,%d,%d)\n", s,
+                    b.sampleClip[s][0], b.sampleClip[s][1], b.sampleClip[s][2], b.sampleClip[s][3], b.sampleNrm[s][0],
+                    b.sampleNrm[s][1], b.sampleNrm[s][2], b.litSample[s], b.sampleShade[s][0], b.sampleShade[s][1],
+                    b.sampleShade[s][2], b.sampleShade[s][3]);
+        s_gfxBatchIdx++;
+    }
+    b = GfxDumpBatch();
+}
+} // namespace
+
 #define SEG_ADDR(seg, addr) (addr | (seg << 24) | 1)
 #define SUPPORT_CHECK(x) assert(x)
 
@@ -1418,6 +1492,11 @@ void Interpreter::CalculateNormalDir(const F3DLight_t* light, float coeffs[3]) {
 }
 
 void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
+    // A new matrix delimits a draw batch: flush the geometry drawn under the previous one.
+    if (GfxDumpActive() && s_gfxBatch.open && s_gfxBatch.vtxCount > 0) {
+        GfxDumpFlushBatch();
+    }
+
     float matrix[4][4];
 
     if (auto it = mCurMtxReplacements->find((Mtx*)addr); it != mCurMtxReplacements->end()) {
@@ -1540,6 +1619,30 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                 if (mp[k] < s_ccBboxMin[k]) s_ccBboxMin[k] = mp[k];
                 if (mp[k] > s_ccBboxMax[k]) s_ccBboxMax[k] = mp[k];
             }
+        }
+
+        if (GfxDumpActive()) {
+            GfxDumpBatch& b = s_gfxBatch;
+            if (!b.open || !b.matCaptured) {
+                // First vertex of a new batch: snapshot the matrices + state this geometry draws under.
+                b.open = true;
+                b.matCaptured = true;
+                memcpy(b.mv, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], sizeof(b.mv));
+                memcpy(b.mp, mRsp->MP_matrix, sizeof(b.mp));
+                uint32_t cm = mRsp->geometry_mode & get_attr(CULL_BOTH);
+                b.cullMode = (cm == 0) ? 0
+                             : (cm == get_attr(CULL_BOTH)) ? 3
+                             : (cm == get_attr(CULL_FRONT)) ? 1
+                                                            : 2;
+                b.geomMode = mRsp->geometry_mode;
+                b.numLights = mRsp->current_num_lights;
+                strncpy(b.dlName, s_gfxCurDlName, sizeof(b.dlName) - 1);
+            }
+            for (int k = 0; k < 3; k++) {
+                if (v->ob[k] < b.objMin[k]) b.objMin[k] = v->ob[k];
+                if (v->ob[k] > b.objMax[k]) b.objMax[k] = v->ob[k];
+            }
+            b.vtxCount++;
         }
 
         float world_pos[3] = { 0.0 };
@@ -1724,6 +1827,20 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         } else {
             d->color.a = v->cn[3];
         }
+
+        // gfx dump: sample the first few verts' normal/color bytes + the computed shade. The raw bytes
+        // (vn->n == v->cn, reinterpreted signed) are the lighting NORMAL; comparing the per-limb shade
+        // + whether each vert took the G_LIGHTING path vs vertex-color path against the live game is how
+        // we localise "this limb is lit/shaded wrong vs SoH" (inverted normal, forced lighting, etc.).
+        if (GfxDumpActive() && s_gfxBatch.open && s_gfxBatch.sampleN < 3) {
+            GfxDumpBatch& b = s_gfxBatch;
+            int s = b.sampleN++;
+            b.sampleClip[s][0] = d->x; b.sampleClip[s][1] = d->y; b.sampleClip[s][2] = d->z; b.sampleClip[s][3] = d->w;
+            b.sampleNrm[s][0] = vn->n[0]; b.sampleNrm[s][1] = vn->n[1]; b.sampleNrm[s][2] = vn->n[2];
+            b.sampleShade[s][0] = d->color.r; b.sampleShade[s][1] = d->color.g;
+            b.sampleShade[s][2] = d->color.b; b.sampleShade[s][3] = d->color.a;
+            b.litSample[s] = (mRsp->geometry_mode & G_LIGHTING) ? 1 : 0;
+        }
     }
 }
 
@@ -1754,6 +1871,21 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     const uint32_t cull_both = get_attr(CULL_BOTH);
     const uint32_t cull_front = get_attr(CULL_FRONT);
     const uint32_t cull_back = get_attr(CULL_BACK);
+
+    if (GfxDumpActive() && s_gfxBatch.open) {
+        // Replicate the culler's screen-space cross to classify winding (front=cross<0), independent
+        // of the active cull mode, plus whether THIS cull mode would drop it. Reveals inverted geom.
+        float dx1 = v1->x / v1->w - v2->x / v2->w, dy1 = v1->y / v1->w - v2->y / v2->w;
+        float dx2 = v3->x / v3->w - v2->x / v2->w, dy2 = v3->y / v3->w - v2->y / v2->w;
+        float cr = dx1 * dy2 - dy1 * dx2;
+        if ((v1->w < 0) ^ (v2->w < 0) ^ (v3->w < 0)) cr = -cr;
+        if ((mRsp->extra_geometry_mode & G_EX_INVERT_CULLING) != 0) cr = -cr;
+        s_gfxBatch.triCount++;
+        if (cr < 0) s_gfxBatch.triFront++; else s_gfxBatch.triBack++;
+        uint32_t cm = mRsp->geometry_mode & cull_both;
+        if ((cm == cull_front && cr <= 0) || (cm == cull_back && cr >= 0) || cm == cull_both)
+            s_gfxBatch.triCulled++;
+    }
 
     if ((mRsp->geometry_mode & cull_both) != 0) {
         float dx1 = v1->x / (v1->w) - v2->x / (v2->w);
@@ -3630,6 +3762,10 @@ bool gfx_vtx_otr_filepath_handler_custom(F3DGfx** cmd0) {
 bool gfx_dl_otr_filepath_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
     char* fileName = (char*)cmd->words.w1;
+    if (GfxDumpActive() && fileName) {
+        strncpy(s_gfxCurDlName, fileName, sizeof(s_gfxCurDlName) - 1);
+        s_gfxCurDlName[sizeof(s_gfxCurDlName) - 1] = '\0';
+    }
     F3DGfx* nDL =
         (F3DGfx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer((const char*)fileName);
 
@@ -5159,6 +5295,30 @@ void Interpreter::RunGuiOnly() {
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
     SpReset();
 
+    // Arm the RenderDoc-lite draw dump for exactly the target frame (see GfxDumpBatch comment).
+    if (s_gfxDumpState == 0) {
+        const char* path = getenv("SOH3D_GFXDUMP");
+        if (!path) {
+            s_gfxDumpState = 2; // disabled for this process
+        } else {
+            const char* fr = getenv("SOH3D_GFXDUMP_FRAME");
+            s_gfxDumpTargetFrame = fr ? atoi(fr) : 0;
+            const char* fl = getenv("SOH3D_GFXDUMP_FILTER");
+            s_gfxDumpFilter = fl ? fl : "";
+            s_gfxDumpState = 1;
+        }
+    }
+    if (s_gfxDumpState == 1 && s_gfxDumpFrameCtr == s_gfxDumpTargetFrame) {
+        s_gfxDump = fopen(getenv("SOH3D_GFXDUMP"), "w");
+        if (s_gfxDump) {
+            fprintf(s_gfxDump, "# SoH3D gfx dump — frame %d  filter='%s'\n", s_gfxDumpFrameCtr,
+                    s_gfxDumpFilter.c_str());
+            s_gfxBatch = GfxDumpBatch();
+            s_gfxBatchIdx = 0;
+            s_gfxCurDlName[0] = '\0';
+        }
+    }
+
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();
 
@@ -5196,6 +5356,17 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     }
 
     Flush();
+
+    // Close out the gfx dump after this frame's commands have all executed.
+    if (s_gfxDump) {
+        GfxDumpFlushBatch();
+        fprintf(s_gfxDump, "# end frame — %d batches dumped\n", s_gfxBatchIdx);
+        fclose(s_gfxDump);
+        s_gfxDump = nullptr;
+        s_gfxDumpState = 2; // one-shot
+    }
+    s_gfxDumpFrameCtr++;
+
     mGfxFrameBuffer = 0;
     currentDir = std::stack<std::string>();
 
