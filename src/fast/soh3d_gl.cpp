@@ -339,6 +339,64 @@ struct SavedGl {
     GLboolean blend, cull, depth, scissor, depthMask;
 };
 
+// --- GL state-leak DETECTOR (env SOH3D_GL_STATECHECK=1) ------------------------------------------
+// The non-deterministic skybox/HUD stripe corruption is consistent with our render pass leaving
+// some global GL state un-restored; the NEXT frame's Fast3D skybox (drawn BEFORE our pass) then
+// inherits it, and what leaks depends on which groups/blend states we drew last -> non-deterministic.
+// This snapshots a BROAD set of context + bound-VAO attrib state; RenderPass compares pre-pass vs
+// post-pass and logs any field we failed to hand back. A CLEAN diff rules a state leak OUT.
+struct FullGl {
+    GLint vao, prog, arrBuf, elemBuf, activeTex, tex0, tex1, depthFunc, cullMode, frontFace;
+    GLint bSrcRGB, bDstRGB, bSrcA, bDstA, bEqRGB, bEqA, viewport[4];
+    GLfloat blendColor[4], depthRange[2];
+    GLboolean blend, cull, depth, scissor, depthMask, colorMask[4];
+    GLint attrEn[8], attrBuf[8];
+};
+static void captureFullGl(FullGl& f) {
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &f.vao);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &f.prog);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &f.arrBuf);
+    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &f.elemBuf);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &f.activeTex);
+    glActiveTexture(GL_TEXTURE0); glGetIntegerv(GL_TEXTURE_BINDING_2D, &f.tex0);
+    glActiveTexture(GL_TEXTURE1); glGetIntegerv(GL_TEXTURE_BINDING_2D, &f.tex1);
+    glActiveTexture((GLenum)f.activeTex);
+    glGetIntegerv(GL_BLEND_SRC_RGB, &f.bSrcRGB); glGetIntegerv(GL_BLEND_DST_RGB, &f.bDstRGB);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &f.bSrcA); glGetIntegerv(GL_BLEND_DST_ALPHA, &f.bDstA);
+    glGetIntegerv(GL_BLEND_EQUATION_RGB, &f.bEqRGB); glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &f.bEqA);
+    glGetIntegerv(GL_DEPTH_FUNC, &f.depthFunc); glGetIntegerv(GL_CULL_FACE_MODE, &f.cullMode);
+    glGetIntegerv(GL_FRONT_FACE, &f.frontFace); glGetIntegerv(GL_VIEWPORT, f.viewport);
+    glGetFloatv(GL_BLEND_COLOR, f.blendColor); glGetFloatv(GL_DEPTH_RANGE, f.depthRange);
+    f.blend = glIsEnabled(GL_BLEND); f.cull = glIsEnabled(GL_CULL_FACE);
+    f.depth = glIsEnabled(GL_DEPTH_TEST); f.scissor = glIsEnabled(GL_SCISSOR_TEST);
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &f.depthMask); glGetBooleanv(GL_COLOR_WRITEMASK, f.colorMask);
+    for (int i = 0; i < 8; i++) {
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &f.attrEn[i]);
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &f.attrBuf[i]);
+    }
+}
+static int g_stateCheck = -1;
+static void checkGlLeak(const FullGl& pre, const char* where) {
+    if (g_stateCheck < 0) { const char* e = getenv("SOH3D_GL_STATECHECK"); g_stateCheck = (e && e[0] == '1') ? 1 : 0; }
+    if (!g_stateCheck) return;
+    FullGl p; captureFullGl(p);
+    int n = 0;
+#define LK_I(field) if (pre.field != p.field) { fprintf(stderr, "[SoH3D_GL LEAK %s] %s: %d -> %d\n", where, #field, (int)pre.field, (int)p.field); n++; }
+    LK_I(vao) LK_I(prog) LK_I(arrBuf) LK_I(elemBuf) LK_I(activeTex) LK_I(tex0) LK_I(tex1)
+    LK_I(depthFunc) LK_I(cullMode) LK_I(frontFace) LK_I(bSrcRGB) LK_I(bDstRGB) LK_I(bSrcA) LK_I(bDstA)
+    LK_I(bEqRGB) LK_I(bEqA) LK_I(blend) LK_I(cull) LK_I(depth) LK_I(scissor) LK_I(depthMask)
+#undef LK_I
+    if (memcmp(pre.viewport, p.viewport, sizeof(p.viewport))) { fprintf(stderr, "[SoH3D_GL LEAK %s] viewport changed\n", where); n++; }
+    if (memcmp(pre.blendColor, p.blendColor, sizeof(p.blendColor))) { fprintf(stderr, "[SoH3D_GL LEAK %s] blendColor changed\n", where); n++; }
+    if (memcmp(pre.depthRange, p.depthRange, sizeof(p.depthRange))) { fprintf(stderr, "[SoH3D_GL LEAK %s] depthRange changed\n", where); n++; }
+    if (memcmp(pre.colorMask, p.colorMask, sizeof(p.colorMask))) { fprintf(stderr, "[SoH3D_GL LEAK %s] colorMask changed\n", where); n++; }
+    for (int i = 0; i < 8; i++) {
+        if (pre.attrEn[i] != p.attrEn[i]) { fprintf(stderr, "[SoH3D_GL LEAK %s] attrib[%d] enabled %d -> %d\n", where, i, pre.attrEn[i], p.attrEn[i]); n++; }
+        if (pre.attrBuf[i] != p.attrBuf[i]) { fprintf(stderr, "[SoH3D_GL LEAK %s] attrib[%d] buffer %d -> %d\n", where, i, pre.attrBuf[i], p.attrBuf[i]); n++; }
+    }
+    if (n) fprintf(stderr, "[SoH3D_GL LEAK %s] %d field(s) NOT restored by our pass\n", where, n);
+}
+
 // Open our render pass: snapshot Fast3D's state, then install OUR common state once (isolated
 // VAO, our program, depth test on / LEQUAL, scissor+cull off). Per-item uniforms/attribs and
 // per-group blend/depth-write are set inside drawOne.
@@ -545,6 +603,8 @@ extern "C" void SoH3D_GL_RenderPass(void) {
     if (nodraw < 0) { const char* e = getenv("SOH3D_GL_NODRAW"); nodraw = (e && e[0] == '1') ? 1 : 0; }
     if (nodraw) { g_drawList.clear(); return; }
 
+    FullGl pre;
+    if (g_stateCheck != 0) captureFullGl(pre); // snapshot BEFORE the pass (cheap unless STATECHECK off)
     SavedGl s;
     beginPass(s);
     int drawn = 0;
@@ -568,6 +628,7 @@ extern "C" void SoH3D_GL_RenderPass(void) {
         drawn++;
     }
     endPass(s);
+    checkGlLeak(pre, "renderpass"); // verify our pass handed every captured state field back
 
     {
         static int dbg = -1;
