@@ -354,32 +354,39 @@ bool Fast3dWindow::KeyUp(int32_t scancode) {
     }
 
     Ship::Context::GetRawInstance()->GetWindow()->SetLastScancode(-1);
-    return Ship::Context::GetRawInstance()->GetControlDeck()->ProcessKeyboardEvent(
-        Ship::KbEventType::LUS_KB_EVENT_KEY_UP, static_cast<Ship::KbScancode>(scancode));
+    // The control deck is optional: an embedder that needs no controller input (e.g. a model viewer)
+    // may run without one. Routing keyboard/mouse events to a null deck would crash, so no-op instead.
+    auto controlDeck = Ship::Context::GetRawInstance()->GetControlDeck();
+    return controlDeck ? controlDeck->ProcessKeyboardEvent(Ship::KbEventType::LUS_KB_EVENT_KEY_UP,
+                                                           static_cast<Ship::KbScancode>(scancode))
+                       : false;
 }
 
 bool Fast3dWindow::KeyDown(int32_t scancode) {
-    bool isProcessed = Ship::Context::GetRawInstance()->GetControlDeck()->ProcessKeyboardEvent(
-        Ship::KbEventType::LUS_KB_EVENT_KEY_DOWN, static_cast<Ship::KbScancode>(scancode));
+    auto controlDeck = Ship::Context::GetRawInstance()->GetControlDeck();
+    bool isProcessed = controlDeck && controlDeck->ProcessKeyboardEvent(Ship::KbEventType::LUS_KB_EVENT_KEY_DOWN,
+                                                                        static_cast<Ship::KbScancode>(scancode));
     Ship::Context::GetRawInstance()->GetWindow()->SetLastScancode(scancode);
 
     return isProcessed;
 }
 
 void Fast3dWindow::AllKeysUp() {
-    Ship::Context::GetRawInstance()->GetControlDeck()->ProcessKeyboardEvent(Ship::KbEventType::LUS_KB_EVENT_ALL_KEYS_UP,
-                                                                            Ship::KbScancode::LUS_KB_UNKNOWN);
+    auto controlDeck = Ship::Context::GetRawInstance()->GetControlDeck();
+    if (controlDeck) {
+        controlDeck->ProcessKeyboardEvent(Ship::KbEventType::LUS_KB_EVENT_ALL_KEYS_UP,
+                                          Ship::KbScancode::LUS_KB_UNKNOWN);
+    }
 }
 
 bool Fast3dWindow::MouseButtonUp(int button) {
-    return Ship::Context::GetRawInstance()->GetControlDeck()->ProcessMouseButtonEvent(
-        false, static_cast<Ship::MouseBtn>(button));
+    auto controlDeck = Ship::Context::GetRawInstance()->GetControlDeck();
+    return controlDeck ? controlDeck->ProcessMouseButtonEvent(false, static_cast<Ship::MouseBtn>(button)) : false;
 }
 
 bool Fast3dWindow::MouseButtonDown(int button) {
-    bool isProcessed = Ship::Context::GetRawInstance()->GetControlDeck()->ProcessMouseButtonEvent(
-        true, static_cast<Ship::MouseBtn>(button));
-    return isProcessed;
+    auto controlDeck = Ship::Context::GetRawInstance()->GetControlDeck();
+    return controlDeck ? controlDeck->ProcessMouseButtonEvent(true, static_cast<Ship::MouseBtn>(button)) : false;
 }
 
 void Fast3dWindow::OnFullscreenChanged(bool isNowFullscreen) {
