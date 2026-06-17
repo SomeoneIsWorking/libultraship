@@ -3899,6 +3899,7 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
     rawTexMetdata.h_byte_scale = 1;
     rawTexMetdata.v_pixel_scale = 1;
 
+    bool loadedOtrTex = false;
     if ((i & 1) != 1) {
         if (gfx_check_image_signature(imgData) == 1) {
             std::shared_ptr<Fast::Texture> tex = std::static_pointer_cast<Fast::Texture>(
@@ -3909,6 +3910,7 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
                 return false;
             }
 
+            loadedOtrTex = true;
             i = (uintptr_t) reinterpret_cast<char*>(tex->ImageData);
             texFlags = tex->Flags;
             rawTexMetdata.width = tex->Width;
@@ -3923,17 +3925,22 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
     // If the resolved address is still in the N64 segmented range, SegAddr
     // failed to resolve it (segment not set up). Skip to avoid dereferencing
     // invalid memory.
+    // EXCEPTION: a successfully-loaded OTR texture's ImageData is a valid host pointer regardless of
+    // its numeric value — on systems whose heap sits below 0x10000000 (e.g. a low-mmap'd process)
+    // ImageData can legitimately be <= 0x0FFFFFFF, and treating that as "unresolved" wrongly drops
+    // the texture (this is how actor-segmented eye/mouth face textures rendered as a VOID). Only the
+    // raw/unresolved path (no OTR load) can still be a stale segmented address, so gate on that.
     // For Windows, also check if the address is not from a dll because this validation returns a false positive caused
     // by how the virtual memory is allocated.
 #ifdef _WIN32
     HMODULE module = nullptr;
-    if (i <= 0x0FFFFFFF &&
+    if (!loadedOtrTex && i <= 0x0FFFFFFF &&
         !(GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                              reinterpret_cast<LPCSTR>(i), &module))) {
         return false;
     }
 #else
-    if (i <= 0x0FFFFFFF) {
+    if (!loadedOtrTex && i <= 0x0FFFFFFF) {
         // DIAGNOSTIC (SoH3D): the "sky bug" — a non-deterministic scene-load race where a texture's
         // N64 segment base is still 0 when its display list first runs, so SegAddr can't resolve it.
         // The texture is skipped here, leaving a stale GL binding that paints garbage (a HUD icon, a
@@ -3953,9 +3960,9 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
                 crumb += ":" + std::to_string(disp[k].line);
                 if (k) crumb += " <- ";
             }
-            SPDLOG_WARN("SoH3D SKYBUG: unresolved texture segment {} (w1=0x{:08X}, segBase=0) skipped; "
-                        "drawn by [{}]",
-                        segNum, (uint32_t)w1, crumb.empty() ? "(no OPEN_DISPS context)" : crumb);
+            SPDLOG_WARN("SoH3D SKYBUG: unresolved texture segment {} (w1=0x{:08X}, resolved=0x{:016X}) "
+                        "skipped; drawn by [{}]",
+                        segNum, (uint32_t)w1, (uint64_t)i, crumb.empty() ? "(no OPEN_DISPS context)" : crumb);
         }
         return false;
     }
