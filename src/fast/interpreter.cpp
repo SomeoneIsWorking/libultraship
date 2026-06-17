@@ -60,6 +60,25 @@ static int s_soh3dMeasureKey = 0;
 static float s_soh3dMeasHMin, s_soh3dMeasHMax;
 extern "C" void SoH3D_MeasureResult(int key, float height); // implemented in soh/src/soh3d/soh3d.c
 
+// charcompare: measure the MODEL-SPACE (modelview-transformed) vertex bbox over a frame, so the tool
+// can frame the model — especially the DEPTH axis — by its true geometry extent. The modelview is the
+// per-limb FK (no view/framing rotation), so this bbox is view-independent. Used to scale the depth
+// axis to fill the z-buffer (framing by the joint bbox crushes depth and z-fights the head/face).
+static bool s_ccBboxMeasure = false;
+static float s_ccBboxMin[3], s_ccBboxMax[3];
+extern "C" void Cc_BboxMeasureBegin() {
+    s_ccBboxMeasure = true;
+    s_ccBboxMin[0] = s_ccBboxMin[1] = s_ccBboxMin[2] = 1e30f;
+    s_ccBboxMax[0] = s_ccBboxMax[1] = s_ccBboxMax[2] = -1e30f;
+}
+extern "C" void Cc_BboxMeasureEnd(float* mn, float* mx) {
+    s_ccBboxMeasure = false;
+    for (int i = 0; i < 3; i++) {
+        mn[i] = s_ccBboxMin[i];
+        mx[i] = s_ccBboxMax[i];
+    }
+}
+
 #define SEG_ADDR(seg, addr) (addr | (seg << 24) | 1)
 #define SUPPORT_CHECK(x) assert(x)
 
@@ -1511,6 +1530,17 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                   v->ob[2] * mRsp->MP_matrix[2][2] + mRsp->MP_matrix[3][2];
         float w = v->ob[0] * mRsp->MP_matrix[0][3] + v->ob[1] * mRsp->MP_matrix[1][3] +
                   v->ob[2] * mRsp->MP_matrix[2][3] + mRsp->MP_matrix[3][3];
+
+        if (s_ccBboxMeasure) {
+            float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
+            float mp[3] = { v->ob[0] * mv[0][0] + v->ob[1] * mv[1][0] + v->ob[2] * mv[2][0] + mv[3][0],
+                            v->ob[0] * mv[0][1] + v->ob[1] * mv[1][1] + v->ob[2] * mv[2][1] + mv[3][1],
+                            v->ob[0] * mv[0][2] + v->ob[1] * mv[1][2] + v->ob[2] * mv[2][2] + mv[3][2] };
+            for (int k = 0; k < 3; k++) {
+                if (mp[k] < s_ccBboxMin[k]) s_ccBboxMin[k] = mp[k];
+                if (mp[k] > s_ccBboxMax[k]) s_ccBboxMax[k] = mp[k];
+            }
+        }
 
         float world_pos[3] = { 0.0 };
         if (mRsp->geometry_mode & G_LIGHTING_POSITIONAL) {
