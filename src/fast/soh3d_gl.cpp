@@ -375,10 +375,12 @@ static void captureFullGl(FullGl& f) {
         glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &f.attrBuf[i]);
     }
 }
-static int g_stateCheck = -1;
+// -1 = uninit (seed from env SOH3D_GL_STATECHECK on first use), 0 = off, 1 = on. Cross-module so
+// soh3d.c's REPL `statecheck 1` can flip it on the moment corruption appears (no relaunch).
+extern "C" int gSoH3dStateCheck = -1;
 static void checkGlLeak(const FullGl& pre, const char* where) {
-    if (g_stateCheck < 0) { const char* e = getenv("SOH3D_GL_STATECHECK"); g_stateCheck = (e && e[0] == '1') ? 1 : 0; }
-    if (!g_stateCheck) return;
+    if (gSoH3dStateCheck < 0) { const char* e = getenv("SOH3D_GL_STATECHECK"); gSoH3dStateCheck = (e && e[0] == '1') ? 1 : 0; }
+    if (!gSoH3dStateCheck) return;
     FullGl p; captureFullGl(p);
     int n = 0;
 #define LK_I(field) if (pre.field != p.field) { fprintf(stderr, "[SoH3D_GL LEAK %s] %s: %d -> %d\n", where, #field, (int)pre.field, (int)p.field); n++; }
@@ -604,7 +606,7 @@ extern "C" void SoH3D_GL_RenderPass(void) {
     if (nodraw) { g_drawList.clear(); return; }
 
     FullGl pre;
-    if (g_stateCheck != 0) captureFullGl(pre); // snapshot BEFORE the pass (cheap unless STATECHECK off)
+    if (gSoH3dStateCheck != 0) captureFullGl(pre); // snapshot BEFORE the pass (skipped once STATECHECK confirmed off)
     SavedGl s;
     beginPass(s);
     int drawn = 0;
