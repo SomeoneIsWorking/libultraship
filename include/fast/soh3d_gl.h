@@ -95,6 +95,13 @@ void SoH3D_GL_RenderPass(void);
 // e.g. a scene transition early-out) so they can't leak into the next frame.
 void SoH3D_GL_FrameBegin(void);
 
+// Snapshot the current pose (the bones last set via SoH3D_GL_SetBones) for this model id, tagged
+// for the next draw of that id. Call once per actor at EMIT time, right after SoH3D_GL_SetBones and
+// before the draw opcode is written. This is what lets two actors that share a model id render with
+// their own poses: by the time the deferred draw is interpreted, g_models[id].bones holds only the
+// last actor's pose, so each actor's pose must be captured here at build time instead.
+void SoH3D_GL_EmitPose(int modelId);
+
 // Set the scene's world-space key-light (sun) direction (direction TO the light, the F3DEX
 // convention OoT stores in lightSettings.light1Dir). Used by the character/prop half-Lambert
 // FORM term so shading tracks time of day. Need not be normalized (the shader renormalizes).

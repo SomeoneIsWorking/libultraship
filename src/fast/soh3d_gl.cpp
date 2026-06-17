@@ -55,6 +55,16 @@ struct GlModel {
 std::unordered_map<int, GlModel> g_models; // keyed by stable model id
 SoH3DModelProvider g_provider = nullptr;
 
+// Emit-time pose snapshots, captured when each actor's draw opcode is written (after its SetBones,
+// before later same-modelId actors overwrite g_models[modelId].bones). Consumed by Submit in
+// modelId-FIFO order. See the long note in SoH3D_GL_Submit.
+struct EmitPose {
+    int modelId;
+    std::vector<float> bones;
+    int boneCount;
+};
+std::vector<EmitPose> g_poseQueue;
+
 GLuint g_program = 0;
 // Our own Vertex Array Object. Fast3D's GL backend renders on its OWN VAO (gfx_opengl.cpp
 // creates mOpenglVao once at init and assumes it stays configured), so we must NOT mutate
@@ -235,6 +245,22 @@ extern "C" void SoH3D_GL_SetBones(int modelId, const float* mats16, int n) {
     m.boneCount = n;
 }
 
+extern "C" void SoH3D_GL_EmitPose(int modelId) {
+    // Snapshot this actor's just-set pose at EMIT time so it survives later same-modelId SetBones
+    // calls; Submit pairs it back by modelId-FIFO. Called from SoH3D_EmitModelDraw before the draw
+    // opcode. No bones set -> push an empty entry so the FIFO still pairs 1:1 with the draws.
+    EmitPose p;
+    p.modelId = modelId;
+    auto it = g_models.find(modelId);
+    if (it != g_models.end() && !it->second.bones.empty()) {
+        p.bones = it->second.bones;
+        p.boneCount = it->second.boneCount;
+    } else {
+        p.boneCount = 0;
+    }
+    g_poseQueue.push_back(std::move(p));
+}
+
 // Upload a model's CPU data (from the provider) to GL. GL must be current.
 static bool uploadModel(GlModel& m, const SoH3DGlGroup* groups, int groupCount, const SoH3DGlTex* texs, int texCount) {
     std::vector<SoH3DGlVtx> all;
@@ -359,7 +385,7 @@ void endPass(const SavedGl& s) {
 // Draw one already-uploaded model with the given MP/invertY/tint, using the model's currently
 // set skinning pose. Assumes beginPass installed the common state and the VAO is g_vao.
 void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int invertY, unsigned char r,
-             unsigned char g, unsigned char b, float aspectAdj) {
+             unsigned char g, unsigned char b, float aspectAdj, const float* boneData, int boneCnt) {
     // Mirror Fast3D's per-vertex `x = AdjXForAspectRatio(x)` (interpreter.cpp): scale the
     // clip-space X output of MP by the factor the N64 actors get (MP column 0 = row-major
     // indices 0,4,8,12). Without it the OoT3D content shears vs N64 actors as the camera pans.
@@ -378,18 +404,19 @@ void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int inve
     glUniform1f(g_uInvertY, invertY ? -1.0f : 1.0f);
     glUniform3f(g_uTint, r / 255.0f, g / 255.0f, b / 255.0f);
 
-    // uBones: identity by default (bind pose), else the model's per-frame skin matrices.
-    // Row-major (M*v), uploaded transposed for GLSL's column-major m*v. Unused slots identity.
+    // uBones: identity by default (bind pose), else THIS draw item's per-frame skin matrices
+    // (boneData/boneCnt, snapshotted at Submit time so two actors sharing a modelId keep their own
+    // poses). Row-major (M*v), uploaded transposed for GLSL's column-major m*v. Unused slots identity.
     {
         float bones[SOH3D_GL_MAX_BONES * 16];
         for (int k = 0; k < SOH3D_GL_MAX_BONES; k++) {
             float* d = bones + k * 16;
             for (int e = 0; e < 16; e++) d[e] = (e % 5 == 0) ? 1.0f : 0.0f; // identity
         }
-        int nb = m.boneCount < SOH3D_GL_MAX_BONES ? m.boneCount : SOH3D_GL_MAX_BONES;
-        if (!m.bones.empty()) memcpy(bones, m.bones.data(), (size_t)nb * 16 * sizeof(float));
+        int nb = boneCnt < SOH3D_GL_MAX_BONES ? boneCnt : SOH3D_GL_MAX_BONES;
+        if (boneData && boneCnt > 0) memcpy(bones, boneData, (size_t)nb * 16 * sizeof(float));
         glUniformMatrix4fv(g_uBones, SOH3D_GL_MAX_BONES, GL_TRUE, bones);
-        glUniform1f(g_uSkin, (!m.bones.empty() && m.boneCount > 0) ? 1.0f : 0.0f);
+        glUniform1f(g_uSkin, (boneData && boneCnt > 0) ? 1.0f : 0.0f);
     }
 
     glBindBuffer(GL_ARRAY_BUFFER, m.vbo);
@@ -432,6 +459,8 @@ struct DrawItem {
     int invertY;
     unsigned char r, g, b;
     float aspectAdj;
+    std::vector<float> bones; // per-item skin pose snapshot (so same-modelId actors keep own poses)
+    int boneCount = 0;
 };
 std::vector<DrawItem> g_drawList;
 
@@ -450,7 +479,9 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
     if (nodraw) return;
     SavedGl s;
     beginPass(s);
-    drawOne(*m, mp16, mp16, /*lit=*/0, invertY, r, g, b, aspectAdj); // legacy path: no lighting
+    // legacy path: no lighting; pose = the model's current bones (single-actor inline draw)
+    drawOne(*m, mp16, mp16, /*lit=*/0, invertY, r, g, b, aspectAdj,
+            m->bones.empty() ? nullptr : m->bones.data(), m->boneCount);
     endPass(s);
 }
 
@@ -466,11 +497,35 @@ extern "C" void SoH3D_GL_Submit(int modelId, const float* mp16, const float* mv1
     it.g = g;
     it.b = b;
     it.aspectAdj = aspectAdj;
-    g_drawList.push_back(it);
+    // Per-item pose. The pose can't be read from g_models[modelId] HERE: Submit runs at dlist
+    // INTERPRET time, by which point every actor has already done its SetBones during dlist BUILD,
+    // so a later same-modelId actor has overwritten g_models[modelId].bones. Instead the pose is
+    // snapshotted at EMIT time into g_poseQueue (SoH3D_GL_EmitPose, called right after SetBones);
+    // here we consume the matching entry in FIFO order. Same-modelId emits and Submits preserve
+    // relative order (sequential POLY_OPA), so the first queued pose for this modelId is this item's.
+    for (auto q = g_poseQueue.begin(); q != g_poseQueue.end(); ++q) {
+        if (q->modelId == modelId) {
+            it.bones = std::move(q->bones);
+            it.boneCount = q->boneCount;
+            g_poseQueue.erase(q);
+            break;
+        }
+    }
+    if (it.bones.empty()) {
+        // No emit-time pose (e.g. the legacy inline path, or an unposed model): fall back to the
+        // model's current bones so single-actor behaviour is unchanged.
+        auto mit = g_models.find(modelId);
+        if (mit != g_models.end() && !mit->second.bones.empty()) {
+            it.bones = mit->second.bones;
+            it.boneCount = mit->second.boneCount;
+        }
+    }
+    g_drawList.push_back(std::move(it));
 }
 
 extern "C" void SoH3D_GL_FrameBegin(void) {
     g_drawList.clear();
+    g_poseQueue.clear(); // drop any emit-time poses left unconsumed (e.g. a dropped/early-out frame)
 }
 
 extern "C" void SoH3D_GL_RenderPass(void) {
@@ -486,7 +541,8 @@ extern "C" void SoH3D_GL_RenderPass(void) {
     for (const DrawItem& it : g_drawList) {
         GlModel* m = ensureUploaded(it.modelId);
         if (!m) continue;
-        drawOne(*m, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.aspectAdj);
+        drawOne(*m, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.aspectAdj,
+                it.bones.empty() ? nullptr : it.bones.data(), it.boneCount);
         drawn++;
     }
     endPass(s);
@@ -494,9 +550,18 @@ extern "C" void SoH3D_GL_RenderPass(void) {
     {
         static int dbg = -1;
         if (dbg < 0) { const char* e = getenv("SOH3D_GL_DBG"); dbg = (e && e[0] == '1') ? 1 : 0; }
-        if (dbg)
+        if (dbg) {
             fprintf(stderr, "[SoH3D_GL] render pass: %d/%zu items glerr=0x%x\n", drawn, g_drawList.size(),
                     glGetError());
+            // Per-item pose checksum: two items with the same modelId but DIFFERENT sums prove the
+            // per-item pose capture works (the old per-modelId store gave same-model actors one pose).
+            for (const DrawItem& it : g_drawList) {
+                double sum = 0.0;
+                for (float f : it.bones) sum += f;
+                fprintf(stderr, "[SoH3D_GL]   item model=%d boneCount=%d poseSum=%.4f\n", it.modelId,
+                        it.boneCount, sum);
+            }
+        }
     }
     g_drawList.clear();
 }
