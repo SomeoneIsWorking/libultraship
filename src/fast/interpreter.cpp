@@ -3826,9 +3826,19 @@ bool gfx_dl_otr_hash_handler_custom(F3DGfx** cmd0) {
             g_exec_stack.call(cmd, gfx);
         }
     } else {
-        Interpreter* gfx = mInstance.lock().get();
-        assert(0 && "????");
-        (*cmd0) = (F3DGfx*)gfx->SegAddr((*cmd0)->words.w1);
+        // Branch (no return) to a hash-referenced DL — the no-push variant of the call case above.
+        // The retail game never emits this (it was an unimplemented assert(0)), but actor limb DLs
+        // that branch to a sub-DL by hash (e.g. En_Zf / Dinolfos+Lizalfos) do. Mirror the call case's
+        // hash read, then branch like gfx_dl_handler_common's no-push path instead of pushing a return.
+        (*cmd0)++; // advance to the hash word (carries the return point for the branched frame)
+        uint64_t hash = ((uint64_t)(*cmd0)->words.w0 << 32) + (*cmd0)->words.w1;
+        F3DGfx* gfx = (F3DGfx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(hash);
+        if (gfx != nullptr) {
+            (*cmd0) = gfx;
+            g_exec_stack.branch(cmd);
+        } else {
+            ++(*cmd0); // unresolved: skip past the hash word and continue the current DL
+        }
         return true;
     }
     return false;
