@@ -609,6 +609,14 @@ void GfxRenderingAPIVulkan::CreateInstance() {
         SPDLOG_ERROR("SDL_Vulkan_GetInstanceExtensions(list) failed: {}", SDL_GetError());
         abort();
     }
+#if defined(__APPLE__)
+    // MoltenVK is a "portability" (non-conformant) Vulkan implementation. Without enabling this
+    // instance extension AND the matching create flag, vkEnumeratePhysicalDevices returns zero
+    // devices on macOS. (Added before debug_utils so the validation-retry below can pop only the
+    // debug_utils entry without dropping this.)
+    extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+#endif
+    // debug_utils goes LAST so the validation-retry path can drop it with a single pop_back().
     if (mEnableValidation) {
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
@@ -633,6 +641,9 @@ void GfxRenderingAPIVulkan::CreateInstance() {
     ci.ppEnabledExtensionNames = extensions.data();
     ci.enabledLayerCount = (uint32_t)layers.size();
     ci.ppEnabledLayerNames = layers.data();
+#if defined(__APPLE__)
+    ci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR; // see portability ext above
+#endif
 
     VkResult res = vkCreateInstance(&ci, nullptr, &mInstance);
     if (res != VK_SUCCESS) {
@@ -641,14 +652,17 @@ void GfxRenderingAPIVulkan::CreateInstance() {
             SPDLOG_WARN("vkCreateInstance with validation failed ({}); retrying without", (int)res);
             mEnableValidation = false;
             ci.enabledLayerCount = 0;
-            ci.enabledExtensionCount = extCount; // drop debug_utils
+            extensions.pop_back(); // drop debug_utils (it was pushed last); keep portability
+            ci.enabledExtensionCount = (uint32_t)extensions.size();
+            ci.ppEnabledExtensionNames = extensions.data();
             VK_CHECK(vkCreateInstance(&ci, nullptr, &mInstance));
         } else {
             SPDLOG_ERROR("vkCreateInstance failed: {}", (int)res);
             abort();
         }
     }
-    SPDLOG_INFO("Vulkan instance created ({} extensions, validation={})", extCount, mEnableValidation);
+    SPDLOG_INFO("Vulkan instance created ({} extensions, validation={})", (unsigned)extensions.size(),
+                mEnableValidation);
 }
 
 void GfxRenderingAPIVulkan::CreateSurface() {
@@ -733,7 +747,24 @@ void GfxRenderingAPIVulkan::CreateLogicalDevice() {
         queueInfos.push_back(qi);
     }
 
-    const char* deviceExtensions[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    std::vector<const char*> deviceExtensions = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+#if defined(__APPLE__)
+    // The Vulkan spec REQUIRES enabling VK_KHR_portability_subset on any device that advertises it
+    // (MoltenVK always does); vkCreateDevice fails otherwise. Use the string name to avoid pulling
+    // in the beta headers (VK_ENABLE_BETA_EXTENSIONS) just for the macro.
+    {
+        uint32_t n = 0;
+        vkEnumerateDeviceExtensionProperties(mPhysicalDevice, nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> avail(n);
+        vkEnumerateDeviceExtensionProperties(mPhysicalDevice, nullptr, &n, avail.data());
+        for (const auto& e : avail) {
+            if (strcmp(e.extensionName, "VK_KHR_portability_subset") == 0) {
+                deviceExtensions.push_back("VK_KHR_portability_subset");
+                break;
+            }
+        }
+    }
+#endif
 
     VkPhysicalDeviceFeatures features{};
     features.samplerAnisotropy = VK_FALSE;
@@ -744,8 +775,8 @@ void GfxRenderingAPIVulkan::CreateLogicalDevice() {
     ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     ci.queueCreateInfoCount = (uint32_t)queueInfos.size();
     ci.pQueueCreateInfos = queueInfos.data();
-    ci.enabledExtensionCount = 1;
-    ci.ppEnabledExtensionNames = deviceExtensions;
+    ci.enabledExtensionCount = (uint32_t)deviceExtensions.size();
+    ci.ppEnabledExtensionNames = deviceExtensions.data();
     ci.pEnabledFeatures = &features;
 
     VK_CHECK(vkCreateDevice(mPhysicalDevice, &ci, nullptr, &mDevice));
