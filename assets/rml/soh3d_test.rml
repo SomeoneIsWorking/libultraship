@@ -32,6 +32,8 @@
 				<select-button tabindex="auto" toggle="shadows"><key>Dynamic Shadows</key><value>On</value></select-button>
 				<select-button tabindex="auto" toggle="ao"><key>Ambient Occlusion</key><value>On</value></select-button>
 				<select-button tabindex="auto" toggle="lighting"><key>Scene Lighting</key><value>On</value></select-button>
+				<!-- Cycle row: 0 N64 model+anim / 1 3DS model + N64-retarget anim / 2 3DS model + 3DS anim. -->
+				<select-button tabindex="auto" cycle="linkmode"><key>Link Model / Anim</key><value>N64</value></select-button>
 				<p class="hint">&#8596; switch tab &middot; &#8597; move &middot; Enter / A toggle &middot; Esc / B close</p>
 			</pane>
 			<pane>
@@ -45,6 +47,8 @@
 				     scene transition (SohRmlUi -> gSoH3dMenuWarp -> soh3d.c SoH3D_ReplPoll). -->
 				<div class="section-heading">Game</div>
 				<select-button tabindex="auto" restart="1"><key>Restart &#8594; Title Screen</key><value>&#8635;</value></select-button>
+				<!-- Time-of-day applied to the NEXT warp below: Default (clock runs) / Day / Night. -->
+				<select-button tabindex="auto" cycle="warptime"><key>Warp Time-of-Day</key><value>Default</value></select-button>
 				<div class="section-heading">Level Select</div>
 				<select-button tabindex="auto" warp="238"><key>Kokiri Forest</key><value>&#8594;</value></select-button>
 				<select-button tabindex="auto" warp="177"><key>Market</key><value>&#8594;</value></select-button>
@@ -63,6 +67,21 @@
 				<select-button tabindex="auto" warp="1047"><key>Morpha (Water)</key><value>&#9876;</value></select-button>
 				<select-button tabindex="auto" warp="1043"><key>Bongo Bongo (Shadow)</key><value>&#9876;</value></select-button>
 				<select-button tabindex="auto" warp="141"><key>Twinrova (Spirit)</key><value>&#9876;</value></select-button>
+				<!-- Dungeons (first-room entrances; indices are the literal entrance_table.h hex->dec,
+				     same convention as the Level Select / Boss rows above). -->
+				<div class="section-heading">Dungeons</div>
+				<select-button tabindex="auto" warp="0"><key>Deku Tree</key><value>&#9760;</value></select-button>
+				<select-button tabindex="auto" warp="4"><key>Dodongo's Cavern</key><value>&#9760;</value></select-button>
+				<select-button tabindex="auto" warp="40"><key>Jabu-Jabu</key><value>&#9760;</value></select-button>
+				<select-button tabindex="auto" warp="361"><key>Forest Temple</key><value>&#9760;</value></select-button>
+				<select-button tabindex="auto" warp="357"><key>Fire Temple</key><value>&#9760;</value></select-button>
+				<select-button tabindex="auto" warp="16"><key>Water Temple</key><value>&#9760;</value></select-button>
+				<select-button tabindex="auto" warp="55"><key>Shadow Temple</key><value>&#9760;</value></select-button>
+				<select-button tabindex="auto" warp="130"><key>Spirit Temple</key><value>&#9760;</value></select-button>
+				<select-button tabindex="auto" warp="152"><key>Bottom of the Well</key><value>&#9760;</value></select-button>
+				<select-button tabindex="auto" warp="136"><key>Ice Cavern</key><value>&#9760;</value></select-button>
+				<select-button tabindex="auto" warp="8"><key>Gerudo Training</key><value>&#9760;</value></select-button>
+				<select-button tabindex="auto" warp="1127"><key>Inside Ganon's Castle</key><value>&#9760;</value></select-button>
 			</pane>
 			<pane>
 				<div class="section-heading">About</div>

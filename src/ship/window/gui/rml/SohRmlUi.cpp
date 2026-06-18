@@ -37,6 +37,17 @@ extern "C" int gSoH3dMenuWarp = -1;
 // SoH3D_ReplPoll consumes it (it has the PlayState) and returns to the title screen.
 extern "C" int gSoH3dMenuRestart = 0;
 
+// Link render/anim mode, cycled by the `linkmode` row: 0 = N64 model + N64 anim, 1 = 3DS model +
+// N64-retarget anim, 2 = 3DS model + 3DS-own CSAB anim. soh3d.c's SoH3D_ReplPoll applies it to
+// gSoH3dLinkOn/gSoH3dLinkAnimSrc (and seeds it from the current mode on the first frame). DEFINED
+// here in libultraship because charcompare also links against it.
+extern "C" int gSoH3dMenuLinkMode = 0;
+
+// Time-of-day applied on the NEXT Debug-menu warp, cycled by the `warptime` row: 0 = scene default
+// (clock runs), 1 = Day, 2 = Night. soh3d.c reads this when it consumes gSoH3dMenuWarp and sets
+// gSoH3dForceTime before the transition (so the new scene's Play_Init picks the right day/night set).
+extern "C" int gSoH3dMenuWarpTime = 0;
+
 // Unique id for blocking game input while the RML menu is open (sequence continues the existing
 // *_BLOCK_ID constants in gfx_dxgi.cpp / InputEditorWindow.cpp). Without this, SoH polls the
 // controller/keyboard directly and the game keeps responding under the open menu.
@@ -72,6 +83,37 @@ static bool ToggleState(const ToggleSpec& t) {
 static void SetToggleValueText(Rml::Element* row, bool on) {
     if (Rml::Element* val = row->QuerySelector("value")) {
         val->SetInnerRML(on ? "On" : "Off");
+    }
+}
+
+// Curated cycle rows: an RML row carrying `cycle="<id>"` steps through a fixed list of labels and
+// writes the selected index into a live menu global (consumed by soh3d.c's SoH3D_ReplPoll). Unlike
+// the on/off toggles these have N states. The displayed `<value>` is the current label.
+struct CycleSpec {
+    const char* id;
+    int* live;                 // menu global (also defined as extern "C" above)
+    const char* labels[4];     // labels[0..count-1]
+    int count;
+};
+static const CycleSpec kCycles[] = {
+    { "linkmode", &gSoH3dMenuLinkMode, { "N64", "3DS \xC2\xB7 N64 anim", "3DS \xC2\xB7 3DS anim", nullptr }, 3 },
+    { "warptime", &gSoH3dMenuWarpTime, { "Default", "Day", "Night", nullptr }, 3 },
+};
+static const CycleSpec* FindCycle(const Rml::String& id) {
+    for (const auto& c : kCycles) {
+        if (id == c.id) {
+            return &c;
+        }
+    }
+    return nullptr;
+}
+static void SetCycleValueText(Rml::Element* row, const CycleSpec& c) {
+    int idx = *c.live;
+    if (idx < 0 || idx >= c.count) {
+        idx = 0;
+    }
+    if (Rml::Element* val = row->QuerySelector("value")) {
+        val->SetInnerRML(c.labels[idx]);
     }
 }
 
@@ -268,6 +310,20 @@ void SohRmlUi::ActivateFocused() {
         SetVisible(false);
         return;
     }
+    // Curated multi-state cycle rows (e.g. Link render/anim mode, warp time-of-day): step to the
+    // next state in place rather than "clicking" a row.
+    {
+        const Rml::String cid = focus->GetAttribute<Rml::String>("cycle", "");
+        if (const CycleSpec* c = cid.empty() ? nullptr : FindCycle(cid)) {
+            int idx = *c->live;
+            if (idx < 0 || idx >= c->count) {
+                idx = 0;
+            }
+            *c->live = (idx + 1) % c->count;
+            SetCycleValueText(focus, *c);
+            return;
+        }
+    }
     // Curated CVar toggle rows take priority: flip the feature in place rather than "clicking" a row.
     if (ToggleFocusedRow()) {
         return;
@@ -289,6 +345,10 @@ void SohRmlUi::RefreshToggleRows() {
         const Rml::String id = row->GetAttribute<Rml::String>("toggle", "");
         if (const ToggleSpec* t = id.empty() ? nullptr : FindToggle(id)) {
             SetToggleValueText(row, ToggleState(*t));
+        }
+        const Rml::String cid = row->GetAttribute<Rml::String>("cycle", "");
+        if (const CycleSpec* c = cid.empty() ? nullptr : FindCycle(cid)) {
+            SetCycleValueText(row, *c);
         }
     }
 }
