@@ -140,10 +140,17 @@ endif()
 # Vulkan path reaches parity. Desktop Linux / macOS only (not GLES/iOS/Android).
 if (NOT USE_OPENGLES AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
     find_package(Vulkan)
-    if (Vulkan_FOUND)
-        target_link_libraries(libultraship PRIVATE Vulkan::Vulkan)
+    # Runtime GLSL->SPIR-V compilation of the per-combiner shaders uses glslang
+    # (shaderc has no dev headers on this box). find_package(glslang) exposes the
+    # imported targets glslang::glslang / glslang::SPIRV / the default resource limits.
+    find_package(glslang QUIET)
+    if (Vulkan_FOUND AND glslang_FOUND)
+        target_link_libraries(libultraship PRIVATE Vulkan::Vulkan
+            glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits)
         target_compile_definitions(libultraship PRIVATE ENABLE_VULKAN)
-        message(STATUS "soh3d: Vulkan backend ENABLED (${Vulkan_LIBRARIES})")
+        message(STATUS "soh3d: Vulkan backend ENABLED (${Vulkan_LIBRARIES}) + glslang")
+    elseif (Vulkan_FOUND)
+        message(STATUS "soh3d: Vulkan found but glslang missing; Vulkan backend disabled")
     else()
         message(STATUS "soh3d: Vulkan not found; Vulkan backend disabled")
     endif()

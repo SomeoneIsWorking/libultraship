@@ -9,6 +9,9 @@
 
 #include <vector>
 #include <map>
+#include <array>
+#include <unordered_map>
+#include <string>
 #include <cstdint>
 
 namespace Fast {
@@ -18,18 +21,61 @@ namespace Fast {
 // shared window manager for GL / Metal / Vulkan on SDL.
 class GfxWindowBackendSDL2;
 
-// Minimal per-combiner shader record. For Milestone 1 (clear only) we don't build
-// pipelines yet; we just track the combiner feature flags the interpreter queries
-// via ShaderGetInfo so the draw-prep path doesn't dereference null. The real
-// pipeline + SPIR-V live here in Milestone 2.
+// Per-combiner shader record. Holds the compiled SPIR-V shader modules and the
+// vertex-input layout derived from the color-combiner features, mirroring the GL
+// backend's ShaderProgram. VkPipelines are built lazily (per render-state combo)
+// and cached separately in mPipelineCache, keyed on (id0,id1,stateBits).
 //
 // Named *Vulkan (not the interface's opaque Fast::ShaderProgram) because multiple
 // backends compile in the same build (GL + Vulkan on Linux); only one header may
 // define Fast::ShaderProgram (gfx_opengl.h does). We treat ShaderProgram* opaquely
 // and cast, exactly like gfx_metal's ShaderProgramMetal.
 struct ShaderProgramVulkan {
-    uint8_t numInputs;
-    bool usedTextures[2];
+    uint64_t id0 = 0, id1 = 0;
+    uint8_t numInputs = 0;
+    bool usedTextures[2] = { false, false }; // tex0, tex1
+    bool usedMasks[2] = { false, false };
+    bool usedBlend[2] = { false, false };
+    uint8_t numFloats = 0; // vertex stride in floats
+    VkShaderModule vert = VK_NULL_HANDLE;
+    VkShaderModule frag = VK_NULL_HANDLE;
+    // Which of the 6 sampler slots (tex0,tex1,mask0,mask1,blend0,blend1) are used.
+    bool usedSlot[6] = { false, false, false, false, false, false };
+    // Vertex input attributes in declaration order (location == index).
+    struct Attr {
+        uint32_t size;   // component count (1..4 floats)
+        uint32_t offset; // byte offset within the vertex
+    };
+    std::vector<Attr> attribs;
+};
+
+// Pipeline cache key: a shader (combiner) plus the render-state knobs that affect
+// pipeline creation (depth, blend, polygon offset). Viewport/scissor/depth-bias
+// magnitude are dynamic state, so they are NOT part of the key.
+struct VulkanPipelineKey {
+    uint64_t id0, id1;
+    uint32_t stateBits; // bit0 depthTest, bit1 depthMask, bit2 zmodeDecal, bit3 useAlpha
+    bool operator==(const VulkanPipelineKey& o) const {
+        return id0 == o.id0 && id1 == o.id1 && stateBits == o.stateBits;
+    }
+};
+struct VulkanPipelineKeyHash {
+    size_t operator()(const VulkanPipelineKey& k) const {
+        return std::hash<uint64_t>()(k.id0) ^ (std::hash<uint64_t>()(k.id1) << 1) ^
+               (std::hash<uint32_t>()(k.stateBits) << 2);
+    }
+};
+
+// A GPU texture (VkImage) plus its sampling metadata.
+struct TextureVulkan {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    uint32_t width = 0, height = 0;
+    uint16_t filtering = 0; // FILTER_* (for the in-shader three-point path)
+    bool linearFilter = false;
+    uint32_t cms = 0, cmt = 0;
+    bool uploaded = false;
 };
 
 class GfxRenderingAPIVulkan : public GfxRenderingAPI {
@@ -91,6 +137,8 @@ class GfxRenderingAPIVulkan : public GfxRenderingAPI {
     void CreateFramebuffers();
     void CreateCommandResources();
     void CreateSyncObjects();
+    void CreatePerImageSync();
+    void DestroyPerImageSync();
     void RecreateSwapchain();
     void DestroySwapchain();
     // Milestone-1 verification: copy the just-rendered swapchain image to a host
@@ -98,6 +146,22 @@ class GfxRenderingAPIVulkan : public GfxRenderingAPI {
     // on-demand dump triggers as the GL window-backend path.
     void MaybeDumpFrame();
     void WriteSwapchainPpm(const char* path);
+
+    // ---- M2: real rendering (pipelines / vertex streaming / textures) ----
+    void CreateDepthResources();
+    void DestroyDepthResources();
+    void CreateRenderingResources();   // descriptor layout, pipeline layout, per-frame rings, dummy tex
+    void DestroyRenderingResources();
+    uint32_t FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;
+    void CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props, VkBuffer& buf,
+                      VkDeviceMemory& mem, void** mappedOut);
+    void CreateImageRGBA(uint32_t width, uint32_t height, VkImage& image, VkDeviceMemory& mem, VkImageView& view);
+    void UploadImageRGBA(VkImage image, uint32_t width, uint32_t height, const uint8_t* rgba);
+    std::string BuildVkShaderSource(const struct CCFeatures& cc, bool vertex, ShaderProgramVulkan* prg);
+    VkShaderModule CreateShaderModule(const std::vector<uint32_t>& spirv);
+    VkPipeline GetOrCreatePipeline(ShaderProgramVulkan* prg, uint32_t stateBits);
+    VkSampler GetOrCreateSampler(bool linear, uint32_t cms, uint32_t cmt);
+    void BeginFrameRings(); // reset per-frame vbo/ubo/descriptor pool at acquire
 
     GfxWindowBackendSDL2* mWindowBackend = nullptr;
     SDL_Window* mWindow = nullptr;
@@ -125,9 +189,10 @@ class GfxRenderingAPIVulkan : public GfxRenderingAPI {
 
     static constexpr int kMaxFramesInFlight = 2;
     std::vector<VkCommandBuffer> mCommandBuffers;
-    std::vector<VkSemaphore> mImageAvailableSemaphores;
-    std::vector<VkSemaphore> mRenderFinishedSemaphores;
-    std::vector<VkFence> mInFlightFences;
+    std::vector<VkSemaphore> mImageAvailableSemaphores; // per frame-in-flight
+    std::vector<VkSemaphore> mRenderFinishedSemaphores; // per SWAPCHAIN IMAGE (present sync)
+    std::vector<VkFence> mInFlightFences;               // per frame-in-flight
+    std::vector<VkFence> mImagesInFlight;               // per image: fence last submitted for it
     uint32_t mCurrentFrame = 0;
     uint32_t mImageIndex = 0;
     bool mFrameAcquired = false;
@@ -137,9 +202,60 @@ class GfxRenderingAPIVulkan : public GfxRenderingAPI {
     // (not black) so M1 verification can confirm Vulkan actually drove the present.
     float mClearColor[4] = { 0.10f, 0.35f, 0.45f, 1.0f };
 
-    // Combiner-shader records keyed by (id0,id1). Populated lazily; no GPU pipeline
-    // in Milestone 1.
+    // Depth attachment shared by the swapchain render pass. In M2 every Fast3D draw
+    // renders into the swapchain pass (offscreen framebuffers arrive in M3), so a
+    // single window-sized depth buffer suffices.
+    VkImage mDepthImage = VK_NULL_HANDLE;
+    VkDeviceMemory mDepthMemory = VK_NULL_HANDLE;
+    VkImageView mDepthView = VK_NULL_HANDLE;
+    VkFormat mDepthFormat = VK_FORMAT_D32_SFLOAT;
+
+    // Combiner-shader records keyed by (id0,id1).
     std::map<std::pair<uint64_t, uint64_t>, ShaderProgramVulkan> mShaderProgramPool;
+    std::unordered_map<VulkanPipelineKey, VkPipeline, VulkanPipelineKeyHash> mPipelineCache;
+    VkDescriptorSetLayout mDescriptorSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout mPipelineLayout = VK_NULL_HANDLE;
+
+    // Per-frame-in-flight transient resources: a vertex ring, a uniform ring, and a
+    // descriptor pool, all reset at the start of each acquired frame.
+    struct FrameRing {
+        VkBuffer vbo = VK_NULL_HANDLE;
+        VkDeviceMemory vboMem = VK_NULL_HANDLE;
+        void* vboMapped = nullptr;
+        VkDeviceSize vboCapacity = 0;
+        VkDeviceSize vboOffset = 0;
+        VkBuffer ubo = VK_NULL_HANDLE;
+        VkDeviceMemory uboMem = VK_NULL_HANDLE;
+        void* uboMapped = nullptr;
+        VkDeviceSize uboCapacity = 0;
+        VkDeviceSize uboOffset = 0;
+        VkDescriptorPool descPool = VK_NULL_HANDLE;
+    };
+    std::array<FrameRing, kMaxFramesInFlight> mFrameRings;
+    VkDeviceSize mUboAlignedSize = 0;
+
+    // Samplers cached by (linear, cms, cmt).
+    std::map<uint32_t, VkSampler> mSamplerCache;
+
+    // A 1x1 white texture bound to unused sampler slots so descriptor sets are valid.
+    VkImage mDummyImage = VK_NULL_HANDLE;
+    VkDeviceMemory mDummyMemory = VK_NULL_HANDLE;
+    VkImageView mDummyView = VK_NULL_HANDLE;
+    VkSampler mDummySampler = VK_NULL_HANDLE;
+
+    std::vector<TextureVulkan> mTextures; // indexed by texture id
+
+    // Current draw state. (mCurrentDepthTest/Mask/ZmodeDecal, mSrgbMode and
+    // mCurrentPrimDepth live in the GfxRenderingAPI base class — do not shadow them.)
+    ShaderProgramVulkan* mCurrentShaderProgram = nullptr;
+    uint32_t mCurrentTextureIds[6] = { 0, 0, 0, 0, 0, 0 };
+    uint8_t mCurrentTile = 0;
+    bool mCurrentUseAlpha = false;
+    float mCurrentNoiseScale = 0.0f;
+    uint32_t mFrameCount = 0;
+    VkViewport mCurrentViewport{};
+    VkRect2D mCurrentScissor{};
+
     FilteringMode mCurrentFilterMode = FILTER_THREE_POINT;
     uint32_t mNextTextureId = 1;
     int mFramebufferCount = 1; // id 0 = screen

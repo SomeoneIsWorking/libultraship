@@ -26,16 +26,66 @@
 #include "fast/interpreter.h"
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
+#include <prism/processor.h>
 
 #include <SDL2/SDL_vulkan.h>
+
+#include <glslang/Public/ShaderLang.h>
+#include <glslang/Public/ResourceLimits.h>
+#include <glslang/SPIRV/GlslangToSpv.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <array>
+#include <mutex>
 #include <stdexcept>
 #include <spdlog/spdlog.h>
+
+namespace {
+// Runtime GLSL -> SPIR-V via glslang. glslang's process must be initialized once
+// per process. Returns true on success; on failure fills outLog and returns false.
+bool gVkGlslangInited = false;
+std::once_flag gVkGlslangOnce;
+
+bool CompileGlslToSpirv(EShLanguage stage, const std::string& src, std::vector<uint32_t>& outSpirv,
+                        std::string& outLog) {
+    std::call_once(gVkGlslangOnce, []() {
+        glslang::InitializeProcess();
+        gVkGlslangInited = true;
+    });
+
+    glslang::TShader shader(stage);
+    const char* str = src.c_str();
+    shader.setStrings(&str, 1);
+    shader.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 100);
+    shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_1);
+    shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_3);
+
+    const TBuiltInResource* resources = GetDefaultResources();
+    const int defaultVersion = 450;
+    EShMessages messages = (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules);
+
+    if (!shader.parse(resources, defaultVersion, false, messages)) {
+        outLog = std::string("parse: ") + shader.getInfoLog() + "\n" + shader.getInfoDebugLog();
+        return false;
+    }
+
+    glslang::TProgram program;
+    program.addShader(&shader);
+    if (!program.link(messages)) {
+        outLog = std::string("link: ") + program.getInfoLog();
+        return false;
+    }
+
+    glslang::SpvOptions spvOptions;
+    spvOptions.disableOptimizer = true;
+    spvOptions.validate = false;
+    glslang::GlslangToSpv(*program.getIntermediate(stage), outSpirv, &spvOptions);
+    return !outSpirv.empty();
+}
+} // namespace
 
 // SoH3D frame-dump globals (defined in gfx_sdl2.cpp). The REPL sets these to
 // capture the current frame on demand; we honor them from the Vulkan present path
@@ -44,6 +94,450 @@ extern "C" {
 extern char gSoh3dDumpPath[1024];
 extern volatile int gSoh3dDumpPending;
 }
+
+// ============================================================================
+// Combiner -> GLSL helpers.
+//
+// These mirror the per-color-combiner formula generation in gfx_opengl.cpp
+// (shader_item_to_str / append_formula). The combiner string output is identical;
+// only the surrounding Vulkan template (explicit locations + a UBO for the loose
+// uniforms) differs. The bare identifiers these strings emit (frame_count,
+// noise_scale) are routed to the UBO via #defines in the Vulkan template, so the
+// formula logic is reused verbatim. Kept local to this TU to avoid disturbing the
+// GL backend; a shared extraction is a later cleanup.
+// ============================================================================
+namespace {
+using namespace Fast;
+
+#define RAND_NOISE "((random(vec3(floor(gl_FragCoord.xy * noise_scale), float(frame_count))) + 1.0) / 2.0)"
+
+const char* vk_shader_item_to_str(uint32_t item, bool with_alpha, bool only_alpha, bool inputs_have_alpha,
+                                  bool first_cycle, bool hint_single_element) {
+    if (!only_alpha) {
+        switch (item) {
+            case SHADER_0:
+                return with_alpha ? "vec4(0.0, 0.0, 0.0, 0.0)" : "vec3(0.0, 0.0, 0.0)";
+            case SHADER_1:
+                return with_alpha ? "vec4(1.0, 1.0, 1.0, 1.0)" : "vec3(1.0, 1.0, 1.0)";
+            case SHADER_INPUT_1:
+                return with_alpha || !inputs_have_alpha ? "vInput1" : "vInput1.rgb";
+            case SHADER_INPUT_2:
+                return with_alpha || !inputs_have_alpha ? "vInput2" : "vInput2.rgb";
+            case SHADER_INPUT_3:
+                return with_alpha || !inputs_have_alpha ? "vInput3" : "vInput3.rgb";
+            case SHADER_INPUT_4:
+                return with_alpha || !inputs_have_alpha ? "vInput4" : "vInput4.rgb";
+            case SHADER_TEXEL0:
+                return first_cycle ? (with_alpha ? "texVal0" : "texVal0.rgb")
+                                   : (with_alpha ? "texVal1" : "texVal1.rgb");
+            case SHADER_TEXEL0A:
+                return first_cycle
+                           ? (hint_single_element ? "texVal0.a"
+                                                  : (with_alpha ? "vec4(texVal0.a, texVal0.a, texVal0.a, texVal0.a)"
+                                                                : "vec3(texVal0.a, texVal0.a, texVal0.a)"))
+                           : (hint_single_element ? "texVal1.a"
+                                                  : (with_alpha ? "vec4(texVal1.a, texVal1.a, texVal1.a, texVal1.a)"
+                                                                : "vec3(texVal1.a, texVal1.a, texVal1.a)"));
+            case SHADER_TEXEL1A:
+                return first_cycle
+                           ? (hint_single_element ? "texVal1.a"
+                                                  : (with_alpha ? "vec4(texVal1.a, texVal1.a, texVal1.a, texVal1.a)"
+                                                                : "vec3(texVal1.a, texVal1.a, texVal1.a)"))
+                           : (hint_single_element ? "texVal0.a"
+                                                  : (with_alpha ? "vec4(texVal0.a, texVal0.a, texVal0.a, texVal0.a)"
+                                                                : "vec3(texVal0.a, texVal0.a, texVal0.a)"));
+            case SHADER_TEXEL1:
+                return first_cycle ? (with_alpha ? "texVal1" : "texVal1.rgb")
+                                   : (with_alpha ? "texVal0" : "texVal0.rgb");
+            case SHADER_COMBINED:
+                return with_alpha ? "texel" : "texel.rgb";
+            case SHADER_NOISE:
+                return with_alpha ? "vec4(" RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ")"
+                                  : "vec3(" RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ")";
+        }
+    } else {
+        switch (item) {
+            case SHADER_0:
+                return "0.0";
+            case SHADER_1:
+                return "1.0";
+            case SHADER_INPUT_1:
+                return "vInput1.a";
+            case SHADER_INPUT_2:
+                return "vInput2.a";
+            case SHADER_INPUT_3:
+                return "vInput3.a";
+            case SHADER_INPUT_4:
+                return "vInput4.a";
+            case SHADER_TEXEL0:
+                return first_cycle ? "texVal0.a" : "texVal1.a";
+            case SHADER_TEXEL0A:
+                return first_cycle ? "texVal0.a" : "texVal1.a";
+            case SHADER_TEXEL1A:
+                return first_cycle ? "texVal1.a" : "texVal0.a";
+            case SHADER_TEXEL1:
+                return first_cycle ? "texVal1.a" : "texVal0.a";
+            case SHADER_COMBINED:
+                return "texel.a";
+            case SHADER_NOISE:
+                return RAND_NOISE;
+        }
+    }
+    return "";
+}
+
+bool vk_get_bool(prism::ContextTypes* value) {
+    if (std::holds_alternative<int>(*value)) {
+        return std::get<int>(*value) == 1;
+    }
+    return false;
+}
+
+prism::ContextTypes* vk_append_formula(prism::ContextTypes* _, prism::ContextTypes* a_arg, prism::ContextTypes* a_single,
+                                       prism::ContextTypes* a_mult, prism::ContextTypes* a_mix,
+                                       prism::ContextTypes* a_with_alpha, prism::ContextTypes* a_only_alpha,
+                                       prism::ContextTypes* a_alpha, prism::ContextTypes* a_first_cycle) {
+    auto c = std::get<prism::MTDArray<int>>(*a_arg);
+    bool do_single = vk_get_bool(a_single);
+    bool do_multiply = vk_get_bool(a_mult);
+    bool do_mix = vk_get_bool(a_mix);
+    bool with_alpha = vk_get_bool(a_with_alpha);
+    bool only_alpha = vk_get_bool(a_only_alpha);
+    bool opt_alpha = vk_get_bool(a_alpha);
+    bool first_cycle = vk_get_bool(a_first_cycle);
+    std::string out = "";
+    if (do_single) {
+        out += vk_shader_item_to_str(c.at(only_alpha, 3), with_alpha, only_alpha, opt_alpha, first_cycle, false);
+    } else if (do_multiply) {
+        out += vk_shader_item_to_str(c.at(only_alpha, 0), with_alpha, only_alpha, opt_alpha, first_cycle, false);
+        out += " * ";
+        out += vk_shader_item_to_str(c.at(only_alpha, 2), with_alpha, only_alpha, opt_alpha, first_cycle, true);
+    } else if (do_mix) {
+        out += "mix(";
+        out += vk_shader_item_to_str(c.at(only_alpha, 1), with_alpha, only_alpha, opt_alpha, first_cycle, false);
+        out += ", ";
+        out += vk_shader_item_to_str(c.at(only_alpha, 0), with_alpha, only_alpha, opt_alpha, first_cycle, false);
+        out += ", ";
+        out += vk_shader_item_to_str(c.at(only_alpha, 2), with_alpha, only_alpha, opt_alpha, first_cycle, true);
+        out += ")";
+    } else {
+        out += "(";
+        out += vk_shader_item_to_str(c.at(only_alpha, 0), with_alpha, only_alpha, opt_alpha, first_cycle, false);
+        out += " - ";
+        out += vk_shader_item_to_str(c.at(only_alpha, 1), with_alpha, only_alpha, opt_alpha, first_cycle, false);
+        out += ") * ";
+        out += vk_shader_item_to_str(c.at(only_alpha, 2), with_alpha, only_alpha, opt_alpha, first_cycle, true);
+        out += " + ";
+        out += vk_shader_item_to_str(c.at(only_alpha, 3), with_alpha, only_alpha, opt_alpha, first_cycle, false);
+    }
+    return new prism::ContextTypes{ out };
+}
+
+// Running location counters for the Vulkan template's explicit layout(location=)
+// qualifiers. Reset from BuildVkShaderSource before each stage build: both stages
+// emit varyings in identical order so the per-stage vary counter lines up VS-out
+// with FS-in, and the C++ vertex-attribute layout mirrors the attr counter order.
+int gVkAttrLoc = 0;
+int gVkVaryLoc = 0;
+prism::ContextTypes* vk_aloc(prism::ContextTypes*) {
+    return new prism::ContextTypes{ gVkAttrLoc++ };
+}
+prism::ContextTypes* vk_vloc(prism::ContextTypes*) {
+    return new prism::ContextTypes{ gVkVaryLoc++ };
+}
+
+std::optional<std::string> vk_include_noop(const std::string&) {
+    return std::nullopt;
+}
+
+// Vulkan-valid (#version 450) variant of shaders/opengl/default.shader.glsl. The
+// combiner body is identical; the structural differences are explicit attribute /
+// varying locations, the loose uniforms gathered into a std140 UBO (binding 0) with
+// #defines so the reused combiner strings resolve, and explicit sampler bindings.
+const char* kVkShaderTemplate = R"PRISM(@prism(type='fragment', name='Fast3D Vulkan Shader', version='1.0.0')
+#version 450
+
+@if(VERTEX_SHADER)
+    layout(location = @{aloc()}) in vec4 aVtxPos;
+
+    @for(i in 0..2)
+        @if(o_textures[i])
+            layout(location = @{aloc()}) in vec2 aTexCoord@{i};
+            layout(location = @{vloc()}) out vec2 vTexCoord@{i};
+            @for(j in 0..2)
+                @if(o_clamp[i][j])
+                    @if(j == 0)
+                        layout(location = @{aloc()}) in float aTexClampS@{i};
+                        layout(location = @{vloc()}) out float vTexClampS@{i};
+                    @else
+                        layout(location = @{aloc()}) in float aTexClampT@{i};
+                        layout(location = @{vloc()}) out float vTexClampT@{i};
+                    @end
+                @end
+            @end
+        @end
+    @end
+
+    @if(o_fog)
+        layout(location = @{aloc()}) in vec4 aFog;
+        layout(location = @{vloc()}) out vec4 vFog;
+    @end
+
+    @if(o_grayscale)
+        layout(location = @{aloc()}) in vec4 aGrayscaleColor;
+        layout(location = @{vloc()}) out vec4 vGrayscaleColor;
+    @end
+
+    @for(i in 0..o_inputs)
+        @if(o_alpha)
+            layout(location = @{aloc()}) in vec4 aInput@{i + 1};
+            layout(location = @{vloc()}) out vec4 vInput@{i + 1};
+        @else
+            layout(location = @{aloc()}) in vec3 aInput@{i + 1};
+            layout(location = @{vloc()}) out vec3 vInput@{i + 1};
+        @end
+    @end
+
+    void main() {
+        @for(i in 0..2)
+            @if(o_textures[i])
+                vTexCoord@{i} = aTexCoord@{i};
+                @for(j in 0..2)
+                    @if(o_clamp[i][j])
+                        @if(j == 0)
+                            vTexClampS@{i} = aTexClampS@{i};
+                        @else
+                            vTexClampT@{i} = aTexClampT@{i};
+                        @end
+                    @end
+                @end
+            @end
+        @end
+        @if(o_fog)
+            vFog = aFog;
+        @end
+        @if(o_grayscale)
+            vGrayscaleColor = aGrayscaleColor;
+        @end
+        @for(i in 0..o_inputs)
+            vInput@{i + 1} = aInput@{i + 1};
+        @end
+        gl_Position = aVtxPos;
+    }
+@else
+    layout(location = 0) out vec4 vOutColor;
+
+    @for(i in 0..2)
+        @if(o_textures[i])
+            layout(location = @{vloc()}) in vec2 vTexCoord@{i};
+            @for(j in 0..2)
+                @if(o_clamp[i][j])
+                    @if(j == 0)
+                        layout(location = @{vloc()}) in float vTexClampS@{i};
+                    @else
+                        layout(location = @{vloc()}) in float vTexClampT@{i};
+                    @end
+                @end
+            @end
+        @end
+    @end
+
+    @if(o_fog) layout(location = @{vloc()}) in vec4 vFog;
+    @if(o_grayscale) layout(location = @{vloc()}) in vec4 vGrayscaleColor;
+
+    @for(i in 0..o_inputs)
+        @if(o_alpha)
+            layout(location = @{vloc()}) in vec4 vInput@{i + 1};
+        @else
+            layout(location = @{vloc()}) in vec3 vInput@{i + 1};
+        @end
+    @end
+
+    @if(o_textures[0]) layout(binding = 1) uniform sampler2D uTex0;
+    @if(o_textures[1]) layout(binding = 2) uniform sampler2D uTex1;
+    @if(o_masks[0]) layout(binding = 3) uniform sampler2D uTexMask0;
+    @if(o_masks[1]) layout(binding = 4) uniform sampler2D uTexMask1;
+    @if(o_blend[0]) layout(binding = 5) uniform sampler2D uTexBlend0;
+    @if(o_blend[1]) layout(binding = 6) uniform sampler2D uTexBlend1;
+
+    layout(binding = 0, std140) uniform UBO {
+        int frame_count;
+        float noise_scale;
+        float prim_depth;
+        ivec2 texture_width;
+        ivec2 texture_height;
+        ivec2 texture_filtering;
+    } ubo;
+    #define frame_count ubo.frame_count
+    #define noise_scale ubo.noise_scale
+    #define prim_depth ubo.prim_depth
+    #define texture_width ubo.texture_width
+    #define texture_height ubo.texture_height
+    #define texture_filtering ubo.texture_filtering
+
+    #define TEX_OFFSET(off) texture(tex, texCoord - off / texSize)
+    #define WRAP(x, low, high) mod((x)-(low), (high)-(low)) + (low)
+
+    float random(in vec3 value) {
+        float random = dot(sin(value), vec3(12.9898, 78.233, 37.719));
+        return fract(sin(random) * 143758.5453);
+    }
+
+    vec4 fromLinear(vec4 linearRGB){
+        bvec3 cutoff = lessThan(linearRGB.rgb, vec3(0.0031308));
+        vec3 higher = vec3(1.055)*pow(linearRGB.rgb, vec3(1.0/2.4)) - vec3(0.055);
+        vec3 lower = linearRGB.rgb * vec3(12.92);
+        return vec4(mix(higher, lower, cutoff), linearRGB.a);
+    }
+
+    vec4 filter3point(in sampler2D tex, in vec2 texCoord, in vec2 texSize) {
+        vec2 offset = fract(texCoord*texSize - vec2(0.5));
+        offset -= step(1.0, offset.x + offset.y);
+        vec4 c0 = TEX_OFFSET(offset);
+        vec4 c1 = TEX_OFFSET(vec2(offset.x - sign(offset.x), offset.y));
+        vec4 c2 = TEX_OFFSET(vec2(offset.x, offset.y - sign(offset.y)));
+        return c0 + abs(offset.x)*(c1-c0) + abs(offset.y)*(c2-c0);
+    }
+
+    vec4 hookTexture2D(in int id, sampler2D tex, in vec2 uv, in vec2 texSize) {
+    @if(o_three_point_filtering)
+        if(texture_filtering[id] == @{FILTER_THREE_POINT}) {
+            return filter3point(tex, uv, texSize);
+        }
+    @end
+        return texture(tex, uv);
+    }
+
+    #define TEX_SIZE(tex) vec2(texture_width[tex], texture_height[tex])
+
+    void main() {
+        @for(i in 0..2)
+            @if(o_textures[i])
+                @{s = o_clamp[i][0]}
+                @{t = o_clamp[i][1]}
+
+                vec2 texSize@{i} = TEX_SIZE(@{i});
+
+                @if(!s && !t)
+                    vec2 vTexCoordAdj@{i} = vTexCoord@{i};
+                @else
+                    @if(s && t)
+                        vec2 vTexCoordAdj@{i} = clamp(vTexCoord@{i}, 0.5 / texSize@{i}, vec2(vTexClampS@{i}, vTexClampT@{i}));
+                    @elseif(s)
+                        vec2 vTexCoordAdj@{i} = vec2(clamp(vTexCoord@{i}.s, 0.5 / texSize@{i}.s, vTexClampS@{i}), vTexCoord@{i}.t);
+                    @else
+                        vec2 vTexCoordAdj@{i} = vec2(vTexCoord@{i}.s, clamp(vTexCoord@{i}.t, 0.5 / texSize@{i}.t, vTexClampT@{i}));
+                    @end
+                @end
+
+                vec4 texVal@{i} = hookTexture2D(@{i}, uTex@{i}, vTexCoordAdj@{i}, texSize@{i});
+
+                @if(o_masks[i])
+                    vec2 maskSize@{i} = textureSize(uTexMask@{i}, 0);
+
+                    vec4 maskVal@{i} = hookTexture2D(@{i}, uTexMask@{i}, vTexCoordAdj@{i}, maskSize@{i});
+
+                    @if(o_blend[i])
+                        vec4 blendVal@{i} = hookTexture2D(@{i}, uTexBlend@{i}, vTexCoordAdj@{i}, texSize@{i});
+                    @else
+                        vec4 blendVal@{i} = vec4(0, 0, 0, 0);
+                    @end
+
+                    texVal@{i} = mix(texVal@{i}, blendVal@{i}, maskVal@{i}.a);
+                @end
+            @end
+        @end
+
+        @if(o_alpha)
+            vec4 texel;
+        @else
+            vec3 texel;
+        @end
+
+        @if(o_2cyc)
+            @{f_range = 2}
+        @else
+            @{f_range = 1}
+        @end
+
+        @for(c in 0..f_range)
+            @if(c == 1)
+                @if(o_alpha)
+                    @if(o_c[c][1][2] == SHADER_COMBINED)
+                        texel.a = WRAP(texel.a, -1.01, 1.01);
+                    @else
+                        texel.a = WRAP(texel.a, -0.51, 1.51);
+                    @end
+                @end
+
+                @if(o_c[c][0][2] == SHADER_COMBINED)
+                    texel.rgb = WRAP(texel.rgb, -1.01, 1.01);
+                @else
+                    texel.rgb = WRAP(texel.rgb, -0.51, 1.51);
+                @end
+            @end
+
+            @if(!o_color_alpha_same[c] && o_alpha)
+                texel = vec4(@{
+                append_formula(o_c[c], o_do_single[c][0],
+                            o_do_multiply[c][0], o_do_mix[c][0], false, false, true, c == 0)
+                }, @{append_formula(o_c[c], o_do_single[c][1],
+                            o_do_multiply[c][1], o_do_mix[c][1], true, true, true, c == 0)
+                });
+            @else
+                texel = @{append_formula(o_c[c], o_do_single[c][0],
+                            o_do_multiply[c][0], o_do_mix[c][0], o_alpha, false,
+                            o_alpha, c == 0)};
+            @end
+        @end
+
+        texel = WRAP(texel, -0.51, 1.51);
+        texel = clamp(texel, 0.0, 1.0);
+        @if(o_fog)
+            @if(o_alpha)
+                texel = vec4(mix(texel.rgb, vFog.rgb, vFog.a), texel.a);
+            @else
+                texel = mix(texel, vFog.rgb, vFog.a);
+            @end
+        @end
+
+        @if(o_texture_edge && o_alpha)
+            if (texel.a > 0.19) texel.a = 1.0; else discard;
+        @end
+
+        @if(o_alpha && o_noise)
+            texel.a *= floor(clamp(random(vec3(floor(gl_FragCoord.xy * noise_scale), float(frame_count))) + texel.a, 0.0, 1.0));
+        @end
+
+        @if(o_grayscale)
+            float intensity = (texel.r + texel.g + texel.b) / 3.0;
+            vec3 new_texel = vGrayscaleColor.rgb * intensity;
+            texel.rgb = mix(texel.rgb, new_texel, vGrayscaleColor.a);
+        @end
+
+        @if(o_alpha)
+            @if(o_alpha_threshold)
+                if (texel.a < 8.0 / 256.0) discard;
+            @end
+            @if(o_invisible)
+                texel.a = 0.0;
+            @end
+            vOutColor = texel;
+        @else
+            vOutColor = vec4(texel, 1.0);
+        @end
+
+        @if(srgb_mode)
+            vOutColor = fromLinear(vOutColor);
+        @end
+
+        @if(o_prim_depth)
+            gl_FragDepth = prim_depth;
+        @end
+    }
+@end
+)PRISM";
+} // namespace
 
 namespace Fast {
 
@@ -64,10 +558,11 @@ GfxRenderingAPIVulkan::GfxRenderingAPIVulkan(GfxWindowBackendSDL2* windowBackend
 GfxRenderingAPIVulkan::~GfxRenderingAPIVulkan() {
     if (mDevice != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(mDevice);
+        DestroyRenderingResources();
+        DestroyDepthResources();
+        DestroyPerImageSync();
         DestroySwapchain();
         for (int i = 0; i < kMaxFramesInFlight; i++) {
-            if (mRenderFinishedSemaphores.size() > (size_t)i)
-                vkDestroySemaphore(mDevice, mRenderFinishedSemaphores[i], nullptr);
             if (mImageAvailableSemaphores.size() > (size_t)i)
                 vkDestroySemaphore(mDevice, mImageAvailableSemaphores[i], nullptr);
             if (mInFlightFences.size() > (size_t)i)
@@ -233,6 +728,8 @@ void GfxRenderingAPIVulkan::CreateLogicalDevice() {
 
     VkPhysicalDeviceFeatures features{};
     features.samplerAnisotropy = VK_FALSE;
+    features.depthClamp = VK_TRUE;     // mirrors the GL backend's glEnable(GL_DEPTH_CLAMP)
+    features.fragmentStoresAndAtomics = VK_FALSE;
 
     VkDeviceCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -350,23 +847,40 @@ void GfxRenderingAPIVulkan::CreateRenderPass() {
     colorRef.attachment = 0;
     colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
+    // Depth attachment (M2): cleared each frame, used while rendering, discarded.
+    VkAttachmentDescription depth{};
+    depth.format = mDepthFormat;
+    depth.samples = VK_SAMPLE_COUNT_1_BIT;
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference depthRef{};
+    depthRef.attachment = 1;
+    depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
     VkSubpassDescription subpass{};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments = &colorRef;
+    subpass.pDepthStencilAttachment = &depthRef;
 
     VkSubpassDependency dep{};
     dep.srcSubpass = VK_SUBPASS_EXTERNAL;
     dep.dstSubpass = 0;
-    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
     dep.srcAccessMask = 0;
-    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
+    VkAttachmentDescription attachments[] = { color, depth };
     VkRenderPassCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    ci.attachmentCount = 1;
-    ci.pAttachments = &color;
+    ci.attachmentCount = 2;
+    ci.pAttachments = attachments;
     ci.subpassCount = 1;
     ci.pSubpasses = &subpass;
     ci.dependencyCount = 1;
@@ -378,16 +892,64 @@ void GfxRenderingAPIVulkan::CreateRenderPass() {
 void GfxRenderingAPIVulkan::CreateFramebuffers() {
     mSwapchainFramebuffers.resize(mSwapchainImageViews.size());
     for (size_t i = 0; i < mSwapchainImageViews.size(); i++) {
-        VkImageView attachments[] = { mSwapchainImageViews[i] };
+        VkImageView attachments[] = { mSwapchainImageViews[i], mDepthView };
         VkFramebufferCreateInfo fi{};
         fi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         fi.renderPass = mRenderPass;
-        fi.attachmentCount = 1;
+        fi.attachmentCount = 2;
         fi.pAttachments = attachments;
         fi.width = mSwapchainExtent.width;
         fi.height = mSwapchainExtent.height;
         fi.layers = 1;
         VK_CHECK(vkCreateFramebuffer(mDevice, &fi, nullptr, &mSwapchainFramebuffers[i]));
+    }
+}
+
+void GfxRenderingAPIVulkan::CreateDepthResources() {
+    VkImageCreateInfo ii{};
+    ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = mDepthFormat;
+    ii.extent = { mSwapchainExtent.width, mSwapchainExtent.height, 1 };
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VK_CHECK(vkCreateImage(mDevice, &ii, nullptr, &mDepthImage));
+
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(mDevice, mDepthImage, &req);
+    VkMemoryAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK_CHECK(vkAllocateMemory(mDevice, &ai, nullptr, &mDepthMemory));
+    VK_CHECK(vkBindImageMemory(mDevice, mDepthImage, mDepthMemory, 0));
+
+    VkImageViewCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image = mDepthImage;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = mDepthFormat;
+    vi.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+    VK_CHECK(vkCreateImageView(mDevice, &vi, nullptr, &mDepthView));
+}
+
+void GfxRenderingAPIVulkan::DestroyDepthResources() {
+    if (mDepthView != VK_NULL_HANDLE) {
+        vkDestroyImageView(mDevice, mDepthView, nullptr);
+        mDepthView = VK_NULL_HANDLE;
+    }
+    if (mDepthImage != VK_NULL_HANDLE) {
+        vkDestroyImage(mDevice, mDepthImage, nullptr);
+        mDepthImage = VK_NULL_HANDLE;
+    }
+    if (mDepthMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(mDevice, mDepthMemory, nullptr);
+        mDepthMemory = VK_NULL_HANDLE;
     }
 }
 
@@ -408,8 +970,8 @@ void GfxRenderingAPIVulkan::CreateCommandResources() {
 }
 
 void GfxRenderingAPIVulkan::CreateSyncObjects() {
+    // Per-frame-in-flight: acquire semaphore + submission fence.
     mImageAvailableSemaphores.resize(kMaxFramesInFlight);
-    mRenderFinishedSemaphores.resize(kMaxFramesInFlight);
     mInFlightFences.resize(kMaxFramesInFlight);
 
     VkSemaphoreCreateInfo si{};
@@ -420,9 +982,32 @@ void GfxRenderingAPIVulkan::CreateSyncObjects() {
 
     for (int i = 0; i < kMaxFramesInFlight; i++) {
         VK_CHECK(vkCreateSemaphore(mDevice, &si, nullptr, &mImageAvailableSemaphores[i]));
-        VK_CHECK(vkCreateSemaphore(mDevice, &si, nullptr, &mRenderFinishedSemaphores[i]));
         VK_CHECK(vkCreateFence(mDevice, &fi, nullptr, &mInFlightFences[i]));
     }
+
+    // Per-swapchain-image: render-finished semaphore (the present waits on this; a
+    // binary semaphore can't be re-signaled while a present is still pending it, so
+    // it must be owned per image, not per frame-in-flight) + an images-in-flight
+    // fence map so we never render to an image whose previous frame is unfinished.
+    CreatePerImageSync();
+}
+
+void GfxRenderingAPIVulkan::CreatePerImageSync() {
+    const size_t n = mSwapchainImages.size();
+    mRenderFinishedSemaphores.resize(n);
+    VkSemaphoreCreateInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    for (size_t i = 0; i < n; i++) {
+        VK_CHECK(vkCreateSemaphore(mDevice, &si, nullptr, &mRenderFinishedSemaphores[i]));
+    }
+    mImagesInFlight.assign(n, VK_NULL_HANDLE);
+}
+
+void GfxRenderingAPIVulkan::DestroyPerImageSync() {
+    for (VkSemaphore s : mRenderFinishedSemaphores)
+        vkDestroySemaphore(mDevice, s, nullptr);
+    mRenderFinishedSemaphores.clear();
+    mImagesInFlight.clear();
 }
 
 void GfxRenderingAPIVulkan::DestroySwapchain() {
@@ -440,9 +1025,13 @@ void GfxRenderingAPIVulkan::DestroySwapchain() {
 
 void GfxRenderingAPIVulkan::RecreateSwapchain() {
     vkDeviceWaitIdle(mDevice);
+    DestroyPerImageSync();
     DestroySwapchain();
+    DestroyDepthResources();
     CreateSwapchain();
+    CreateDepthResources();
     CreateFramebuffers();
+    CreatePerImageSync();
 }
 
 void GfxRenderingAPIVulkan::Init() {
@@ -456,11 +1045,13 @@ void GfxRenderingAPIVulkan::Init() {
     PickPhysicalDevice();
     CreateLogicalDevice();
     CreateSwapchain();
+    CreateDepthResources();
     CreateRenderPass();
     CreateFramebuffers();
     CreateCommandResources();
     CreateSyncObjects();
-    SPDLOG_INFO("Vulkan backend initialized (Milestone 1: clear-only)");
+    CreateRenderingResources();
+    SPDLOG_INFO("Vulkan backend initialized (Milestone 2: per-combiner pipelines)");
 }
 
 // ---------------------------------------------------------------------------
@@ -486,6 +1077,12 @@ void GfxRenderingAPIVulkan::StartFrame() {
         abort();
     }
 
+    // If a previous frame-in-flight is still rendering to this image, wait for it.
+    if (mImagesInFlight[mImageIndex] != VK_NULL_HANDLE) {
+        vkWaitForFences(mDevice, 1, &mImagesInFlight[mImageIndex], VK_TRUE, UINT64_MAX);
+    }
+    mImagesInFlight[mImageIndex] = mInFlightFences[mCurrentFrame];
+
     vkResetFences(mDevice, 1, &mInFlightFences[mCurrentFrame]);
 
     VkCommandBuffer cmd = mCommandBuffers[mCurrentFrame];
@@ -494,8 +1091,12 @@ void GfxRenderingAPIVulkan::StartFrame() {
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
 
-    VkClearValue clear{};
-    clear.color = { { mClearColor[0], mClearColor[1], mClearColor[2], mClearColor[3] } };
+    // Reset the per-frame vertex/uniform rings and descriptor pool for this frame.
+    BeginFrameRings();
+
+    VkClearValue clears[2]{};
+    clears[0].color = { { mClearColor[0], mClearColor[1], mClearColor[2], mClearColor[3] } };
+    clears[1].depthStencil = { 1.0f, 0 };
 
     VkRenderPassBeginInfo rp{};
     rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -503,10 +1104,15 @@ void GfxRenderingAPIVulkan::StartFrame() {
     rp.framebuffer = mSwapchainFramebuffers[mImageIndex];
     rp.renderArea.offset = { 0, 0 };
     rp.renderArea.extent = mSwapchainExtent;
-    rp.clearValueCount = 1;
-    rp.pClearValues = &clear;
+    rp.clearValueCount = 2;
+    rp.pClearValues = clears;
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
+    // Default dynamic state covers the whole frame until the game sets a viewport.
+    mCurrentViewport = { 0.0f, 0.0f, (float)mSwapchainExtent.width, (float)mSwapchainExtent.height, 0.0f, 1.0f };
+    mCurrentScissor = { { 0, 0 }, mSwapchainExtent };
+
+    mFrameCount++;
     mFrameAcquired = true;
 }
 
@@ -534,7 +1140,8 @@ void GfxRenderingAPIVulkan::FinishRender() {
     submit.pWaitDstStageMask = waitStages;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
-    VkSemaphore signalSems[] = { mRenderFinishedSemaphores[mCurrentFrame] };
+    // Signal the per-IMAGE render-finished semaphore (the present below waits on it).
+    VkSemaphore signalSems[] = { mRenderFinishedSemaphores[mImageIndex] };
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = signalSems;
 
@@ -736,20 +1343,470 @@ void GfxRenderingAPIVulkan::OnResize() {
 }
 
 // ---------------------------------------------------------------------------
-// Shader records (no GPU pipeline in M1; just feature bookkeeping)
+// Memory / buffer / image helpers
 // ---------------------------------------------------------------------------
 
+uint32_t GfxRenderingAPIVulkan::FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(mPhysicalDevice, &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        if ((typeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & props) == props) {
+            return i;
+        }
+    }
+    SPDLOG_ERROR("Vulkan: no suitable memory type ({:#x})", typeBits);
+    abort();
+}
+
+void GfxRenderingAPIVulkan::CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
+                                         VkBuffer& buf, VkDeviceMemory& mem, void** mappedOut) {
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = size;
+    bci.usage = usage;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VK_CHECK(vkCreateBuffer(mDevice, &bci, nullptr, &buf));
+
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(mDevice, buf, &req);
+    VkMemoryAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, props);
+    VK_CHECK(vkAllocateMemory(mDevice, &ai, nullptr, &mem));
+    VK_CHECK(vkBindBufferMemory(mDevice, buf, mem, 0));
+    if (mappedOut != nullptr) {
+        VK_CHECK(vkMapMemory(mDevice, mem, 0, size, 0, mappedOut));
+    }
+}
+
+void GfxRenderingAPIVulkan::CreateImageRGBA(uint32_t width, uint32_t height, VkImage& image, VkDeviceMemory& mem,
+                                            VkImageView& view) {
+    VkImageCreateInfo ii{};
+    ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ii.extent = { width, height, 1 };
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VK_CHECK(vkCreateImage(mDevice, &ii, nullptr, &image));
+
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(mDevice, image, &req);
+    VkMemoryAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK_CHECK(vkAllocateMemory(mDevice, &ai, nullptr, &mem));
+    VK_CHECK(vkBindImageMemory(mDevice, image, mem, 0));
+
+    VkImageViewCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image = image;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    VK_CHECK(vkCreateImageView(mDevice, &vi, nullptr, &view));
+}
+
+void GfxRenderingAPIVulkan::UploadImageRGBA(VkImage image, uint32_t width, uint32_t height, const uint8_t* rgba) {
+    const VkDeviceSize size = (VkDeviceSize)width * height * 4;
+    VkBuffer staging;
+    VkDeviceMemory stagingMem;
+    void* mapped = nullptr;
+    CreateBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging, stagingMem,
+                 &mapped);
+    memcpy(mapped, rgba, size);
+    vkUnmapMemory(mDevice, stagingMem);
+
+    VkCommandBufferAllocateInfo cai{};
+    cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cai.commandPool = mCommandPool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkCommandBuffer cmd;
+    VK_CHECK(vkAllocateCommandBuffers(mDevice, &cai, &cmd));
+    VkCommandBufferBeginInfo cbi{};
+    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(cmd, &cbi));
+
+    auto barrier = [&](VkImageLayout oldL, VkImageLayout newL, VkAccessFlags srcA, VkAccessFlags dstA,
+                       VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {
+        VkImageMemoryBarrier b{};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout = oldL;
+        b.newLayout = newL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = image;
+        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        b.srcAccessMask = srcA;
+        b.dstAccessMask = dstA;
+        vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+
+    barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    VkBufferImageCopy region{};
+    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageExtent = { width, height, 1 };
+    vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+    VK_CHECK(vkEndCommandBuffer(cmd));
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    VkFence fence;
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VK_CHECK(vkCreateFence(mDevice, &fci, nullptr, &fence));
+    VK_CHECK(vkQueueSubmit(mGraphicsQueue, 1, &submit, fence));
+    vkWaitForFences(mDevice, 1, &fence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(mDevice, fence, nullptr);
+    vkFreeCommandBuffers(mDevice, mCommandPool, 1, &cmd);
+    vkDestroyBuffer(mDevice, staging, nullptr);
+    vkFreeMemory(mDevice, stagingMem, nullptr);
+}
+
+// Std140 UBO matching the Vulkan shader template's UBO block (48 bytes).
+struct VkUboData {
+    int32_t frame_count;
+    float noise_scale;
+    float prim_depth;
+    int32_t _pad0;
+    int32_t texture_width[2];
+    int32_t texture_height[2];
+    int32_t texture_filtering[2];
+    int32_t _pad1[2];
+};
+
+// ---------------------------------------------------------------------------
+// Rendering resources (descriptor layout, pipeline layout, per-frame rings, dummy)
+// ---------------------------------------------------------------------------
+
+void GfxRenderingAPIVulkan::CreateRenderingResources() {
+    // One descriptor set layout used by every pipeline: binding 0 = UBO, bindings
+    // 1..6 = the six combiner sampler slots (tex0,tex1,mask0,mask1,blend0,blend1).
+    std::array<VkDescriptorSetLayoutBinding, 7> binds{};
+    binds[0].binding = 0;
+    binds[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    binds[0].descriptorCount = 1;
+    binds[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    for (int i = 1; i < 7; i++) {
+        binds[i].binding = i;
+        binds[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binds[i].descriptorCount = 1;
+        binds[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dli{};
+    dli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dli.bindingCount = (uint32_t)binds.size();
+    dli.pBindings = binds.data();
+    VK_CHECK(vkCreateDescriptorSetLayout(mDevice, &dli, nullptr, &mDescriptorSetLayout));
+
+    VkPipelineLayoutCreateInfo pli{};
+    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &mDescriptorSetLayout;
+    VK_CHECK(vkCreatePipelineLayout(mDevice, &pli, nullptr, &mPipelineLayout));
+
+    // UBO sub-allocation stride (aligned).
+    VkDeviceSize align = mPhysicalDeviceProps.limits.minUniformBufferOffsetAlignment;
+    if (align == 0)
+        align = 1;
+    mUboAlignedSize = ((sizeof(VkUboData) + align - 1) / align) * align;
+
+    const VkDeviceSize kVboCapacity = 32 * 1024 * 1024; // 32 MB vertex ring per frame
+    const uint32_t kMaxDrawsPerFrame = 32768;
+    const VkDeviceSize kUboCapacity = mUboAlignedSize * kMaxDrawsPerFrame;
+
+    for (int i = 0; i < kMaxFramesInFlight; i++) {
+        FrameRing& fr = mFrameRings[i];
+        CreateBuffer(kVboCapacity, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, fr.vbo, fr.vboMem,
+                     &fr.vboMapped);
+        fr.vboCapacity = kVboCapacity;
+        CreateBuffer(kUboCapacity, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, fr.ubo, fr.uboMem,
+                     &fr.uboMapped);
+        fr.uboCapacity = kUboCapacity;
+
+        std::array<VkDescriptorPoolSize, 2> ps{};
+        ps[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        ps[0].descriptorCount = kMaxDrawsPerFrame;
+        ps[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        ps[1].descriptorCount = kMaxDrawsPerFrame * 6;
+        VkDescriptorPoolCreateInfo dpi{};
+        dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpi.maxSets = kMaxDrawsPerFrame;
+        dpi.poolSizeCount = (uint32_t)ps.size();
+        dpi.pPoolSizes = ps.data();
+        VK_CHECK(vkCreateDescriptorPool(mDevice, &dpi, nullptr, &fr.descPool));
+    }
+
+    // 1x1 white dummy texture for unused sampler slots.
+    CreateImageRGBA(1, 1, mDummyImage, mDummyMemory, mDummyView);
+    const uint8_t white[4] = { 255, 255, 255, 255 };
+    UploadImageRGBA(mDummyImage, 1, 1, white);
+    mDummySampler = GetOrCreateSampler(false, G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMIRROR | G_TX_CLAMP);
+}
+
+void GfxRenderingAPIVulkan::DestroyRenderingResources() {
+    for (auto& kv : mPipelineCache)
+        vkDestroyPipeline(mDevice, kv.second, nullptr);
+    mPipelineCache.clear();
+    for (auto& kv : mShaderProgramPool) {
+        if (kv.second.vert)
+            vkDestroyShaderModule(mDevice, kv.second.vert, nullptr);
+        if (kv.second.frag)
+            vkDestroyShaderModule(mDevice, kv.second.frag, nullptr);
+    }
+    mShaderProgramPool.clear();
+    for (auto& kv : mSamplerCache)
+        vkDestroySampler(mDevice, kv.second, nullptr);
+    mSamplerCache.clear();
+    for (auto& t : mTextures) {
+        if (t.view)
+            vkDestroyImageView(mDevice, t.view, nullptr);
+        if (t.image)
+            vkDestroyImage(mDevice, t.image, nullptr);
+        if (t.memory)
+            vkFreeMemory(mDevice, t.memory, nullptr);
+    }
+    mTextures.clear();
+    if (mDummyView)
+        vkDestroyImageView(mDevice, mDummyView, nullptr);
+    if (mDummyImage)
+        vkDestroyImage(mDevice, mDummyImage, nullptr);
+    if (mDummyMemory)
+        vkFreeMemory(mDevice, mDummyMemory, nullptr);
+    for (int i = 0; i < kMaxFramesInFlight; i++) {
+        FrameRing& fr = mFrameRings[i];
+        if (fr.descPool)
+            vkDestroyDescriptorPool(mDevice, fr.descPool, nullptr);
+        if (fr.vbo)
+            vkDestroyBuffer(mDevice, fr.vbo, nullptr);
+        if (fr.vboMem)
+            vkFreeMemory(mDevice, fr.vboMem, nullptr);
+        if (fr.ubo)
+            vkDestroyBuffer(mDevice, fr.ubo, nullptr);
+        if (fr.uboMem)
+            vkFreeMemory(mDevice, fr.uboMem, nullptr);
+    }
+    if (mPipelineLayout)
+        vkDestroyPipelineLayout(mDevice, mPipelineLayout, nullptr);
+    if (mDescriptorSetLayout)
+        vkDestroyDescriptorSetLayout(mDevice, mDescriptorSetLayout, nullptr);
+}
+
+void GfxRenderingAPIVulkan::BeginFrameRings() {
+    FrameRing& fr = mFrameRings[mCurrentFrame];
+    fr.vboOffset = 0;
+    fr.uboOffset = 0;
+    vkResetDescriptorPool(mDevice, fr.descPool, 0);
+}
+
+VkSampler GfxRenderingAPIVulkan::GetOrCreateSampler(bool linear, uint32_t cms, uint32_t cmt) {
+    uint32_t key = (linear ? 1u : 0u) | (cms << 1) | (cmt << 4);
+    auto it = mSamplerCache.find(key);
+    if (it != mSamplerCache.end())
+        return it->second;
+
+    auto wrap = [](uint32_t cm) -> VkSamplerAddressMode {
+        switch (cm) {
+            case G_TX_NOMIRROR | G_TX_CLAMP:
+                return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            case G_TX_MIRROR | G_TX_WRAP:
+                return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+            case G_TX_MIRROR | G_TX_CLAMP:
+                return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+            case G_TX_NOMIRROR | G_TX_WRAP:
+            default:
+                return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        }
+    };
+    VkSamplerCreateInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    si.magFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    si.minFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    si.addressModeU = wrap(cms);
+    si.addressModeV = wrap(cmt);
+    si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    si.maxLod = 0.0f;
+    si.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    VkSampler sampler;
+    VK_CHECK(vkCreateSampler(mDevice, &si, nullptr, &sampler));
+    mSamplerCache[key] = sampler;
+    return sampler;
+}
+
+// ---------------------------------------------------------------------------
+// Shaders / pipelines
+// ---------------------------------------------------------------------------
+
+std::string GfxRenderingAPIVulkan::BuildVkShaderSource(const CCFeatures& cc, bool vertex, ShaderProgramVulkan* prg) {
+    // Reset the location counters: attribute + varying for the vertex stage, only
+    // the varying counter for the fragment stage (so VS-out matches FS-in).
+    if (vertex) {
+        gVkAttrLoc = 0;
+        gVkVaryLoc = 0;
+    } else {
+        gVkVaryLoc = 0;
+    }
+
+    prism::Processor processor;
+    prism::ContextItems ctx = {
+        { "VERTEX_SHADER", vertex },
+        { "o_c", M_ARRAY(cc.c, int, 2, 2, 4) },
+        { "o_alpha", cc.opt_alpha },
+        { "o_fog", cc.opt_fog },
+        { "o_texture_edge", cc.opt_texture_edge },
+        { "o_noise", cc.opt_noise },
+        { "o_2cyc", cc.opt_2cyc },
+        { "o_alpha_threshold", cc.opt_alpha_threshold },
+        { "o_invisible", cc.opt_invisible },
+        { "o_grayscale", cc.opt_grayscale },
+        { "o_prim_depth", cc.opt_prim_depth },
+        { "o_textures", M_ARRAY(cc.usedTextures, bool, 2) },
+        { "o_masks", M_ARRAY(cc.used_masks, bool, 2) },
+        { "o_blend", M_ARRAY(cc.used_blend, bool, 2) },
+        { "o_clamp", M_ARRAY(cc.clamp, bool, 2, 2) },
+        { "o_inputs", cc.numInputs },
+        { "o_do_mix", M_ARRAY(cc.do_mix, bool, 2, 2) },
+        { "o_do_single", M_ARRAY(cc.do_single, bool, 2, 2) },
+        { "o_do_multiply", M_ARRAY(cc.do_multiply, bool, 2, 2) },
+        { "o_color_alpha_same", M_ARRAY(cc.color_alpha_same, bool, 2) },
+        { "FILTER_THREE_POINT", FILTER_THREE_POINT },
+        { "FILTER_LINEAR", FILTER_LINEAR },
+        { "FILTER_NONE", FILTER_NONE },
+        { "srgb_mode", mSrgbMode },
+        { "SHADER_0", SHADER_0 },
+        { "SHADER_INPUT_1", SHADER_INPUT_1 },
+        { "SHADER_INPUT_2", SHADER_INPUT_2 },
+        { "SHADER_INPUT_3", SHADER_INPUT_3 },
+        { "SHADER_INPUT_4", SHADER_INPUT_4 },
+        { "SHADER_INPUT_5", SHADER_INPUT_5 },
+        { "SHADER_INPUT_6", SHADER_INPUT_6 },
+        { "SHADER_INPUT_7", SHADER_INPUT_7 },
+        { "SHADER_TEXEL0", SHADER_TEXEL0 },
+        { "SHADER_TEXEL0A", SHADER_TEXEL0A },
+        { "SHADER_TEXEL1", SHADER_TEXEL1 },
+        { "SHADER_TEXEL1A", SHADER_TEXEL1A },
+        { "SHADER_1", SHADER_1 },
+        { "SHADER_COMBINED", SHADER_COMBINED },
+        { "SHADER_NOISE", SHADER_NOISE },
+        { "o_three_point_filtering", mCurrentFilterMode == FILTER_THREE_POINT },
+        { "append_formula", (InvokeFunc)vk_append_formula },
+        { "aloc", (InvokeFunc)vk_aloc },
+        { "vloc", (InvokeFunc)vk_vloc },
+    };
+    processor.populate(ctx);
+    processor.load(kVkShaderTemplate);
+    processor.bind_include_loader(vk_include_noop);
+    return processor.process();
+}
+
+VkShaderModule GfxRenderingAPIVulkan::CreateShaderModule(const std::vector<uint32_t>& spirv) {
+    VkShaderModuleCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    ci.codeSize = spirv.size() * sizeof(uint32_t);
+    ci.pCode = spirv.data();
+    VkShaderModule mod;
+    VK_CHECK(vkCreateShaderModule(mDevice, &ci, nullptr, &mod));
+    return mod;
+}
+
 void GfxRenderingAPIVulkan::ClearShaderCache() {
+    vkDeviceWaitIdle(mDevice);
+    for (auto& kv : mPipelineCache)
+        vkDestroyPipeline(mDevice, kv.second, nullptr);
+    mPipelineCache.clear();
+    for (auto& kv : mShaderProgramPool) {
+        if (kv.second.vert)
+            vkDestroyShaderModule(mDevice, kv.second.vert, nullptr);
+        if (kv.second.frag)
+            vkDestroyShaderModule(mDevice, kv.second.frag, nullptr);
+    }
     mShaderProgramPool.clear();
 }
 
 ShaderProgram* GfxRenderingAPIVulkan::CreateAndLoadNewShader(uint64_t shaderId0, uint64_t shaderId1) {
     CCFeatures cc{};
     gfx_cc_get_features(shaderId0, shaderId1, &cc);
+
     ShaderProgramVulkan& prg = mShaderProgramPool[std::make_pair(shaderId0, shaderId1)];
+    prg.id0 = shaderId0;
+    prg.id1 = shaderId1;
     prg.numInputs = cc.numInputs;
     prg.usedTextures[0] = cc.usedTextures[0];
     prg.usedTextures[1] = cc.usedTextures[1];
+    prg.usedMasks[0] = cc.used_masks[0];
+    prg.usedMasks[1] = cc.used_masks[1];
+    prg.usedBlend[0] = cc.used_blend[0];
+    prg.usedBlend[1] = cc.used_blend[1];
+    prg.usedSlot[0] = cc.usedTextures[0];
+    prg.usedSlot[1] = cc.usedTextures[1];
+    prg.usedSlot[2] = cc.used_masks[0];
+    prg.usedSlot[3] = cc.used_masks[1];
+    prg.usedSlot[4] = cc.used_blend[0];
+    prg.usedSlot[5] = cc.used_blend[1];
+
+    // Build the vertex-attribute layout in the SAME order the Vulkan template emits
+    // `layout(location=)` qualifiers, so location N == attribs[N].
+    uint32_t floatOffset = 0;
+    auto add = [&](uint32_t size) {
+        prg.attribs.push_back({ size, floatOffset * (uint32_t)sizeof(float) });
+        floatOffset += size;
+    };
+    add(4); // aVtxPos
+    for (int i = 0; i < 2; i++) {
+        if (cc.usedTextures[i]) {
+            add(2); // aTexCoord
+            for (int j = 0; j < 2; j++) {
+                if (cc.clamp[i][j])
+                    add(1); // aTexClampS / aTexClampT
+            }
+        }
+    }
+    if (cc.opt_fog)
+        add(4);
+    if (cc.opt_grayscale)
+        add(4);
+    for (int i = 0; i < cc.numInputs; i++)
+        add(cc.opt_alpha ? 4 : 3);
+    prg.numFloats = (uint8_t)floatOffset;
+
+    std::string vsSrc = BuildVkShaderSource(cc, true, &prg);
+    std::string fsSrc = BuildVkShaderSource(cc, false, &prg);
+
+    std::vector<uint32_t> vsSpv, fsSpv;
+    std::string log;
+    if (!CompileGlslToSpirv(EShLangVertex, vsSrc, vsSpv, log)) {
+        SPDLOG_ERROR("Vulkan VS compile failed (shader {:#x}): {}\n--- source ---\n{}", cc.shader_id, log, vsSrc);
+        abort();
+    }
+    if (!CompileGlslToSpirv(EShLangFragment, fsSrc, fsSpv, log)) {
+        SPDLOG_ERROR("Vulkan FS compile failed (shader {:#x}): {}\n--- source ---\n{}", cc.shader_id, log, fsSrc);
+        abort();
+    }
+    prg.vert = CreateShaderModule(vsSpv);
+    prg.frag = CreateShaderModule(fsSpv);
+
+    mCurrentShaderProgram = &prg;
     return reinterpret_cast<ShaderProgram*>(&prg);
 }
 
@@ -770,13 +1827,152 @@ void GfxRenderingAPIVulkan::ShaderGetInfo(ShaderProgram* prg, uint8_t* numInputs
     usedTextures[1] = vk->usedTextures[1];
 }
 
-void GfxRenderingAPIVulkan::LoadShader(ShaderProgram*) {
+void GfxRenderingAPIVulkan::LoadShader(ShaderProgram* prg) {
+    mCurrentShaderProgram = reinterpret_cast<ShaderProgramVulkan*>(prg);
 }
 void GfxRenderingAPIVulkan::UnloadShader(ShaderProgram*) {
 }
 
+VkPipeline GfxRenderingAPIVulkan::GetOrCreatePipeline(ShaderProgramVulkan* prg, uint32_t stateBits) {
+    VulkanPipelineKey key{ prg->id0, prg->id1, stateBits };
+    auto it = mPipelineCache.find(key);
+    if (it != mPipelineCache.end())
+        return it->second;
+
+    const bool depthTest = (stateBits & 1) != 0;
+    const bool depthMask = (stateBits & 2) != 0;
+    const bool zmodeDecal = (stateBits & 4) != 0;
+    const bool useAlpha = (stateBits & 8) != 0;
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = prg->vert;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = prg->frag;
+    stages[1].pName = "main";
+
+    VkVertexInputBindingDescription binding{};
+    binding.binding = 0;
+    binding.stride = prg->numFloats * sizeof(float);
+    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    std::vector<VkVertexInputAttributeDescription> attrs(prg->attribs.size());
+    for (size_t i = 0; i < prg->attribs.size(); i++) {
+        VkFormat fmt = VK_FORMAT_R32_SFLOAT;
+        switch (prg->attribs[i].size) {
+            case 1:
+                fmt = VK_FORMAT_R32_SFLOAT;
+                break;
+            case 2:
+                fmt = VK_FORMAT_R32G32_SFLOAT;
+                break;
+            case 3:
+                fmt = VK_FORMAT_R32G32B32_SFLOAT;
+                break;
+            case 4:
+                fmt = VK_FORMAT_R32G32B32A32_SFLOAT;
+                break;
+        }
+        attrs[i].location = (uint32_t)i;
+        attrs[i].binding = 0;
+        attrs[i].format = fmt;
+        attrs[i].offset = prg->attribs[i].offset;
+    }
+
+    VkPipelineVertexInputStateCreateInfo vin{};
+    vin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vin.vertexBindingDescriptionCount = 1;
+    vin.pVertexBindingDescriptions = &binding;
+    vin.vertexAttributeDescriptionCount = (uint32_t)attrs.size();
+    vin.pVertexAttributeDescriptions = attrs.data();
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.depthClampEnable = VK_TRUE; // matches GL GL_DEPTH_CLAMP
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE; // Fast3D culls on the CPU
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    rs.depthBiasEnable = zmodeDecal ? VK_TRUE : VK_FALSE;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    if (depthTest || depthMask) {
+        ds.depthTestEnable = VK_TRUE;
+        ds.depthWriteEnable = depthMask ? VK_TRUE : VK_FALSE;
+        ds.depthCompareOp = depthTest ? (zmodeDecal ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS)
+                                      : VK_COMPARE_OP_ALWAYS;
+    } else {
+        ds.depthTestEnable = VK_FALSE;
+        ds.depthWriteEnable = VK_FALSE;
+        ds.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+    }
+
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    if (useAlpha) {
+        cba.blendEnable = VK_TRUE;
+        cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        cba.colorBlendOp = VK_BLEND_OP_ADD;
+        cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    } else {
+        cba.blendEnable = VK_FALSE;
+    }
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+
+    VkDynamicState dynStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
+    VkPipelineDynamicStateCreateInfo dyn{};
+    dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dyn.dynamicStateCount = 3;
+    dyn.pDynamicStates = dynStates;
+
+    VkGraphicsPipelineCreateInfo pci{};
+    pci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pci.stageCount = 2;
+    pci.pStages = stages;
+    pci.pVertexInputState = &vin;
+    pci.pInputAssemblyState = &ia;
+    pci.pViewportState = &vp;
+    pci.pRasterizationState = &rs;
+    pci.pMultisampleState = &ms;
+    pci.pDepthStencilState = &ds;
+    pci.pColorBlendState = &cb;
+    pci.pDynamicState = &dyn;
+    pci.layout = mPipelineLayout;
+    pci.renderPass = mRenderPass;
+    pci.subpass = 0;
+
+    VkPipeline pipeline;
+    VK_CHECK(vkCreateGraphicsPipelines(mDevice, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline));
+    mPipelineCache[key] = pipeline;
+    return pipeline;
+}
+
 // ---------------------------------------------------------------------------
-// Inert entry points (implemented in later milestones)
+// Textures
 // ---------------------------------------------------------------------------
 
 int GfxRenderingAPIVulkan::GetMaxTextureSize() {
@@ -788,14 +1984,72 @@ GfxClipParameters GfxRenderingAPIVulkan::GetClipParameters() {
     return { true, true };
 }
 uint32_t GfxRenderingAPIVulkan::NewTexture() {
-    return mNextTextureId++;
+    uint32_t id = mNextTextureId++;
+    if (id >= mTextures.size())
+        mTextures.resize(id + 1);
+    return id;
 }
-void GfxRenderingAPIVulkan::SelectTexture(int, uint32_t) {
+void GfxRenderingAPIVulkan::SelectTexture(int tile, uint32_t textureId) {
+    if (tile < 0 || tile >= 6)
+        return;
+    mCurrentTextureIds[tile] = textureId;
+    mCurrentTile = (uint8_t)tile;
 }
-void GfxRenderingAPIVulkan::UploadTexture(const uint8_t*, uint32_t, uint32_t) {
+void GfxRenderingAPIVulkan::UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0)
+        return;
+    uint32_t id = mCurrentTextureIds[mCurrentTile];
+    if (id >= mTextures.size())
+        mTextures.resize(id + 1);
+    TextureVulkan& t = mTextures[id];
+    // (Re)create the image if size changed.
+    if (t.image == VK_NULL_HANDLE || t.width != width || t.height != height) {
+        if (t.view) {
+            // The previous image may still be referenced by an in-flight frame; flush.
+            vkDeviceWaitIdle(mDevice);
+            vkDestroyImageView(mDevice, t.view, nullptr);
+            vkDestroyImage(mDevice, t.image, nullptr);
+            vkFreeMemory(mDevice, t.memory, nullptr);
+        }
+        CreateImageRGBA(width, height, t.image, t.memory, t.view);
+        t.width = width;
+        t.height = height;
+    }
+    UploadImageRGBA(t.image, width, height, rgba32Buf);
+    t.uploaded = true;
 }
-void GfxRenderingAPIVulkan::SetSamplerParameters(int, bool, uint32_t, uint32_t) {
+void GfxRenderingAPIVulkan::SetSamplerParameters(int tile, bool linearFilter, uint32_t cms, uint32_t cmt) {
+    if (tile < 0 || tile >= 6)
+        return;
+    uint32_t id = mCurrentTextureIds[tile];
+    if (id >= mTextures.size())
+        return;
+    TextureVulkan& t = mTextures[id];
+    t.linearFilter = linearFilter && mCurrentFilterMode == FILTER_LINEAR;
+    t.filtering = !linearFilter ? FILTER_LINEAR : FILTER_THREE_POINT;
+    t.cms = cms;
+    t.cmt = cmt;
 }
+void GfxRenderingAPIVulkan::DeleteTexture(uint32_t texId) {
+    if (texId >= mTextures.size())
+        return;
+    TextureVulkan& t = mTextures[texId];
+    if (t.image == VK_NULL_HANDLE)
+        return;
+    vkDeviceWaitIdle(mDevice);
+    if (t.view)
+        vkDestroyImageView(mDevice, t.view, nullptr);
+    if (t.image)
+        vkDestroyImage(mDevice, t.image, nullptr);
+    if (t.memory)
+        vkFreeMemory(mDevice, t.memory, nullptr);
+    t = TextureVulkan{};
+}
+
+// ---------------------------------------------------------------------------
+// Render state
+// ---------------------------------------------------------------------------
+
 void GfxRenderingAPIVulkan::SetDepthTestAndMask(bool depthTest, bool zUpd) {
     mCurrentDepthTest = depthTest;
     mCurrentDepthMask = zUpd;
@@ -803,20 +2057,135 @@ void GfxRenderingAPIVulkan::SetDepthTestAndMask(bool depthTest, bool zUpd) {
 void GfxRenderingAPIVulkan::SetZmodeDecal(bool decal) {
     mCurrentZmodeDecal = decal;
 }
-void GfxRenderingAPIVulkan::SetViewport(int, int, int, int) {
+void GfxRenderingAPIVulkan::SetViewport(int x, int y, int width, int height) {
+    // Fast3D viewport origin is bottom-left (GL convention); the interpreter already
+    // inverts Y in clip space for Vulkan, so use a top-left viewport directly.
+    mCurrentViewport.x = (float)x;
+    mCurrentViewport.y = (float)y;
+    mCurrentViewport.width = (float)width;
+    mCurrentViewport.height = (float)height;
+    mCurrentViewport.minDepth = 0.0f;
+    mCurrentViewport.maxDepth = 1.0f;
 }
-void GfxRenderingAPIVulkan::SetScissor(int, int, int, int) {
+void GfxRenderingAPIVulkan::SetScissor(int x, int y, int width, int height) {
+    int32_t sx = std::max(0, x);
+    int32_t sy = std::max(0, y);
+    mCurrentScissor.offset = { sx, sy };
+    mCurrentScissor.extent = { (uint32_t)std::max(0, width), (uint32_t)std::max(0, height) };
 }
-void GfxRenderingAPIVulkan::SetUseAlpha(bool) {
+void GfxRenderingAPIVulkan::SetUseAlpha(bool useAlpha) {
+    mCurrentUseAlpha = useAlpha;
 }
-void GfxRenderingAPIVulkan::DrawTriangles(float[], size_t, size_t) {
+
+void GfxRenderingAPIVulkan::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t bufVboNumTris) {
+    if (!mFrameAcquired || mCurrentShaderProgram == nullptr || mCurrentShaderProgram->vert == VK_NULL_HANDLE)
+        return;
+
+    ShaderProgramVulkan* prg = mCurrentShaderProgram;
+    FrameRing& fr = mFrameRings[mCurrentFrame];
+    VkCommandBuffer cmd = mCommandBuffers[mCurrentFrame];
+
+    // --- Vertex data into the per-frame ring ---
+    const VkDeviceSize vboBytes = bufVboLen * sizeof(float);
+    const VkDeviceSize vboAligned = (fr.vboOffset + 0xF) & ~(VkDeviceSize)0xF;
+    if (vboAligned + vboBytes > fr.vboCapacity || fr.uboOffset + mUboAlignedSize > fr.uboCapacity) {
+        // Ring exhausted this frame: drop the draw rather than corrupt memory.
+        return;
+    }
+    memcpy((uint8_t*)fr.vboMapped + vboAligned, bufVbo, vboBytes);
+    fr.vboOffset = vboAligned + vboBytes;
+
+    // --- UBO into the per-frame ring ---
+    VkUboData ubo{};
+    ubo.frame_count = (int32_t)mFrameCount;
+    ubo.noise_scale = mCurrentNoiseScale;
+    ubo.prim_depth = mCurrentPrimDepth;
+    for (int t = 0; t < 2; t++) {
+        uint32_t id = mCurrentTextureIds[t];
+        if (id < mTextures.size() && mTextures[id].uploaded) {
+            ubo.texture_width[t] = (int32_t)mTextures[id].width;
+            ubo.texture_height[t] = (int32_t)mTextures[id].height;
+            ubo.texture_filtering[t] = (int32_t)mTextures[id].filtering;
+        }
+    }
+    const VkDeviceSize uboOffset = fr.uboOffset;
+    memcpy((uint8_t*)fr.uboMapped + uboOffset, &ubo, sizeof(ubo));
+    fr.uboOffset += mUboAlignedSize;
+
+    // --- Descriptor set (UBO + 6 sampler slots) ---
+    VkDescriptorSetAllocateInfo dai{};
+    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dai.descriptorPool = fr.descPool;
+    dai.descriptorSetCount = 1;
+    dai.pSetLayouts = &mDescriptorSetLayout;
+    VkDescriptorSet set;
+    if (vkAllocateDescriptorSets(mDevice, &dai, &set) != VK_SUCCESS)
+        return;
+
+    VkDescriptorBufferInfo bufInfo{};
+    bufInfo.buffer = fr.ubo;
+    bufInfo.offset = uboOffset;
+    bufInfo.range = sizeof(VkUboData);
+
+    VkDescriptorImageInfo imgInfo[6];
+    for (int s = 0; s < 6; s++) {
+        uint32_t id = mCurrentTextureIds[s];
+        VkImageView view = mDummyView;
+        VkSampler sampler = mDummySampler;
+        if (prg->usedSlot[s] && id < mTextures.size() && mTextures[id].uploaded) {
+            const TextureVulkan& t = mTextures[id];
+            view = t.view;
+            sampler = GetOrCreateSampler(t.linearFilter, t.cms, t.cmt);
+        }
+        imgInfo[s].sampler = sampler;
+        imgInfo[s].imageView = view;
+        imgInfo[s].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+
+    VkWriteDescriptorSet writes[7]{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = set;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[0].descriptorCount = 1;
+    writes[0].pBufferInfo = &bufInfo;
+    for (int s = 0; s < 6; s++) {
+        writes[s + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[s + 1].dstSet = set;
+        writes[s + 1].dstBinding = s + 1;
+        writes[s + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[s + 1].descriptorCount = 1;
+        writes[s + 1].pImageInfo = &imgInfo[s];
+    }
+    vkUpdateDescriptorSets(mDevice, 7, writes, 0, nullptr);
+
+    // --- Record the draw ---
+    uint32_t stateBits = (mCurrentDepthTest ? 1u : 0u) | (mCurrentDepthMask ? 2u : 0u) |
+                         (mCurrentZmodeDecal ? 4u : 0u) | (mCurrentUseAlpha ? 8u : 0u);
+    VkPipeline pipeline = GetOrCreatePipeline(prg, stateBits);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vkCmdSetViewport(cmd, 0, 1, &mCurrentViewport);
+    vkCmdSetScissor(cmd, 0, 1, &mCurrentScissor);
+    // Slope-scaled bias matching the GL backend's default zmode-decal offset.
+    vkCmdSetDepthBias(cmd, mCurrentZmodeDecal ? -2.0f : 0.0f, 0.0f, mCurrentZmodeDecal ? -2.0f : 0.0f);
+    VkDeviceSize vbOffset = vboAligned;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &fr.vbo, &vbOffset);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, mPipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdDraw(cmd, 3 * (uint32_t)bufVboNumTris, 1, 0, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Framebuffers (M2: every draw targets the swapchain pass; offscreen FBs in M3)
+// ---------------------------------------------------------------------------
+
 int GfxRenderingAPIVulkan::CreateFramebuffer() {
     return mFramebufferCount++;
 }
 void GfxRenderingAPIVulkan::UpdateFramebufferParameters(int, uint32_t, uint32_t, uint32_t, bool, bool, bool, bool) {
 }
-void GfxRenderingAPIVulkan::StartDrawToFramebuffer(int, float) {
+void GfxRenderingAPIVulkan::StartDrawToFramebuffer(int, float noiseScale) {
+    if (noiseScale != 0.0f)
+        mCurrentNoiseScale = 1.0f / noiseScale;
 }
 void GfxRenderingAPIVulkan::CopyFramebuffer(int, int, int, int, int, int, int, int, int, int) {
 }
@@ -837,8 +2206,6 @@ void* GfxRenderingAPIVulkan::GetFramebufferTextureId(int) {
     return nullptr;
 }
 void GfxRenderingAPIVulkan::SelectTextureFb(int) {
-}
-void GfxRenderingAPIVulkan::DeleteTexture(uint32_t) {
 }
 void GfxRenderingAPIVulkan::SetTextureFilter(FilteringMode mode) {
     mCurrentFilterMode = mode;
