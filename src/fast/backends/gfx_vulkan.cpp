@@ -614,10 +614,11 @@ void GfxRenderingAPIVulkan::CreateInstance() {
         if (const char* sdk = getenv("VULKAN_SDK")) {
             candidates.push_back(std::string(sdk) + "/share/vulkan/icd.d/MoltenVK_icd.json");
         }
-        // Homebrew installs the ICD under the molten-vk prefix (NOT the shared loader dir), e.g.
-        // /opt/homebrew/opt/molten-vk/share/vulkan/icd.d/MoltenVK_icd.json.
-        candidates.push_back("/opt/homebrew/opt/molten-vk/share/vulkan/icd.d/MoltenVK_icd.json"); // brew, Apple Silicon
-        candidates.push_back("/usr/local/opt/molten-vk/share/vulkan/icd.d/MoltenVK_icd.json");    // brew, Intel
+        // Homebrew installs the ICD under its config dir: $(brew --prefix)/etc/vulkan/icd.d/.
+        candidates.push_back("/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json"); // brew, Apple Silicon
+        candidates.push_back("/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json");    // brew, Intel
+        candidates.push_back("/opt/homebrew/opt/molten-vk/share/vulkan/icd.d/MoltenVK_icd.json");
+        candidates.push_back("/usr/local/opt/molten-vk/share/vulkan/icd.d/MoltenVK_icd.json");
         candidates.push_back("/opt/homebrew/share/vulkan/icd.d/MoltenVK_icd.json");
         candidates.push_back("/usr/local/share/vulkan/icd.d/MoltenVK_icd.json");
         bool found = false;
