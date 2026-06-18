@@ -13,7 +13,13 @@
 #include <SDL2/SDL_events.h>
 
 #include "ship/Context.h"
+#include "ship/controller/controldeck/ControlDeck.h"
 #include <spdlog/spdlog.h>
+
+// Unique id for blocking game input while the RML menu is open (sequence continues the existing
+// *_BLOCK_ID constants in gfx_dxgi.cpp / InputEditorWindow.cpp). Without this, SoH polls the
+// controller/keyboard directly and the game keeps responding under the open menu.
+#define SOH3D_RML_MENU_BLOCK_ID 95237931
 
 namespace Ship {
 
@@ -122,6 +128,15 @@ void SohRmlUi::SetVisible(bool visible) {
         return;
     }
     mVisible = visible;
+    // Block/unblock game input so the game doesn't react to keys/buttons while the menu is up
+    // (SoH reads the controller by polling, so consuming SDL events alone isn't enough).
+    if (auto ctx = Ship::Context::GetRawInstance(); ctx && ctx->GetControlDeck()) {
+        if (mVisible) {
+            ctx->GetControlDeck()->BlockGameInput(SOH3D_RML_MENU_BLOCK_ID);
+        } else {
+            ctx->GetControlDeck()->UnblockGameInput(SOH3D_RML_MENU_BLOCK_ID);
+        }
+    }
     if (mVisible && mContext) {
         // Update once so layout is current, then drop focus onto the first focusable element so a
         // controller/keyboard can drive it immediately (matches Dusklight opening with a default focus).
