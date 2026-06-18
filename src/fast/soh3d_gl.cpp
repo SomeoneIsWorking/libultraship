@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstddef>
+#include <cmath>
 
 namespace {
 
@@ -90,7 +91,13 @@ GLuint g_vao = 0;
 GLint g_locPos = -1, g_locNrm = -1, g_locUv = -1, g_locBoneId = -1, g_locBoneW = -1;
 GLint g_uMP = -1, g_uInvertY = -1, g_uTint = -1, g_uAlphaRef = -1, g_uTex = -1, g_uBones = -1, g_uSkin = -1;
 GLint g_uDepthOffset = -1, g_uMV = -1, g_uLit = -1, g_uLightDir = -1;
+GLint g_uLightVP = -1, g_uShadowMap = -1, g_uShadowOn = -1, g_uShadowBias = -1, g_uShadowStrength = -1,
+      g_uShadowTexel = -1;
 bool g_progFailed = false;
+
+// --- Sun-shadow map (depth render from the light) ---
+GLuint g_shadowFbo = 0, g_shadowTex = 0;
+int g_shadowRes = 2048;
 
 // GPU skinning: pos_skinned = sum_i aBoneW[i] * uBones[aBoneId[i]] * pos. uBones is
 // an array of affine matrices, so the result's w = sum_i aBoneW[i] = 1 (weights sum
@@ -99,7 +106,7 @@ const char* kVert =
     "#version 130\n"
     "in vec3 aPos; in vec3 aNrm; in vec2 aUv; in vec4 aBoneId; in vec4 aBoneW; in vec4 aColor;\n"
     "uniform mat4 uMP; uniform mat4 uMV; uniform float uInvertY; uniform mat4 uBones[32]; uniform float uSkin;\n"
-    "out vec2 vUv; out vec4 vColor; out vec3 vNrmView;\n"
+    "out vec2 vUv; out vec4 vColor; out vec3 vNrmView; out vec3 vWorld;\n"
     "void main(){\n"
     "  vColor = aColor;\n"
     // Skinning (uSkin>0.5) blends the vertex by its bones; at the bind pose / no anim
@@ -128,15 +135,39 @@ const char* kVert =
     // compare against (uLightDir) is the scene's world-space sun direction. Uniform model
     // scale -> mat3(uMV) is rotation*scale; the frag renormalizes.
     "  vNrmView = mat3(uMV) * nM;\n"
+    // World-space surface position (uMV is model->world; see above). Needed by the fragment
+    // shadow term to project into the sun's light-space and sample the shadow map.
+    "  vWorld = (uMV * vec4(sp.xyz, 1.0)).xyz;\n"
     "  vUv = vec2(aUv.x, 1.0 - aUv.y);\n" // PICA/CMB UVs are top-origin; GL samples bottom-origin
     "}\n";
 
 const char* kFrag =
     "#version 130\n"
-    "in vec2 vUv; in vec4 vColor; in vec3 vNrmView;\n"
+    "in vec2 vUv; in vec4 vColor; in vec3 vNrmView; in vec3 vWorld;\n"
     "uniform sampler2D uTex; uniform vec3 uTint; uniform float uAlphaRef;\n"
     "uniform float uDepthOffset; uniform float uLit; uniform vec3 uLightDir;\n"
+    // Dynamic sun-shadow: uLightVP maps WORLD -> the sun's light-space clip (built CPU-side from
+    // the scene sun dir + a focus box around the camera target); uShadowMap is the depth render
+    // from the light. uShadowOn gates it (0 = no shadows / shadow-map build pass). uShadowBias
+    // fights acne, uShadowStrength dims the shadowed area, uShadowTexel = 1/shadowRes (PCF step).
+    "uniform mat4 uLightVP; uniform sampler2D uShadowMap; uniform float uShadowOn;\n"
+    "uniform float uShadowBias; uniform float uShadowStrength; uniform float uShadowTexel;\n"
     "out vec4 frag;\n"
+    // Fraction of this fragment that is LIT (1 = fully lit, 0 = fully in shadow), 3x3 PCF.
+    "float shadowLit(){\n"
+    "  vec4 lc = uLightVP * vec4(vWorld, 1.0);\n"
+    "  vec3 p = lc.xyz / lc.w;\n"            // ortho light proj -> w==1
+    "  p = p * 0.5 + 0.5;\n"                 // NDC [-1,1] -> texcoord/depth [0,1]
+    "  if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0 || p.z > 1.0) return 1.0;\n" // outside the box = lit
+    "  float lit = 0.0;\n"
+    "  for (int y = -1; y <= 1; y++) {\n"
+    "    for (int x = -1; x <= 1; x++) {\n"
+    "      float d = texture(uShadowMap, p.xy + vec2(float(x), float(y)) * uShadowTexel).r;\n"
+    "      lit += (p.z - uShadowBias > d) ? 0.0 : 1.0;\n"
+    "    }\n"
+    "  }\n"
+    "  return lit / 9.0;\n"
+    "}\n"
     // uLightDir = the scene's WORLD-space key-light (sun) direction TO the light, set per frame
     // from play->envCtx.lightSettings.light1Dir (soh3d.c SoH3D_UpdateLight) so the form shading
     // tracks time of day / the world, not the camera. The scene's colour still comes from uTint;
@@ -156,6 +187,11 @@ const char* kFrag =
     "  if (uLit > 0.5) {\n"
     "    float hl = dot(normalize(vNrmView), normalize(uLightDir)) * 0.5 + 0.5;\n" // half-Lambert wrap [0,1]
     "    shade = uTint * (0.55 + 0.45 * hl);\n"                          // 0.55 ambient floor -> never black
+    "  }\n"
+    // Dynamic shadow: darken by the shadowed fraction. Applied to BOTH lit (characters) and
+    // unlit (scene ground/walls) draws, so a character's shadow lands on the OoT3D ground.
+    "  if (uShadowOn > 0.5) {\n"
+    "    shade *= (1.0 - uShadowStrength * (1.0 - shadowLit()));\n"
     "  }\n"
     "  frag = vec4(t.rgb * vColor.rgb * shade, t.a * vColor.a);\n"
     "}\n";
@@ -218,6 +254,14 @@ bool ensureProgram() {
     g_uMV = glGetUniformLocation(p, "uMV");
     g_uLit = glGetUniformLocation(p, "uLit");
     g_uLightDir = glGetUniformLocation(p, "uLightDir");
+    g_uLightVP = glGetUniformLocation(p, "uLightVP");
+    g_uShadowMap = glGetUniformLocation(p, "uShadowMap");
+    g_uShadowOn = glGetUniformLocation(p, "uShadowOn");
+    g_uShadowBias = glGetUniformLocation(p, "uShadowBias");
+    g_uShadowStrength = glGetUniformLocation(p, "uShadowStrength");
+    g_uShadowTexel = glGetUniformLocation(p, "uShadowTexel");
+    glUseProgram(p);
+    glUniform1i(g_uShadowMap, 1); // shadow map lives on texture unit 1 (color tex stays unit 0)
     glGenVertexArrays(1, &g_vao); // our isolated VAO (never touch Fast3D's)
     return true;
 }
@@ -246,6 +290,28 @@ extern "C" void SoH3D_GL_SetLightDir(const float dirWorld[3]) {
     gSoH3dLightDirWorld[0] = dirWorld[0];
     gSoH3dLightDirWorld[1] = dirWorld[1];
     gSoH3dLightDirWorld[2] = dirWorld[2];
+}
+
+// --- Dynamic shadow tunables (REPL `shadow*` in soh3d.c; env SOH3D_SHADOW for the master gate) ---
+// -1 = uninit (read env on first pass), 0 = off, 1 = on. Default on.
+extern "C" int gSoH3dShadowEnable = -1;
+// 0 = only "lit" draws (characters/props) cast shadows -> clean character-on-ground shadows, no
+// ground self-shadow acne. 1 = scene geometry casts too (walls etc.), at the cost of self-shadowing.
+extern "C" int gSoH3dShadowCastAll = 0;
+// World-space focus point for the light frustum (the camera look-at target), set per frame by
+// soh3d.c. hasFocus stays 0 until first set (no shadows on the title/no-scene frames).
+extern "C" float gSoH3dShadowFocus[3] = { 0.0f, 0.0f, 0.0f };
+extern "C" int gSoH3dShadowHasFocus = 0;
+extern "C" float gSoH3dShadowRadius = 240.0f;   // half-size of the ortho box around the focus (world units)
+extern "C" float gSoH3dShadowDist = 1600.0f;    // light "camera" pullback along the sun dir
+extern "C" float gSoH3dShadowBias = 0.0030f;    // depth-compare bias (acne vs peter-panning)
+extern "C" float gSoH3dShadowStrength = 0.55f;  // how dark the shadowed area gets (0..1)
+
+extern "C" void SoH3D_GL_SetShadowFocus(float x, float y, float z) {
+    gSoH3dShadowFocus[0] = x;
+    gSoH3dShadowFocus[1] = y;
+    gSoH3dShadowFocus[2] = z;
+    gSoH3dShadowHasFocus = 1;
 }
 
 extern "C" void SoH3D_GL_SetModelProvider(SoH3DModelProvider fn) {
@@ -355,7 +421,7 @@ namespace {
 // it constant). All vertex-array state is isolated in g_vao, so only this global context
 // state needs explicit save/restore. See [[soh3d-gl-state-leak]] / gfx_opengl.cpp.
 struct SavedGl {
-    GLint vao, prog, arrayBuf, activeTex, texBind, depthFunc;
+    GLint vao, prog, arrayBuf, activeTex, texBind, tex1Bind, depthFunc;
     GLboolean blend, cull, depth, scissor, depthMask;
 };
 
@@ -433,6 +499,8 @@ void beginPass(SavedGl& s) {
     s.depth = glIsEnabled(GL_DEPTH_TEST);
     s.scissor = glIsEnabled(GL_SCISSOR_TEST);
     glGetBooleanv(GL_DEPTH_WRITEMASK, &s.depthMask);
+    glActiveTexture(GL_TEXTURE1);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &s.tex1Bind); // we bind the shadow map here; restore it
     glActiveTexture(GL_TEXTURE0);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &s.texBind);
 
@@ -453,6 +521,9 @@ void beginPass(SavedGl& s) {
 // restored garbage). depthFunc IS save/restored because it's the live value Fast3D last set.
 void endPass(const SavedGl& s) {
     glBindVertexArray((GLuint)s.vao); // restores ALL Fast3D vertex-array state in one shot
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)s.tex1Bind); // hand back unit 1 (we used it for the shadow map)
+    glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, (GLuint)s.texBind);
     glActiveTexture((GLenum)s.activeTex);
     glBindBuffer(GL_ARRAY_BUFFER, (GLuint)s.arrayBuf);
@@ -557,6 +628,152 @@ struct DrawItem {
 };
 std::vector<DrawItem> g_drawList;
 
+// --- Light-space matrix math (column-major, the SAME convention uMP/uMV are uploaded with:
+// glUniformMatrix4fv(..., GL_FALSE, ...) so GLSL `M * v` is the standard transform). All inputs
+// and outputs are float[16] column-major (element [col*4 + row]). ---
+static void vmNormalize(float v[3]) {
+    float l = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l > 1e-6f) { v[0] /= l; v[1] /= l; v[2] /= l; }
+}
+static void vmCross(const float a[3], const float b[3], float o[3]) {
+    o[0] = a[1] * b[2] - a[2] * b[1];
+    o[1] = a[2] * b[0] - a[0] * b[2];
+    o[2] = a[0] * b[1] - a[1] * b[0];
+}
+static float vmDot(const float a[3], const float b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+
+// out = A * B (both column-major GLSL matrices). out[c*4+r] = sum_k A[k*4+r] * B[c*4+k].
+static void mat4Mul(float out[16], const float A[16], const float B[16]) {
+    float t[16];
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++) {
+            float s = 0.0f;
+            for (int k = 0; k < 4; k++) s += A[k * 4 + r] * B[c * 4 + k];
+            t[c * 4 + r] = s;
+        }
+    memcpy(out, t, sizeof(t));
+}
+
+static void mat4LookAt(float m[16], const float eye[3], const float center[3], const float up[3]) {
+    float f[3] = { center[0] - eye[0], center[1] - eye[1], center[2] - eye[2] };
+    vmNormalize(f);
+    float s[3];
+    vmCross(f, up, s);
+    vmNormalize(s);
+    float u[3];
+    vmCross(s, f, u);
+    m[0] = s[0]; m[1] = u[0]; m[2] = -f[0]; m[3] = 0.0f;
+    m[4] = s[1]; m[5] = u[1]; m[6] = -f[1]; m[7] = 0.0f;
+    m[8] = s[2]; m[9] = u[2]; m[10] = -f[2]; m[11] = 0.0f;
+    m[12] = -vmDot(s, eye); m[13] = -vmDot(u, eye); m[14] = vmDot(f, eye); m[15] = 1.0f;
+}
+
+static void mat4Ortho(float m[16], float l, float r, float b, float t, float n, float fr) {
+    memset(m, 0, 16 * sizeof(float));
+    m[0] = 2.0f / (r - l);
+    m[5] = 2.0f / (t - b);
+    m[10] = -2.0f / (fr - n);
+    m[12] = -(r + l) / (r - l);
+    m[13] = -(t + b) / (t - b);
+    m[14] = -(fr + n) / (fr - n);
+    m[15] = 1.0f;
+}
+
+// Build WORLD -> sun-light-clip from the scene sun dir + the focus box (REPL-tunable size/pullback).
+static void computeLightVP(float outVP[16]) {
+    float L[3] = { gSoH3dLightDirWorld[0], gSoH3dLightDirWorld[1], gSoH3dLightDirWorld[2] };
+    vmNormalize(L); // direction TO the light (F3DEX convention)
+    float F[3] = { gSoH3dShadowFocus[0], gSoH3dShadowFocus[1], gSoH3dShadowFocus[2] };
+    float D = gSoH3dShadowDist, R = gSoH3dShadowRadius;
+    float eye[3] = { F[0] + L[0] * D, F[1] + L[1] * D, F[2] + L[2] * D };
+    float up[3] = { 0.0f, 1.0f, 0.0f };
+    if (fabsf(L[1]) > 0.95f) { up[0] = 0.0f; up[1] = 0.0f; up[2] = 1.0f; } // near-vertical sun -> stable up
+    float view[16], proj[16];
+    mat4LookAt(view, eye, F, up);
+    float n = D - R * 4.0f;
+    if (n < 1.0f) n = 1.0f;
+    float fr = D + R * 4.0f;
+    mat4Ortho(proj, -R, R, -R, R, n, fr);
+    mat4Mul(outVP, proj, view);
+}
+
+// Lazily create the shadow depth FBO (a depth-only texture). Saves/restores the bound FBO+texture
+// so it can run mid-frame without disturbing the game's render target. Returns false if incomplete.
+static bool ensureShadowFbo() {
+    if (g_shadowFbo) return true;
+    GLint prevFbo = 0, prevTex = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+    glGenTextures(1, &g_shadowTex);
+    glBindTexture(GL_TEXTURE_2D, g_shadowTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, g_shadowRes, g_shadowRes, 0, GL_DEPTH_COMPONENT,
+                 GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenFramebuffers(1, &g_shadowFbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_shadowFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, g_shadowTex, 0);
+#ifndef USE_OPENGLES
+    glDrawBuffer(GL_NONE); // depth-only: no color attachment
+    glReadBuffer(GL_NONE);
+#endif
+    GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prevTex);
+    if (st != GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "[SoH3D_GL] shadow FBO incomplete: 0x%x\n", st);
+        glDeleteFramebuffers(1, &g_shadowFbo);
+        g_shadowFbo = 0;
+        glDeleteTextures(1, &g_shadowTex);
+        g_shadowTex = 0;
+        return false;
+    }
+    fprintf(stderr, "[SoH3D_GL] shadow map %dx%d ready\n", g_shadowRes, g_shadowRes);
+    return true;
+}
+
+// Render the shadow casters' depth from the light's POV into g_shadowFbo. Assumes the main-pass
+// GL state (g_vao, g_program, depth test) is already installed by beginPass; restores the game's
+// FBO + viewport before returning. invertY is forced OFF here so the stored depth matches the
+// fragment's sampling (which uses uLightVP * world directly, no clip-Y flip).
+static void renderShadowMap(GLint gameFbo, const GLint vp[4], const float lightVP[16], float step) {
+    glBindFramebuffer(GL_FRAMEBUFFER, g_shadowFbo);
+    glViewport(0, 0, g_shadowRes, g_shadowRes);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    // The shadow map MUST clear to the FAR depth (1.0): empty texels then read "far", so ground
+    // fragments not under a caster compare as lit. Do NOT inherit Fast3D's clear-depth (it may be
+    // anything); set it explicitly and restore so we don't leak it back into Fast3D's frame clear.
+    GLfloat prevClearDepth = 1.0f;
+    glGetFloatv(GL_DEPTH_CLEAR_VALUE, &prevClearDepth);
+    glClearDepth(1.0);
+    glDepthFunc(GL_LEQUAL); // closer-to-light (smaller) depth wins
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glClearDepth(prevClearDepth);
+    glUniform1f(g_uShadowOn, 0.0f); // building the map: no sampling (also avoids FB feedback)
+    std::vector<float> lerped;
+    for (const DrawItem& it : g_drawList) {
+        if (!gSoH3dShadowCastAll && !it.lit) continue; // default: only characters/props cast
+        GlModel* m = ensureUploaded(it.modelId);
+        if (!m) continue;
+        const float* pose = it.bones.empty() ? nullptr : it.bones.data();
+        if (pose && step < 0.999f && !it.prevBones.empty() && it.prevBones.size() == it.bones.size()) {
+            lerped.resize(it.bones.size());
+            float w = 1.0f - step;
+            for (size_t i = 0; i < it.bones.size(); i++) lerped[i] = w * it.prevBones[i] + step * it.bones[i];
+            pose = lerped.data();
+        }
+        float depthMP[16];
+        mat4Mul(depthMP, lightVP, it.mv); // model -> light-clip = lightVP * (model -> world)
+        drawOne(*m, depthMP, it.mv, /*lit=*/0, /*invertY=*/0, 255, 255, 255, /*aspectAdj=*/1.0f, pose,
+                it.boneCount, it.midMask);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)gameFbo);
+    glViewport(vp[0], vp[1], vp[2], vp[3]);
+}
+
 } // namespace
 
 // Inline single-model draw (legacy entry; still used by any direct caller). Brackets one model
@@ -637,6 +854,32 @@ extern "C" void SoH3D_GL_RenderPass(void) {
     SavedGl s;
     beginPass(s);
     int drawn = 0;
+
+    // --- Dynamic sun-shadow phase (before the visible draws). Render the casters' depth from the
+    // light into the shadow map, bind it on unit 1, and enable sampling for the main draws. ---
+    if (gSoH3dShadowEnable < 0) {
+        const char* e = getenv("SOH3D_SHADOW");
+        gSoH3dShadowEnable = (e && e[0] == '0') ? 0 : 1;
+    }
+    if (gSoH3dShadowEnable && gSoH3dShadowHasFocus && ensureShadowFbo()) {
+        GLint gameFbo = 0, vp[4] = { 0, 0, 0, 0 };
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &gameFbo);
+        glGetIntegerv(GL_VIEWPORT, vp);
+        float lightVP[16];
+        computeLightVP(lightVP);
+        glUniformMatrix4fv(g_uLightVP, 1, GL_FALSE, lightVP);
+        renderShadowMap(gameFbo, vp, lightVP, gSoH3dInterpStep);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g_shadowTex);
+        glActiveTexture(GL_TEXTURE0);
+        glUniform1f(g_uShadowOn, 1.0f);
+        glUniform1f(g_uShadowBias, gSoH3dShadowBias);
+        glUniform1f(g_uShadowStrength, gSoH3dShadowStrength);
+        glUniform1f(g_uShadowTexel, 1.0f / (float)g_shadowRes);
+    } else {
+        glUniform1f(g_uShadowOn, 0.0f);
+    }
+
     // Interpolate each item's skin pose toward this subframe's step, matching the per-subframe matrix
     // interpolation the rest of the scene gets — so skinned limbs animate at the render FPS instead of
     // snapping at the 20fps logic rate. Component-wise matrix lerp, the same blend frame_interpolation
