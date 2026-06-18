@@ -40,6 +40,7 @@ struct GlGroup {
     float blendColor[4] = { 0, 0, 0, 1 };
     int depthWrite = 1;
     float polygonOffset = 0.0f; // window-depth bias for decals (gl_FragDepth += this)
+    int cull = 0;               // 1 = skip (hidden group, e.g. Link baked equipment)
 };
 
 struct GlModel {
@@ -288,6 +289,7 @@ static bool uploadModel(GlModel& m, const SoH3DGlGroup* groups, int groupCount, 
         g.blendEqA = groups[i].blendEqA;
         g.depthWrite = groups[i].depthWrite;
         g.polygonOffset = groups[i].polygonOffset;
+        g.cull = groups[i].cull;
         for (int k = 0; k < 4; k++) g.blendColor[k] = groups[i].blendColor[k];
         all.insert(all.end(), groups[i].verts, groups[i].verts + groups[i].vertCount);
         m.groups.push_back(g);
@@ -496,6 +498,7 @@ void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int inve
     glVertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, color));
 
     for (const GlGroup& grp : m.groups) {
+        if (grp.cull) continue; // hidden group (e.g. Link baked equipment, SOH3D_LINK_HIDEITEMS)
         glUniform1f(g_uAlphaRef, grp.alphaTest ? grp.alphaRef : 0.0f);
         glUniform1f(g_uDepthOffset, grp.polygonOffset);
         if (grp.blendEnable) {
