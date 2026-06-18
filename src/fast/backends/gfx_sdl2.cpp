@@ -28,6 +28,11 @@
 #include "SDL_opengl.h"
 #elif __APPLE__
 #include <SDL.h>
+#ifdef ENABLE_OPENGL
+// macOS resolves desktop GL through GLEW (matches gfx_opengl.h); needed for the SoH3D
+// frame-dump's glReadPixels — otherwise GL_RGBA/GL_UNSIGNED_BYTE are undeclared here.
+#include <GL/glew.h>
+#endif
 #include "fast/backends/gfx_metal.h"
 #include "ship/utils/macUtils.h"
 #else
