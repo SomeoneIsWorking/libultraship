@@ -75,6 +75,11 @@ void Fast3dGui::HandleWindowEvents(Fast::WindowEvent event) {
 #ifdef ENABLE_VULKAN
         case WindowBackend::FAST3D_SDL_VULKAN:
 #endif
+            // Offer the event to the RmlUi menu first (Phase 2). It always handles its toggle
+            // binding, and consumes input while open so the ImGui menu / game do not also react.
+            if (mRml && mRml->ProcessSdlEvent(const_cast<SDL_Event*>(static_cast<const SDL_Event*>(event.Sdl.Event)))) {
+                break;
+            }
             ImGui_ImplSDL2_ProcessEvent(static_cast<const SDL_Event*>(event.Sdl.Event));
 #if defined(__ANDROID__) || defined(__IOS__)
             Ship::Mobile::ImGuiProcessEvent(ImGui::GetIO().WantTextInput);
@@ -175,7 +180,7 @@ void Fast3dGui::ImGuiBackendInit() {
                 auto wnd = Ship::Context::GetRawInstance()->GetWindow();
                 mRml = std::make_unique<Ship::SohRmlUi>();
                 if (!mRml->Init(mImpl.Opengl.Window, mImpl.Opengl.Context, (int)wnd->GetWidth(),
-                                (int)wnd->GetHeight())) {
+                                (int)wnd->GetHeight(), /*vulkan=*/false)) {
                     SPDLOG_ERROR("Fast3dGui: RmlUi init failed; menu disabled");
                     mRml.reset();
                 }
@@ -193,9 +198,18 @@ void Fast3dGui::ImGuiBackendInit() {
 
 #ifdef ENABLE_VULKAN
         case WindowBackend::FAST3D_SDL_VULKAN:
-            // M1: no ImGui Vulkan *renderer* backend yet (that is M4). The font atlas
-            // is built lazily on first NewFrame (see ImGuiBackendNewFrame) once SoH has
-            // added its fonts; nothing is uploaded/drawn until the renderer lands.
+            // No ImGui Vulkan *renderer* backend yet (that is M4); the ImGui font atlas is built
+            // lazily on first NewFrame. The RmlUi menu, however, has its own Vulkan render interface
+            // (records into the Fast3D Vulkan pass), so stand it up here.
+            {
+                auto wnd = Ship::Context::GetRawInstance()->GetWindow();
+                mRml = std::make_unique<Ship::SohRmlUi>();
+                if (!mRml->Init(mImpl.Vulkan.Window, nullptr, (int)wnd->GetWidth(), (int)wnd->GetHeight(),
+                                /*vulkan=*/true)) {
+                    SPDLOG_ERROR("Fast3dGui: RmlUi (Vulkan) init failed; menu disabled");
+                    mRml.reset();
+                }
+            }
             break;
 #endif
 #ifdef ENABLE_DX11
@@ -220,6 +234,11 @@ void Fast3dGui::ImGuiBackendShutdown() {
 #if __APPLE__
         case WindowBackend::FAST3D_SDL_METAL:
             ImGui_ImplMetal_Shutdown();
+            break;
+#endif
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN:
+            mRml.reset();
             break;
 #endif
 #if defined(ENABLE_DX11) || defined(ENABLE_DX12)
@@ -320,8 +339,18 @@ void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {
 }
 
 void Fast3dGui::RenderRmlMenu() {
-    if (mImpl.Backend == WindowBackend::FAST3D_SDL_OPENGL && mRml) {
-        mRml->UpdateAndRender();
+    if (!mRml) {
+        return;
+    }
+    switch (mImpl.Backend) {
+        case WindowBackend::FAST3D_SDL_OPENGL:
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN:
+#endif
+            mRml->UpdateAndRender();
+            break;
+        default:
+            break;
     }
 }
 

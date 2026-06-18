@@ -16,6 +16,8 @@ class ElementDocument;
 
 namespace Ship {
 
+class RmlRenderInterfaceVk;
+
 /**
  * @brief Owns the RmlUi runtime for the Fast3D OpenGL backend.
  *
@@ -42,11 +44,13 @@ class SohRmlUi {
      * @param glContext  SDL_GLContext (as void*), assumed current on the calling thread.
      * @param width      Initial window width in pixels.
      * @param height     Initial window height in pixels.
+     * @param vulkan     true = render with the Vulkan render interface (into the Fast3D Vulkan
+     *                   backend's pass); false = the GL3 render interface on the SDL/GL context.
      * @return true if RmlUi initialised and the test document loaded.
      */
-    bool Init(void* sdlWindow, void* glContext, int width, int height);
+    bool Init(void* sdlWindow, void* glContext, int width, int height, bool vulkan);
 
-    /** @brief Updates and renders the RmlUi context, wrapped in GL state save/restore. */
+    /** @brief Updates and renders the RmlUi context (only when visible), wrapped in GL save/restore. */
     void UpdateAndRender();
 
     /** @brief Updates the context + render-interface viewport after a window resize. */
@@ -59,13 +63,42 @@ class SohRmlUi {
         return mInitialised;
     }
 
+    // --- Phase 2: input + controller navigation -------------------------------------------------
+    /**
+     * @brief Feed one SDL_Event (as void* to keep SDL out of this header) to the menu.
+     *
+     * Toggle keys/buttons are always handled. When the menu is open, mouse/keyboard/controller
+     * events drive RmlUi (directional input is remapped to focus navigation; A/Enter activates the
+     * focused element; B/Esc closes). Returns true if the event was consumed, so the caller can
+     * gate game input while the menu is open.
+     */
+    bool ProcessSdlEvent(void* sdlEvent);
+
+    bool IsVisible() const {
+        return mVisible;
+    }
+    void SetVisible(bool visible);
+    void ToggleVisible() {
+        SetVisible(!mVisible);
+    }
+
+  private:
+    // Move keyboard/controller focus through the document's focusable elements (RmlUi Tab order).
+    void FocusNext();
+    void FocusPrev();
+    // Activate (click) the currently focused element, mirroring a controller "A"/Enter press.
+    void ActivateFocused();
+
   private:
     bool mInitialised = false;
+    bool mVisible = false;
+    bool mVulkan = false;
     int mWidth = 0;
     int mHeight = 0;
     void* mSdlWindow = nullptr;
 
-    std::unique_ptr<RenderInterface_GL3> mRenderInterface;
+    std::unique_ptr<RenderInterface_GL3> mRenderInterface;       // GL backend
+    std::unique_ptr<RmlRenderInterfaceVk> mVkRenderInterface;    // Vulkan backend
     std::unique_ptr<SystemInterface_SDL> mSystemInterface;
     Rml::Context* mContext = nullptr;          // owned by RmlUi, freed by Rml::Shutdown()
     Rml::ElementDocument* mDocument = nullptr;  // owned by the context

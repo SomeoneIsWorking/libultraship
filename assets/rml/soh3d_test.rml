@@ -1,21 +1,32 @@
 <rml>
 <head>
-	<title>SoH3D RmlUi spike</title>
+	<title>SoH3D menu</title>
 	<link type="text/rcss" href="rml.rcss"/>
 	<link type="text/rcss" href="soh3d_test.rcss"/>
 </head>
 <body>
 	<div id="panel">
-		<h1>RmlUi is live</h1>
-		<p>This document is parsed from <span class="tag">.rml + .rcss</span> and
-		rendered by the GL3 RenderInterface inside libultraship's Fast3D GUI pass.</p>
-		<p>Styled colours, rounded corners and a drop shadow below:</p>
-		<p>
-			<span class="swatch a"></span>
-			<span class="swatch b"></span>
-			<span class="swatch c"></span>
-		</p>
-		<p>Phase 1 integration spike &mdash; render path verified.</p>
+		<h1>Ship of Harkinian</h1>
+		<p class="subtitle">RmlUi menu &mdash; Phase 2 (input &amp; navigation)</p>
+
+		<div class="row" tabindex="auto">
+			<span class="label">Widescreen</span>
+			<input type="checkbox" name="widescreen" checked tabindex="none"/>
+		</div>
+		<div class="row" tabindex="auto">
+			<span class="label">Motion blur</span>
+			<input type="checkbox" name="motionblur" tabindex="none"/>
+		</div>
+		<div class="row" tabindex="auto">
+			<span class="label">N64 mode</span>
+			<input type="checkbox" name="n64mode" tabindex="none"/>
+		</div>
+		<div class="row" tabindex="auto">
+			<span class="label">Show FPS</span>
+			<input type="checkbox" name="showfps" tabindex="none"/>
+		</div>
+
+		<p class="hint">&#8597; move focus &middot; Enter / A toggle &middot; Esc / Start closes</p>
 	</div>
 </body>
 </rml>

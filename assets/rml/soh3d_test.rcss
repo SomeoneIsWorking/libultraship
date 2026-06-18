@@ -1,6 +1,6 @@
-/* Phase 1 integration-spike stylesheet. Proves RmlUi RCSS parsing + the GL3
-   render interface inside libultraship's Fast3D GUI pass. The font family must match
-   the name embedded in the TTF (RmlUi reports it as "LatoLatin"). */
+/* SoH3D RmlUi menu stylesheet. Phase 2: a focusable settings list with a clear focus highlight
+   and native checkbox toggle state. The font family must match the name embedded in the TTF
+   (RmlUi reports it as "LatoLatin"). */
 
 body {
 	font-family: LatoLatin;
@@ -24,31 +24,54 @@ body {
 	font-size: 30px;
 	font-weight: bold;
 	color: #8fb6ff;
-	margin-bottom: 14px;
+	margin-bottom: 4px;
 }
 
-#panel p {
-	margin-bottom: 10px;
-	line-height: 24px;
+.subtitle {
+	color: #7c89a8;
+	font-size: 14px;
+	margin-bottom: 18px;
 }
 
-.swatch {
+.hint {
+	color: #6c789a;
+	font-size: 13px;
+	margin-top: 16px;
+}
+
+/* A settings row takes focus as a whole so navigation is obvious; the focused row lights up. */
+.row {
+	display: block;
+	padding: 10px 14px;
+	margin-bottom: 6px;
+	border-radius: 6px;
+	background-color: #1e2a48cc;
+	border: 2px #1e2a4800; /* reserve the focus-border width so layout does not shift on focus */
+}
+
+.row:focus {
+	background-color: #2c416e;
+	border: 2px #8fb6ffff;
+}
+
+.row .label {
 	display: inline-block;
-	width: 40px;
+	width: 360px;
+	vertical-align: middle;
+}
+
+/* Native checkbox: an 18px box that fills when checked. */
+input.checkbox {
+	display: inline-block;
+	width: 18px;
 	height: 18px;
-	margin-right: 6px;
 	vertical-align: middle;
 	border-radius: 4px;
+	border: 2px #8fb6ffff;
+	background-color: #0c1322;
 }
 
-.swatch.a { background-color: #ff5d5d; }
-.swatch.b { background-color: #5dff8f; }
-.swatch.c { background-color: #5d9bff; }
-
-.tag {
-	color: #1a1030;
-	background-color: #ffce54;
-	padding: 2px 8px;
-	border-radius: 12px;
-	font-weight: bold;
+input.checkbox:checked {
+	background-color: #5dff8f;
+	border-color: #5dff8f;
 }
