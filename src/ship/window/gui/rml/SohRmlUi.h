@@ -91,6 +91,9 @@ class SohRmlUi {
     // Move keyboard/controller focus through the document's focusable elements (RmlUi Tab order).
     void FocusNext();
     void FocusPrev();
+    // Scroll the active pane so the currently focused row is visible (for panes taller than the
+    // window, e.g. the Debug tab's long warp list) — keyboard/D-pad nav follows focus off-screen.
+    void ScrollFocusIntoView();
     // Activate (click) the currently focused element, mirroring a controller "A"/Enter press.
     void ActivateFocused();
     // Switch the visible tab: show its <pane>, move the `selected`/`active` classes, and focus the

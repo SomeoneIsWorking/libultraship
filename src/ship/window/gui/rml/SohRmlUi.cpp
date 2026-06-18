@@ -213,10 +213,21 @@ void SohRmlUi::SetVisible(bool visible) {
     }
 }
 
+void SohRmlUi::ScrollFocusIntoView() {
+    if (!mContext) {
+        return;
+    }
+    if (Rml::Element* f = mContext->GetFocusElement()) {
+        // Nearest = only scroll when the row is off-screen (no jump while it's already visible).
+        f->ScrollIntoView(Rml::ScrollIntoViewOptions(Rml::ScrollAlignment::Nearest));
+    }
+}
+
 void SohRmlUi::FocusNext() {
     if (mContext) {
         mContext->ProcessKeyDown(Rml::Input::KI_TAB, 0);
         mContext->ProcessKeyUp(Rml::Input::KI_TAB, 0);
+        ScrollFocusIntoView();
     }
 }
 
@@ -224,6 +235,7 @@ void SohRmlUi::FocusPrev() {
     if (mContext) {
         mContext->ProcessKeyDown(Rml::Input::KI_TAB, Rml::Input::KM_SHIFT);
         mContext->ProcessKeyUp(Rml::Input::KI_TAB, Rml::Input::KM_SHIFT);
+        ScrollFocusIntoView();
     }
 }
 
@@ -357,6 +369,7 @@ void SohRmlUi::FocusFirstInActivePane() {
     // focusable, so Tab navigation naturally stays within the active pane.
     if (Rml::Element* first = panes[mActiveTab]->QuerySelector("[tabindex='auto']")) {
         first->Focus();
+        ScrollFocusIntoView(); // reset a previously-scrolled pane back to its first row
     }
 }
 
