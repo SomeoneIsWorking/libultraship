@@ -125,8 +125,22 @@ void SohRmlUi::SetVisible(bool visible) {
     if (mVisible && mContext) {
         // Update once so layout is current, then drop focus onto the first focusable element so a
         // controller/keyboard can drive it immediately (matches Dusklight opening with a default focus).
+        // Focus the element directly rather than simulating Tab: at open time (e.g. the startup
+        // auto-open) a synthesised Tab does not reliably land on the first item, leaving nothing
+        // highlighted. QuerySelector finds the first element opted into focus via tabindex.
         mContext->Update();
-        FocusNext();
+        Rml::Element* first = nullptr;
+        if (mDocument) {
+            // Match the first element that opts INTO focus (tabindex="auto"); a bare [tabindex]
+            // selector would also match items opted out with tabindex="none" (e.g. the tabs),
+            // and focusing one of those leaves nothing visibly highlighted.
+            first = mDocument->QuerySelector("[tabindex='auto']");
+        }
+        if (first) {
+            first->Focus();
+        } else {
+            FocusNext();
+        }
     } else if (mContext) {
         if (Rml::Element* focus = mContext->GetFocusElement()) {
             focus->Blur();

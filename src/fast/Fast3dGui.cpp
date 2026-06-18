@@ -354,6 +354,55 @@ void Fast3dGui::RenderRmlMenu() {
     }
 }
 
+void Fast3dGui::RmlMenuInjectKey(int sdlKeycode) {
+    if (!mRml) {
+        return;
+    }
+    // Drive the menu through the same path as a real keypress: a KEYDOWN, then a KEYUP. The scancode
+    // is left zero (the menu's handler keys off the keysym/sym only), and modifiers are empty.
+    SDL_Event ev{};
+    ev.type = SDL_KEYDOWN;
+    ev.key.state = SDL_PRESSED;
+    ev.key.repeat = 0;
+    ev.key.keysym.sym = (SDL_Keycode)sdlKeycode;
+    ev.key.keysym.mod = KMOD_NONE;
+    mRml->ProcessSdlEvent(&ev);
+    ev.type = SDL_KEYUP;
+    ev.key.state = SDL_RELEASED;
+    mRml->ProcessSdlEvent(&ev);
+}
+
+// C bridge for the SoH3D REPL (`menu <action>`): resolve the active Fast3dGui and inject the key
+// that drives the requested navigation. The action codes (kept SDL-free for the C caller in
+// soh3d.c) match SoH3D_RmlMenuAction in tools/soh3d_repl.py:
+//   0 next (Down)  1 prev (Up)  2 activate (Enter)  3 close (Esc)  4 toggle (Esc)
+extern "C" void SoH3D_RmlMenuKey(int action) {
+    auto ctx = Ship::Context::GetRawInstance();
+    if (!ctx || !ctx->GetWindow()) {
+        return;
+    }
+    auto* gui = dynamic_cast<Fast::Fast3dGui*>(ctx->GetWindow()->GetGui().get());
+    if (!gui) {
+        return;
+    }
+    int keycode;
+    switch (action) {
+        case 0:
+            keycode = SDLK_DOWN;
+            break;
+        case 1:
+            keycode = SDLK_UP;
+            break;
+        case 2:
+            keycode = SDLK_RETURN;
+            break;
+        default:
+            keycode = SDLK_ESCAPE; // 3 (close) and 4 (toggle) both ride the Esc toggle binding
+            break;
+    }
+    gui->RmlMenuInjectKey(keycode);
+}
+
 void Fast3dGui::DrawFloatingWindows() {
     if (!(ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable)) {
         return;

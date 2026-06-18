@@ -144,6 +144,16 @@ class Fast3dGui : public Ship::Gui {
      */
     void LoadTextureFromResource(const std::string& name, std::shared_ptr<Ship::GuiTexture> texture);
 
+    /**
+     * @brief Test/automation hook: synthesise an SDL key press for the RmlUi menu.
+     *
+     * Builds an SDL_KEYDOWN (+matching KEYUP) for @p sdlKeycode (an SDLK_* value) and feeds it
+     * through the menu's normal ProcessSdlEvent path, so REPL-driven menu navigation exercises
+     * exactly the same input handling as a real keypress (no parallel code path). Used by the
+     * `menu` REPL command (tools/soh3d_repl.py) for deterministic, headless nav verification.
+     */
+    void RmlMenuInjectKey(int sdlKeycode);
+
   protected:
     void ImGuiWMInit() override;
     void ImGuiWMShutdown() override;
