@@ -33,6 +33,10 @@ extern int gSoH3dLightEnable;
 // transition. -1 = nothing pending. Defined here (libultraship) so soh can extern-reference it.
 extern "C" int gSoH3dMenuWarp = -1;
 
+// Debug-menu restart request: a row with `restart="1"` sets this to 1; soh3d.c's per-frame
+// SoH3D_ReplPoll consumes it (it has the PlayState) and returns to the title screen.
+extern "C" int gSoH3dMenuRestart = 0;
+
 // Unique id for blocking game input while the RML menu is open (sequence continues the existing
 // *_BLOCK_ID constants in gfx_dxgi.cpp / InputEditorWindow.cpp). Without this, SoH polls the
 // controller/keyboard directly and the game keeps responding under the open menu.
@@ -255,6 +259,13 @@ void SohRmlUi::ActivateFocused() {
     if (!warp.empty()) {
         gSoH3dMenuWarp = std::atoi(warp.c_str());
         SetVisible(false); // close the menu so the transition is visible
+        return;
+    }
+    // Restart row: `restart="1"` returns to the title screen (consumed in soh3d.c, which has the
+    // PlayState — same indirection as the warp rows above).
+    if (!focus->GetAttribute<Rml::String>("restart", "").empty()) {
+        gSoH3dMenuRestart = 1;
+        SetVisible(false);
         return;
     }
     // Curated CVar toggle rows take priority: flip the feature in place rather than "clicking" a row.
