@@ -51,9 +51,22 @@ target_sources(libultraship PRIVATE ${Source_Files__Window})
 #=================== Gui ===================
 
 file(GLOB_RECURSE Source_Files__Window__Gui RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "window/gui/*.cpp")
+# The RmlUi integration backend (window/gui/rml/) is compiled separately below so it can carry
+# the RmlUi-specific compile definitions; keep it out of the generic gui glob.
+list(FILTER Source_Files__Window__Gui EXCLUDE REGEX "window/gui/rml/")
 
 source_group("window/gui" FILES ${Source_Files__Window__Gui})
 target_sources(libultraship PRIVATE ${Source_Files__Window__Gui})
+
+#=================== Gui / RmlUi ===================
+
+# Only the OpenGL (Fast3D SDL) backend has an RmlUi render interface so far. The bundled glad
+# loader and the SDL platform shim need RMLUI_SDL_VERSION_MAJOR set to the linked SDL major.
+file(GLOB Source_Files__Window__Gui__Rml RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "window/gui/rml/*.cpp")
+source_group("window/gui/rml" FILES ${Source_Files__Window__Gui__Rml})
+target_sources(libultraship PRIVATE ${Source_Files__Window__Gui__Rml})
+# Applied target-wide: the macro is only referenced by the RmlUi SDL backend files.
+target_compile_definitions(libultraship PRIVATE RMLUI_SDL_VERSION_MAJOR=2)
 
 #=================== Utils ===================
 

@@ -266,9 +266,13 @@ void Gui::StartFrame() {
 }
 
 void Gui::EndFrame() {
-    // Draw the ImGui "viewports" which are the floating windows.
     ImGui::Render();
+    // The game frame is composited THROUGH ImGui (DrawGame -> ImGui::Image of the game
+    // framebuffer), so the RmlUi menu has to render AFTER the ImGui draw data or the opaque
+    // game image paints over it. (Layering the menu under the ImGui dev-tool windows is a
+    // Phase 2 concern — they share a single ImGui draw pass here.)
     ImGuiRenderDrawData(ImGui::GetDrawData());
+    RenderRmlMenu();
     ImGui::EndFrame();
 }
 
@@ -309,6 +313,9 @@ void Gui::EndDraw() {
 }
 
 void Gui::ImGuiRenderDrawData(ImDrawData* data) {
+}
+
+void Gui::RenderRmlMenu() {
 }
 
 void Gui::SaveConsoleVariablesNextFrame() {

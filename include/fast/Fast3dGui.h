@@ -12,6 +12,10 @@
 // The WindowEvent type has been moved to the Fast namespace so that ship code does
 // not depend on any Fast3D or platform-specific types.
 
+namespace Ship {
+class SohRmlUi;
+} // namespace Ship
+
 namespace Fast {
 class Interpreter;
 
@@ -61,7 +65,8 @@ class Fast3dGui : public Ship::Gui {
   public:
     Fast3dGui();
     Fast3dGui(std::vector<std::shared_ptr<Ship::GuiWindow>> guiWindows);
-    ~Fast3dGui() override = default;
+    // Defined out-of-line so the unique_ptr<SohRmlUi> deleter sees the complete type.
+    ~Fast3dGui() override;
 
     bool SupportsViewports() override;
 
@@ -144,6 +149,7 @@ class Fast3dGui : public Ship::Gui {
     void ImGuiBackendNewFrame() override;
     void ImGuiWMNewFrame() override;
     void ImGuiRenderDrawData(ImDrawData* data) override;
+    void RenderRmlMenu() override;
     void DrawFloatingWindows() override;
     void CalculateGameViewport() override;
     void DrawGame() override;
@@ -157,6 +163,7 @@ class Fast3dGui : public Ship::Gui {
 
     std::weak_ptr<Interpreter> mInterpreter; ///< Weak reference to the Fast3D scripting interpreter.
     GuiWindowInitData mImpl;                 ///< Backend-specific window/context handles passed to Init().
+    std::unique_ptr<Ship::SohRmlUi> mRml;    ///< RmlUi menu runtime (OpenGL backend only).
 
   private:
     /** @brief Applies any pending resolution or MSAA changes to the render target. */

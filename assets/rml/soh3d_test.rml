@@ -1,0 +1,21 @@
+<rml>
+<head>
+	<title>SoH3D RmlUi spike</title>
+	<link type="text/rcss" href="rml.rcss"/>
+	<link type="text/rcss" href="soh3d_test.rcss"/>
+</head>
+<body>
+	<div id="panel">
+		<h1>RmlUi is live</h1>
+		<p>This document is parsed from <span class="tag">.rml + .rcss</span> and
+		rendered by the GL3 RenderInterface inside libultraship's Fast3D GUI pass.</p>
+		<p>Styled colours, rounded corners and a drop shadow below:</p>
+		<p>
+			<span class="swatch a"></span>
+			<span class="swatch b"></span>
+			<span class="swatch c"></span>
+		</p>
+		<p>Phase 1 integration spike &mdash; render path verified.</p>
+	</div>
+</body>
+</rml>

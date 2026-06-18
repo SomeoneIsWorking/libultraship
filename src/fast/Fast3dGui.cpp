@@ -9,6 +9,7 @@
 #include "fast/resource/type/Texture.h"
 #include "ship/window/gui/resource/GuiTextureFactory.h"
 #include "ship/resource/File.h"
+#include "ship/window/gui/rml/SohRmlUi.h"
 
 #ifdef __APPLE__
 #include <SDL_hints.h>
@@ -44,6 +45,8 @@ Fast3dGui::Fast3dGui() : Ship::Gui() {
 
 Fast3dGui::Fast3dGui(std::vector<std::shared_ptr<Ship::GuiWindow>> guiWindows) : Ship::Gui(guiWindows) {
 }
+
+Fast3dGui::~Fast3dGui() = default;
 
 void Fast3dGui::Init(GuiWindowInitData windowImpl) {
     mImpl = windowImpl;
@@ -148,6 +151,16 @@ void Fast3dGui::ImGuiBackendInit() {
 #else
             ImGui_ImplOpenGL3_Init("#version 120");
 #endif
+            {
+                // Stand up the RmlUi menu runtime alongside ImGui on the same SDL/GL context.
+                auto wnd = Ship::Context::GetRawInstance()->GetWindow();
+                mRml = std::make_unique<Ship::SohRmlUi>();
+                if (!mRml->Init(mImpl.Opengl.Window, mImpl.Opengl.Context, (int)wnd->GetWidth(),
+                                (int)wnd->GetHeight())) {
+                    SPDLOG_ERROR("Fast3dGui: RmlUi init failed; menu disabled");
+                    mRml.reset();
+                }
+            }
             break;
 #endif
 
@@ -174,6 +187,7 @@ void Fast3dGui::ImGuiBackendShutdown() {
     switch (mImpl.Backend) {
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
+            mRml.reset();
             ImGui_ImplOpenGL3_Shutdown();
             break;
 #endif
@@ -257,6 +271,12 @@ void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {
 #endif
         default:
             break;
+    }
+}
+
+void Fast3dGui::RenderRmlMenu() {
+    if (mImpl.Backend == WindowBackend::FAST3D_SDL_OPENGL && mRml) {
+        mRml->UpdateAndRender();
     }
 }
 

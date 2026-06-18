@@ -1,0 +1,54 @@
+/* Phase 1 integration-spike stylesheet. Proves RmlUi RCSS parsing + the GL3
+   render interface inside libultraship's Fast3D GUI pass. The font family must match
+   the name embedded in the TTF (RmlUi reports it as "LatoLatin"). */
+
+body {
+	font-family: LatoLatin;
+	font-weight: normal;
+	font-style: normal;
+	font-size: 18px;
+	color: #e8e8f0;
+}
+
+#panel {
+	width: 460px;
+	margin: 60px auto 0 auto;
+	padding: 24px 28px;
+	background-color: #16203aee;
+	border: 2px #5a7fd0ff;
+	border-radius: 10px;
+	box-shadow: 0 6px 24px #000000aa;
+}
+
+#panel h1 {
+	font-size: 30px;
+	font-weight: bold;
+	color: #8fb6ff;
+	margin-bottom: 14px;
+}
+
+#panel p {
+	margin-bottom: 10px;
+	line-height: 24px;
+}
+
+.swatch {
+	display: inline-block;
+	width: 40px;
+	height: 18px;
+	margin-right: 6px;
+	vertical-align: middle;
+	border-radius: 4px;
+}
+
+.swatch.a { background-color: #ff5d5d; }
+.swatch.b { background-color: #5dff8f; }
+.swatch.c { background-color: #5d9bff; }
+
+.tag {
+	color: #1a1030;
+	background-color: #ffce54;
+	padding: 2px 8px;
+	border-radius: 12px;
+	font-weight: bold;
+}

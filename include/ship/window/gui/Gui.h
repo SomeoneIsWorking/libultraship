@@ -212,6 +212,15 @@ class Gui {
      */
     virtual void ImGuiRenderDrawData(ImDrawData* data);
 
+    /**
+     * @brief Renders the RmlUi menu pass for the active backend.
+     *
+     * Called from EndFrame() between ImGui::Render() and ImGuiRenderDrawData(), so the RmlUi
+     * menu draws under the ImGui dev-tool windows. The base implementation is a no-op;
+     * Fast3dGui overrides it for the OpenGL backend.
+     */
+    virtual void RenderRmlMenu();
+
     /** @brief Flushes CVars to disk if SaveConsoleVariablesNextFrame() was called. */
     void CheckSaveCvars();
 
