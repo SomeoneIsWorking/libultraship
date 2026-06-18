@@ -116,6 +116,13 @@ void SoH3D_GL_SetLightDir(const float dirWorld[3]);
 // stores the matrices; call once per game frame after computing the animated pose.
 void SoH3D_GL_SetBones(int modelId, const float* mats16, int n);
 
+// Upload the model's constant bind (rest-pose bone-world) matrices, row-major float[16] each,
+// indexed by bone id. Cached + inverted once; used to recover the animated bone-world transform
+// for correct rigid pose interpolation between logic frames (see interpSkinPose). Call once per
+// model (cheap no-op once cached). Without it, subframe pose interpolation falls back to the
+// current frame (no smoothing) instead of blending skin matrices (which shatters large rotations).
+void SoH3D_GL_SetBoneBind(int modelId, const float* mats16, int n);
+
 // Set the per-frame mesh_id visibility mask for a model (bit i = mesh_id i visible). Groups whose
 // CMB mesh_id is clear in the mask are skipped at draw; mesh_id < 0 or >= 64 are always drawn.
 // The player path calls this each frame (before its EmitPose) to select Link's live equipment /

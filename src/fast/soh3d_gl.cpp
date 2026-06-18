@@ -57,6 +57,10 @@ struct GlModel {
     std::vector<GLuint> textures;
     std::vector<float> bones;  // flat row-major 16*boneCount; empty = bind pose (identity)
     int boneCount = 0;
+    // Constant per-model bind matrices (CMB rest-pose bone worlds) + their inverses, set once via
+    // SoH3D_GL_SetBoneBind. Used to recover the animated bone-world (skin*bind) for correct rigid
+    // pose interpolation between logic frames (see interpSkinPose). Empty -> interp falls back to cur.
+    std::vector<float> bind, binv;
     // Per-frame mesh_id visibility mask the player path sets (SoH3D_GL_SetMidMask) before EMIT;
     // bit i = mesh_id i visible. Snapshotted per emit into ItemPose so it survives the deferred
     // render (like bones). ~0 = all visible (default; non-Link models never set it). See drawOne.
@@ -84,6 +88,155 @@ std::unordered_map<int, std::vector<ItemPose>> g_prevPoses; // last logic frame,
 // replays it N times with interpolated matrices; we lerp each bone pose by this so the skinned
 // limbs interpolate to the render FPS like the N64 matrix stack does, instead of snapping at 20fps.
 extern "C" float gSoH3dInterpStep = 1.0f;
+
+// Row-major 4x4 multiply (M*v column-vector convention, same as the OoT3D asset code): C = A*B.
+static void rowMul16(const float* A, const float* B, float* C) {
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            float s = 0.0f;
+            for (int k = 0; k < 4; k++) s += A[i * 4 + k] * B[k * 4 + j];
+            C[i * 4 + j] = s;
+        }
+}
+
+// Row-major 4x4 inverse (Gauss-Jordan); writes identity if singular. Mirrors mat4.h matInverse.
+static void rowInv16(const float* M, float* out) {
+    double a[4][8];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) { a[i][j] = M[i * 4 + j]; a[i][4 + j] = (i == j) ? 1.0 : 0.0; }
+    for (int col = 0; col < 4; col++) {
+        int piv = col;
+        for (int r = col + 1; r < 4; r++)
+            if (std::fabs(a[r][col]) > std::fabs(a[piv][col])) piv = r;
+        if (std::fabs(a[piv][col]) < 1e-12) {
+            for (int i = 0; i < 16; i++) out[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+            return;
+        }
+        for (int j = 0; j < 8; j++) std::swap(a[col][j], a[piv][j]);
+        double d = a[col][col];
+        for (int j = 0; j < 8; j++) a[col][j] /= d;
+        for (int r = 0; r < 4; r++) {
+            if (r == col) continue;
+            double f = a[r][col];
+            for (int j = 0; j < 8; j++) a[r][j] -= f * a[col][j];
+        }
+    }
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) out[i * 4 + j] = (float)a[i][4 + j];
+}
+
+// Extract rotation quaternion (x,y,z,w) + per-column scale from a row-major 4x4 affine.
+// Returns false if a column length is ~0 or the rotation is reflected (det < 0).
+static bool decompRS(const float* M, float q[4], float s[3]) {
+    float c[3][3];
+    for (int j = 0; j < 3; j++) { c[j][0] = M[0 * 4 + j]; c[j][1] = M[1 * 4 + j]; c[j][2] = M[2 * 4 + j]; }
+    for (int j = 0; j < 3; j++) s[j] = std::sqrt(c[j][0] * c[j][0] + c[j][1] * c[j][1] + c[j][2] * c[j][2]);
+    if (s[0] < 1e-8f || s[1] < 1e-8f || s[2] < 1e-8f) return false;
+    float R[9]; // row-major normalized rotation: R[i*3+j] = c[j][i]/s[j]
+    for (int j = 0; j < 3; j++)
+        for (int i = 0; i < 3; i++) R[i * 3 + j] = c[j][i] / s[j];
+    float det = R[0] * (R[4] * R[8] - R[5] * R[7]) - R[1] * (R[3] * R[8] - R[5] * R[6]) +
+                R[2] * (R[3] * R[7] - R[4] * R[6]);
+    if (det < 0.0f) return false;
+    float tr = R[0] + R[4] + R[8];
+    if (tr > 0.0f) {
+        float S = std::sqrt(tr + 1.0f) * 2.0f;
+        q[3] = 0.25f * S; q[0] = (R[7] - R[5]) / S; q[1] = (R[2] - R[6]) / S; q[2] = (R[3] - R[1]) / S;
+    } else if (R[0] > R[4] && R[0] > R[8]) {
+        float S = std::sqrt(1.0f + R[0] - R[4] - R[8]) * 2.0f;
+        q[3] = (R[7] - R[5]) / S; q[0] = 0.25f * S; q[1] = (R[1] + R[3]) / S; q[2] = (R[2] + R[6]) / S;
+    } else if (R[4] > R[8]) {
+        float S = std::sqrt(1.0f + R[4] - R[0] - R[8]) * 2.0f;
+        q[3] = (R[2] - R[6]) / S; q[0] = (R[1] + R[3]) / S; q[1] = 0.25f * S; q[2] = (R[5] + R[7]) / S;
+    } else {
+        float S = std::sqrt(1.0f + R[8] - R[0] - R[4]) * 2.0f;
+        q[3] = (R[3] - R[1]) / S; q[0] = (R[2] + R[6]) / S; q[1] = (R[5] + R[7]) / S; q[2] = 0.25f * S;
+    }
+    return true;
+}
+
+// Rigid-aware interpolation of one row-major affine A->B at t: decompose into rotation
+// (quaternion) + per-column scale + translation, nlerp the rotation, lerp scale & translation,
+// recompose. Degenerate/reflected inputs -> copy B (current). This is the correct way to blend
+// two transforms; component-wise matrix lerp collapses large rotations into a degenerate matrix.
+static void interpRigid(const float* A, const float* B, float t, float* O) {
+    float qa[4], qb[4], sa[3], sb[3];
+    if (!decompRS(A, qa, sa) || !decompRS(B, qb, sb)) {
+        for (int i = 0; i < 16; i++) O[i] = B[i];
+        return;
+    }
+    float d = qa[0] * qb[0] + qa[1] * qb[1] + qa[2] * qb[2] + qa[3] * qb[3];
+    float sgn = d < 0.0f ? -1.0f : 1.0f; // shorter arc
+    float q[4];
+    for (int i = 0; i < 4; i++) q[i] = (1.0f - t) * qa[i] + t * sgn * qb[i];
+    float ql = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    if (ql < 1e-8f) { for (int i = 0; i < 16; i++) O[i] = B[i]; return; }
+    for (int i = 0; i < 4; i++) q[i] /= ql;
+    float s[3];
+    for (int j = 0; j < 3; j++) s[j] = (1.0f - t) * sa[j] + t * sb[j];
+    float x = q[0], y = q[1], z = q[2], w = q[3];
+    float R[9] = { 1 - 2 * (y * y + z * z), 2 * (x * y - w * z),     2 * (x * z + w * y),
+                   2 * (x * y + w * z),     1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+                   2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y) };
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) O[i * 4 + j] = R[i * 3 + j] * s[j];
+    O[3] = (1.0f - t) * A[3] + t * B[3];
+    O[7] = (1.0f - t) * A[7] + t * B[7];
+    O[11] = (1.0f - t) * A[11] + t * B[11];
+    O[12] = O[13] = O[14] = 0.0f;
+    O[15] = 1.0f;
+}
+
+// Interpolate two skin-pose arrays (flat row-major 4x4 per bone) for the subframe step.
+// A skin matrix = animWorld(bone) * invBind(bone); its TRANSLATION column bakes in invBind,
+// so it is NOT the bone's position and interpolating the skin matrix directly (even
+// rotation-aware) drifts with the per-frame rotation — small jitter normally, but at
+// anim-transition / loop deltas it explodes the mesh into the "zebra-stripe" spikes
+// (BACKLOG #20). Correct fix: recover the ANIMATED BONE-WORLD transform (a clean rigid R|T
+// about the bone) as skin*bind, interpolate THAT, then re-apply invBind. `bind`/`binv` are the
+// model's constant bind / inverse-bind matrices; when absent (no bind uploaded) we cannot
+// recover animWorld, so fall back to the current pose (no interpolation) rather than shatter.
+//
+// One more case: when the animation LOOPS non-seamlessly (or switches), prev and cur are from
+// two unrelated poses — a discontinuity, not continuous motion. Blending across it morphs limbs
+// through a wrong intermediate that linear-blend skinning stretches into spikes. A bone rotating
+// more than ~90deg in a single 20fps logic step cannot be real continuous motion (>1800 deg/s),
+// so it reliably flags the discontinuity; there we snap the whole pose to the current frame.
+static void interpSkinPose(const float* prev, const float* cur, const float* bind, const float* binv,
+                           float step, size_t n, std::vector<float>& out) {
+    out.resize(n);
+    float t = step < 0.0f ? 0.0f : (step > 1.0f ? 1.0f : step);
+    size_t nb = n / 16;
+    if (!bind || !binv) {
+        for (size_t i = 0; i < n; i++) out[i] = cur[i];
+        return;
+    }
+    // Pass 1: recover the per-bone animated-world transforms and detect a discontinuity.
+    static std::vector<float> awP, awC; // scratch (single-threaded render); 16 floats per bone
+    awP.resize(n);
+    awC.resize(n);
+    bool discontinuous = false;
+    for (size_t b = 0; b < nb; b++) {
+        const float* Bd = bind + b * 16;
+        rowMul16(prev + b * 16, Bd, awP.data() + b * 16); // animWorld_prev = skin_prev * bind
+        rowMul16(cur + b * 16, Bd, awC.data() + b * 16);  // animWorld_cur  = skin_cur  * bind
+        float qp[4], qc[4], sp[3], sc[3];
+        if (decompRS(awP.data() + b * 16, qp, sp) && decompRS(awC.data() + b * 16, qc, sc)) {
+            float dot = std::fabs(qp[0] * qc[0] + qp[1] * qc[1] + qp[2] * qc[2] + qp[3] * qc[3]);
+            if (dot < 0.707f) discontinuous = true; // |quat dot| = cos(halfAngle); 0.707 => 90deg rot
+        }
+    }
+    if (discontinuous) {
+        for (size_t i = 0; i < n; i++) out[i] = cur[i];
+        return;
+    }
+    // Pass 2: rigid-interpolate each bone's animated world, then re-apply invBind.
+    for (size_t b = 0; b < nb; b++) {
+        float awI[16];
+        interpRigid(awP.data() + b * 16, awC.data() + b * 16, t, awI);
+        rowMul16(awI, binv + b * 16, out.data() + b * 16); // skin = animWorld_interp * invBind
+    }
+}
 
 GLuint g_program = 0;
 // Our own Vertex Array Object. Fast3D's GL backend renders on its OWN VAO (gfx_opengl.cpp
@@ -348,6 +501,19 @@ extern "C" void SoH3D_GL_SetBones(int modelId, const float* mats16, int n) {
     if (!mats16 || n <= 0) { m.bones.clear(); m.boneCount = 0; return; }
     m.bones.assign(mats16, mats16 + (size_t)n * 16);
     m.boneCount = n;
+}
+
+// Upload the model's constant bind (rest-pose bone-world) matrices, row-major 16*n. Cached and
+// inverted once (skipped if already the right size) — interpSkinPose needs them to recover the
+// animated bone-world transform for correct rigid pose interpolation. Caller: SoH3D_UpdateAnim.
+extern "C" void SoH3D_GL_SetBoneBind(int modelId, const float* mats16, int n) {
+    GlModel& m = g_models[modelId];
+    if (n > SOH3D_GL_MAX_BONES) n = SOH3D_GL_MAX_BONES;
+    if (!mats16 || n <= 0) { m.bind.clear(); m.binv.clear(); return; }
+    if ((int)m.bind.size() == n * 16) return; // already set (bind is constant per model)
+    m.bind.assign(mats16, mats16 + (size_t)n * 16);
+    m.binv.resize((size_t)n * 16);
+    for (int i = 0; i < n; i++) rowInv16(&m.bind[(size_t)i * 16], &m.binv[(size_t)i * 16]);
 }
 
 // Set the per-frame mesh_id visibility mask for a model (bit i = mesh_id i visible). The player
@@ -784,9 +950,8 @@ static void renderShadowMap(GLint gameFbo, const GLint vp[4], const float lightV
         if (!m) continue;
         const float* pose = it.bones.empty() ? nullptr : it.bones.data();
         if (pose && step < 0.999f && !it.prevBones.empty() && it.prevBones.size() == it.bones.size()) {
-            lerped.resize(it.bones.size());
-            float w = 1.0f - step;
-            for (size_t i = 0; i < it.bones.size(); i++) lerped[i] = w * it.prevBones[i] + step * it.bones[i];
+            interpSkinPose(it.prevBones.data(), it.bones.data(), m->bind.empty() ? nullptr : m->bind.data(),
+                           m->binv.empty() ? nullptr : m->binv.data(), step, it.bones.size(), lerped);
             pose = lerped.data();
         }
         float depthMP[16];
@@ -924,9 +1089,8 @@ static void aoPass(GLint gameFbo, const GLint vp[4], float step) {
         if (!m) continue;
         const float* pose = it.bones.empty() ? nullptr : it.bones.data();
         if (pose && step < 0.999f && !it.prevBones.empty() && it.prevBones.size() == it.bones.size()) {
-            lerped.resize(it.bones.size());
-            float wgt = 1.0f - step;
-            for (size_t i = 0; i < it.bones.size(); i++) lerped[i] = wgt * it.prevBones[i] + step * it.bones[i];
+            interpSkinPose(it.prevBones.data(), it.bones.data(), m->bind.empty() ? nullptr : m->bind.data(),
+                           m->binv.empty() ? nullptr : m->binv.data(), step, it.bones.size(), lerped);
             pose = lerped.data();
         }
         // IDENTICAL transforms to the visible draw (it.mp, it.aspectAdj, it.invertY) -> pixel-aligned.
@@ -1047,9 +1211,10 @@ extern "C" void SoH3D_GL_RenderPass(void) {
         for (const DrawItem& it : g_drawList) {
             const float* pose = it.bones.empty() ? nullptr : it.bones.data();
             if (pose && step < 0.999f && !it.prevBones.empty() && it.prevBones.size() == it.bones.size()) {
-                lerped.resize(it.bones.size());
-                float w = 1.0f - step;
-                for (size_t i = 0; i < it.bones.size(); i++) lerped[i] = w * it.prevBones[i] + step * it.bones[i];
+                auto mit = g_models.find(it.modelId);
+                const float* bd = (mit != g_models.end() && !mit->second.bind.empty()) ? mit->second.bind.data() : nullptr;
+                const float* bi = (mit != g_models.end() && !mit->second.binv.empty()) ? mit->second.binv.data() : nullptr;
+                interpSkinPose(it.prevBones.data(), it.bones.data(), bd, bi, step, it.bones.size(), lerped);
                 pose = lerped.data();
             }
             SoH3D_Vk_DrawModel(it.modelId, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.aspectAdj, pose,
@@ -1097,10 +1262,10 @@ extern "C" void SoH3D_GL_RenderPass(void) {
         glUniform1f(g_uShadowOn, 0.0f);
     }
 
-    // Interpolate each item's skin pose toward this subframe's step, matching the per-subframe matrix
-    // interpolation the rest of the scene gets — so skinned limbs animate at the render FPS instead of
-    // snapping at the 20fps logic rate. Component-wise matrix lerp, the same blend frame_interpolation
-    // applies to recorded N64 matrices. step>=1 or no prev pose -> use cur directly (no work).
+    // Interpolate each item's skin pose toward this subframe's step, so skinned limbs animate at the
+    // render FPS instead of snapping at the 20fps logic rate. Uses interpSkinPose (rotation-aware:
+    // quaternion nlerp + scale/translation lerp) rather than a component-wise matrix blend, which
+    // collapses large per-frame bone rotations. step>=1 or no prev pose -> use cur directly (no work).
     std::vector<float> lerped;
     float step = gSoH3dInterpStep;
     for (const DrawItem& it : g_drawList) {
@@ -1108,9 +1273,8 @@ extern "C" void SoH3D_GL_RenderPass(void) {
         if (!m) continue;
         const float* pose = it.bones.empty() ? nullptr : it.bones.data();
         if (pose && step < 0.999f && !it.prevBones.empty() && it.prevBones.size() == it.bones.size()) {
-            lerped.resize(it.bones.size());
-            float w = 1.0f - step;
-            for (size_t i = 0; i < it.bones.size(); i++) lerped[i] = w * it.prevBones[i] + step * it.bones[i];
+            interpSkinPose(it.prevBones.data(), it.bones.data(), m->bind.empty() ? nullptr : m->bind.data(),
+                           m->binv.empty() ? nullptr : m->binv.data(), step, it.bones.size(), lerped);
             pose = lerped.data();
         }
         drawOne(*m, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.aspectAdj, pose, it.boneCount,
