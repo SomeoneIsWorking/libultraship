@@ -141,10 +141,16 @@ void Fast3dWindow::InitWindowManager() {
     SetWindowBackend(GetSavedWindowBackend());
 
 #ifdef ENABLE_VULKAN
-    // Opt into the Vulkan backend at runtime (env override) while it is being
-    // brought up, without disturbing the saved/default backend (still GL).
-    if (const char* v = std::getenv("SOH3D_VULKAN"); v != nullptr && v[0] == '1') {
-        SetWindowBackend(WindowBackend::FAST3D_SDL_VULKAN);
+    // Runtime backend override while Vulkan is being brought up. Authoritative in BOTH directions so
+    // an A/B harness can pin each instance regardless of the persisted backend (a Vulkan run SAVES
+    // "Vulkan" to config, so SOH3D_VULKAN=0 must explicitly force GL back — not just decline to
+    // override, or the sticky saved value keeps it on Vulkan). '1' -> Vulkan, '0' -> OpenGL.
+    if (const char* v = std::getenv("SOH3D_VULKAN"); v != nullptr) {
+        if (v[0] == '1') {
+            SetWindowBackend(WindowBackend::FAST3D_SDL_VULKAN);
+        } else if (v[0] == '0') {
+            SetWindowBackend(WindowBackend::FAST3D_SDL_OPENGL);
+        }
     }
 #endif
 

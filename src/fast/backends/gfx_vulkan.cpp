@@ -541,7 +541,9 @@ const char* kVkShaderTemplate = R"PRISM(@prism(type='fragment', name='Fast3D Vul
 
 namespace Fast {
 
-#define VK_CHECK(expr)                                                                                                 \
+GfxRenderingAPIVulkan* g_activeVulkanApi = nullptr;
+
+#define VK_CHECK(expr)                                                                                               \
     do {                                                                                                               \
         VkResult vk_check_res_ = (expr);                                                                               \
         if (vk_check_res_ != VK_SUCCESS) {                                                                             \
@@ -556,8 +558,15 @@ GfxRenderingAPIVulkan::GfxRenderingAPIVulkan(GfxWindowBackendSDL2* windowBackend
 }
 
 GfxRenderingAPIVulkan::~GfxRenderingAPIVulkan() {
+    if (g_activeVulkanApi == this)
+        g_activeVulkanApi = nullptr;
     if (mDevice != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(mDevice);
+        for (auto& fb : mFramebuffers)
+            DestroyFbResources(fb);
+        mFramebuffers.clear();
+        if (mFbRenderPass != VK_NULL_HANDLE)
+            vkDestroyRenderPass(mDevice, mFbRenderPass, nullptr);
         DestroyRenderingResources();
         DestroyDepthResources();
         DestroyPerImageSync();
@@ -784,6 +793,8 @@ void GfxRenderingAPIVulkan::CreateSwapchain() {
     VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
         usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT; // for the frame-dump readback
+    if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+        usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT; // present blit: main FB color -> swapchain
 
     VkSwapchainCreateInfoKHR ci{};
     ci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
@@ -1050,8 +1061,14 @@ void GfxRenderingAPIVulkan::Init() {
     CreateFramebuffers();
     CreateCommandResources();
     CreateSyncObjects();
+    CreateFbRenderPass();
     CreateRenderingResources();
-    SPDLOG_INFO("Vulkan backend initialized (Milestone 2: per-combiner pipelines)");
+    // Slot 0 is the main framebuffer; the interpreter sizes it via
+    // UpdateFramebufferParameters(0, ...) right after Init and every frame.
+    mFramebuffers.resize(1);
+    mFramebuffers[0].renderTarget = true;
+    g_activeVulkanApi = this; // the SoH3D Vulkan pass records into this backend
+    SPDLOG_INFO("Vulkan backend initialized (Milestone 3: offscreen framebuffers)");
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,19 +1111,11 @@ void GfxRenderingAPIVulkan::StartFrame() {
     // Reset the per-frame vertex/uniform rings and descriptor pool for this frame.
     BeginFrameRings();
 
-    VkClearValue clears[2]{};
-    clears[0].color = { { mClearColor[0], mClearColor[1], mClearColor[2], mClearColor[3] } };
-    clears[1].depthStencil = { 1.0f, 0 };
-
-    VkRenderPassBeginInfo rp{};
-    rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rp.renderPass = mRenderPass;
-    rp.framebuffer = mSwapchainFramebuffers[mImageIndex];
-    rp.renderArea.offset = { 0, 0 };
-    rp.renderArea.extent = mSwapchainExtent;
-    rp.clearValueCount = 2;
-    rp.pClearValues = clears;
-    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    // No render pass is begun here. The interpreter binds a target with
+    // StartDrawToFramebuffer and the pass for it opens lazily on the first draw/clear
+    // (BeginPassIfNeeded), so a frame can target multiple framebuffers in sequence.
+    mCurrentFb = 0;
+    mPassOpen = false;
 
     // Default dynamic state covers the whole frame until the game sets a viewport.
     mCurrentViewport = { 0.0f, 0.0f, (float)mSwapchainExtent.width, (float)mSwapchainExtent.height, 0.0f, 1.0f };
@@ -1121,7 +1130,56 @@ void GfxRenderingAPIVulkan::EndFrame() {
         return;
     }
     VkCommandBuffer cmd = mCommandBuffers[mCurrentFrame];
-    vkCmdEndRenderPass(cmd);
+    EndPassIfOpen();
+
+    // Present: blit the main framebuffer's color image onto the acquired swapchain
+    // image. (Compositing intermediate buffers onto fb 0 is done by the game's own
+    // Fast3D draws / ResolveMSAAColorBuffer; the ImGui overlay is M4. When the game
+    // renders to mGameFb under internal-resolution scaling, the final composite onto
+    // fb 0 relies on the ImGui pass — until M4 that path shows fb 0's cleared content.)
+    VkImage swap = mSwapchainImages[mImageIndex];
+    FramebufferVulkan& main = mFramebuffers[0];
+
+    auto swapBarrier = [&](VkImageLayout oldL, VkImageLayout newL, VkAccessFlags srcA, VkAccessFlags dstA,
+                           VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {
+        VkImageMemoryBarrier b{};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout = oldL;
+        b.newLayout = newL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = swap;
+        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        b.srcAccessMask = srcA;
+        b.dstAccessMask = dstA;
+        vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+
+    if (main.colorImage != VK_NULL_HANDLE) {
+        TransitionImageLayout(cmd, main.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, main.colorLayout,
+                              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        swapBarrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        VkImageBlit blit{};
+        blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        blit.srcOffsets[0] = { 0, 0, 0 };
+        blit.srcOffsets[1] = { (int32_t)main.width, (int32_t)main.height, 1 };
+        blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        blit.dstOffsets[0] = { 0, 0, 0 };
+        blit.dstOffsets[1] = { (int32_t)mSwapchainExtent.width, (int32_t)mSwapchainExtent.height, 1 };
+        vkCmdBlitImage(cmd, main.colorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swap,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+
+        swapBarrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    } else {
+        // No main color image yet (e.g. before the first UpdateFramebufferParameters):
+        // just put the swapchain image into a presentable layout.
+        swapBarrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, 0, VK_ACCESS_MEMORY_READ_BIT,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    }
+
     VK_CHECK(vkEndCommandBuffer(cmd));
 }
 
@@ -1134,7 +1192,9 @@ void GfxRenderingAPIVulkan::FinishRender() {
     VkSubmitInfo submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     VkSemaphore waitSems[] = { mImageAvailableSemaphores[mCurrentFrame] };
-    VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+    // The acquired swapchain image is only touched by the present blit in EndFrame, so
+    // the acquire semaphore is waited at the transfer stage that performs that blit.
+    VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_TRANSFER_BIT };
     submit.waitSemaphoreCount = 1;
     submit.pWaitSemaphores = waitSems;
     submit.pWaitDstStageMask = waitStages;
@@ -1579,6 +1639,8 @@ void GfxRenderingAPIVulkan::DestroyRenderingResources() {
         vkDestroySampler(mDevice, kv.second, nullptr);
     mSamplerCache.clear();
     for (auto& t : mTextures) {
+        if (t.isFbAlias)
+            continue; // image/view owned by a FramebufferVulkan, freed in DestroyFbResources
         if (t.view)
             vkDestroyImageView(mDevice, t.view, nullptr);
         if (t.image)
@@ -1962,7 +2024,9 @@ VkPipeline GfxRenderingAPIVulkan::GetOrCreatePipeline(ShaderProgramVulkan* prg, 
     pci.pColorBlendState = &cb;
     pci.pDynamicState = &dyn;
     pci.layout = mPipelineLayout;
-    pci.renderPass = mRenderPass;
+    // All drawable framebuffers (the main FB + the interpreter's effect FBs) share
+    // mFbRenderPass, so a single pipeline variant is compatible with every draw target.
+    pci.renderPass = mFbRenderPass;
     pci.subpass = 0;
 
     VkPipeline pipeline;
@@ -2034,6 +2098,8 @@ void GfxRenderingAPIVulkan::DeleteTexture(uint32_t texId) {
     if (texId >= mTextures.size())
         return;
     TextureVulkan& t = mTextures[texId];
+    if (t.isFbAlias)
+        return; // not owned here; freed via DestroyFbResources
     if (t.image == VK_NULL_HANDLE)
         return;
     vkDeviceWaitIdle(mDevice);
@@ -2080,6 +2146,10 @@ void GfxRenderingAPIVulkan::SetUseAlpha(bool useAlpha) {
 void GfxRenderingAPIVulkan::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t bufVboNumTris) {
     if (!mFrameAcquired || mCurrentShaderProgram == nullptr || mCurrentShaderProgram->vert == VK_NULL_HANDLE)
         return;
+
+    BeginPassIfNeeded();
+    if (!mPassOpen)
+        return; // current FB has no render target (shouldn't happen for drawable FBs)
 
     ShaderProgramVulkan* prg = mCurrentShaderProgram;
     FrameRing& fr = mFrameRings[mCurrentFrame];
@@ -2175,38 +2245,691 @@ void GfxRenderingAPIVulkan::DrawTriangles(float bufVbo[], size_t bufVboLen, size
 }
 
 // ---------------------------------------------------------------------------
-// Framebuffers (M2: every draw targets the swapchain pass; offscreen FBs in M3)
+// Framebuffers (M3): real per-id offscreen VkImage color+depth render targets.
+//
+// Every drawable framebuffer shares mFbRenderPass (BGRA color + D32 depth, LOAD/STORE).
+// fb 0 is the "main" buffer the whole frame renders into; FinishRender blits its color
+// onto the swapchain to present. The interpreter binds a target with
+// StartDrawToFramebuffer (which only ends the current pass — the new pass opens lazily
+// on the next draw/clear), samples a buffer back with SelectTextureFb, and blits between
+// buffers with CopyFramebuffer / ResolveMSAAColorBuffer. Mirrors gfx_opengl.cpp's
+// FramebufferOGL path; the Vulkan-specific work is render-pass switching and explicit
+// image-layout transitions (vs GL's implicit FBO binding).
 // ---------------------------------------------------------------------------
 
+void GfxRenderingAPIVulkan::CreateFbRenderPass() {
+    VkAttachmentDescription color{};
+    color.format = mSwapchainFormat;
+    color.samples = VK_SAMPLE_COUNT_1_BIT;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; // preserve; clears are explicit (ClearFramebuffer)
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    color.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference colorRef{};
+    colorRef.attachment = 0;
+    colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentDescription depth{};
+    depth.format = mDepthFormat;
+    depth.samples = VK_SAMPLE_COUNT_1_BIT;
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE; // kept so GetPixelDepth can read it back
+    depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depth.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference depthRef{};
+    depthRef.attachment = 1;
+    depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorRef;
+    subpass.pDepthStencilAttachment = &depthRef;
+
+    // External dependencies pair the pass with the layout transitions / sampling /
+    // blits we record around it (the image is already in the attachment layout via an
+    // explicit barrier before begin, so the pass itself performs no layout change).
+    VkSubpassDependency deps[2]{};
+    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass = 0;
+    deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    deps[0].dstStageMask =
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    deps[1].srcSubpass = 0;
+    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask =
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+
+    VkAttachmentDescription attachments[] = { color, depth };
+    VkRenderPassCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    ci.attachmentCount = 2;
+    ci.pAttachments = attachments;
+    ci.subpassCount = 1;
+    ci.pSubpasses = &subpass;
+    ci.dependencyCount = 2;
+    ci.pDependencies = deps;
+
+    VK_CHECK(vkCreateRenderPass(mDevice, &ci, nullptr, &mFbRenderPass));
+}
+
+void GfxRenderingAPIVulkan::CreateFbResources(FramebufferVulkan& fb, uint32_t width, uint32_t height, bool hasDepth) {
+    width = std::max(width, 1u);
+    height = std::max(height, 1u);
+    fb.width = width;
+    fb.height = height;
+    fb.hasDepth = hasDepth;
+
+    // Color image. Swapchain format so the present/copy blits never swizzle; usage
+    // covers attachment, sampling (SelectTextureFb), and both blit directions.
+    {
+        VkImageCreateInfo ii{};
+        ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ii.imageType = VK_IMAGE_TYPE_2D;
+        ii.format = mSwapchainFormat;
+        ii.extent = { width, height, 1 };
+        ii.mipLevels = 1;
+        ii.arrayLayers = 1;
+        ii.samples = VK_SAMPLE_COUNT_1_BIT;
+        ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VK_CHECK(vkCreateImage(mDevice, &ii, nullptr, &fb.colorImage));
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(mDevice, fb.colorImage, &req);
+        VkMemoryAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VK_CHECK(vkAllocateMemory(mDevice, &ai, nullptr, &fb.colorMem));
+        VK_CHECK(vkBindImageMemory(mDevice, fb.colorImage, fb.colorMem, 0));
+        VkImageViewCreateInfo vi{};
+        vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vi.image = fb.colorImage;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = mSwapchainFormat;
+        vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        VK_CHECK(vkCreateImageView(mDevice, &vi, nullptr, &fb.colorView));
+        fb.colorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+
+    if (hasDepth) {
+        VkImageCreateInfo ii{};
+        ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ii.imageType = VK_IMAGE_TYPE_2D;
+        ii.format = mDepthFormat;
+        ii.extent = { width, height, 1 };
+        ii.mipLevels = 1;
+        ii.arrayLayers = 1;
+        ii.samples = VK_SAMPLE_COUNT_1_BIT;
+        ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VK_CHECK(vkCreateImage(mDevice, &ii, nullptr, &fb.depthImage));
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(mDevice, fb.depthImage, &req);
+        VkMemoryAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VK_CHECK(vkAllocateMemory(mDevice, &ai, nullptr, &fb.depthMem));
+        VK_CHECK(vkBindImageMemory(mDevice, fb.depthImage, fb.depthMem, 0));
+        VkImageViewCreateInfo vi{};
+        vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vi.image = fb.depthImage;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = mDepthFormat;
+        vi.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+        VK_CHECK(vkCreateImageView(mDevice, &vi, nullptr, &fb.depthView));
+        fb.depthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+
+    // The VkFramebuffer binds color+depth to mFbRenderPass. Only built for drawable
+    // targets; mFbRenderPass requires a depth attachment, so a render target without a
+    // depth buffer (e.g. fb 0 during internal-resolution scaling, composited by ImGui in
+    // M4) gets no VkFramebuffer and is not directly drawn into here.
+    if (fb.renderTarget && hasDepth) {
+        VkImageView att[2] = { fb.colorView, fb.depthView };
+        VkFramebufferCreateInfo fi{};
+        fi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fi.renderPass = mFbRenderPass;
+        fi.attachmentCount = 2;
+        fi.pAttachments = att;
+        fi.width = width;
+        fi.height = height;
+        fi.layers = 1;
+        VK_CHECK(vkCreateFramebuffer(mDevice, &fi, nullptr, &fb.fb));
+    }
+
+    // Alias this FB's color image into the texture table so combiner draws can sample it
+    // (SelectTextureFb) and ImGui can reference it (GetFramebufferTextureId). The entry
+    // does not own the image — DeleteTexture / teardown skip it (isFbAlias).
+    if (fb.colorTexId == 0) {
+        uint32_t id = mNextTextureId++;
+        if (id >= mTextures.size())
+            mTextures.resize(id + 1);
+        fb.colorTexId = id;
+    }
+    TextureVulkan& t = mTextures[fb.colorTexId];
+    t = TextureVulkan{};
+    t.isFbAlias = true;
+    t.view = fb.colorView;
+    t.width = width;
+    t.height = height;
+    t.uploaded = true;
+    t.linearFilter = true;
+    t.filtering = FILTER_LINEAR; // never the in-shader three-point path
+    t.cms = G_TX_NOMIRROR | G_TX_CLAMP;
+    t.cmt = G_TX_NOMIRROR | G_TX_CLAMP;
+}
+
+void GfxRenderingAPIVulkan::DestroyFbResources(FramebufferVulkan& fb) {
+    if (fb.fb != VK_NULL_HANDLE) {
+        vkDestroyFramebuffer(mDevice, fb.fb, nullptr);
+        fb.fb = VK_NULL_HANDLE;
+    }
+    if (fb.colorView != VK_NULL_HANDLE) {
+        vkDestroyImageView(mDevice, fb.colorView, nullptr);
+        fb.colorView = VK_NULL_HANDLE;
+    }
+    if (fb.colorImage != VK_NULL_HANDLE) {
+        vkDestroyImage(mDevice, fb.colorImage, nullptr);
+        fb.colorImage = VK_NULL_HANDLE;
+    }
+    if (fb.colorMem != VK_NULL_HANDLE) {
+        vkFreeMemory(mDevice, fb.colorMem, nullptr);
+        fb.colorMem = VK_NULL_HANDLE;
+    }
+    if (fb.depthView != VK_NULL_HANDLE) {
+        vkDestroyImageView(mDevice, fb.depthView, nullptr);
+        fb.depthView = VK_NULL_HANDLE;
+    }
+    if (fb.depthImage != VK_NULL_HANDLE) {
+        vkDestroyImage(mDevice, fb.depthImage, nullptr);
+        fb.depthImage = VK_NULL_HANDLE;
+    }
+    if (fb.depthMem != VK_NULL_HANDLE) {
+        vkFreeMemory(mDevice, fb.depthMem, nullptr);
+        fb.depthMem = VK_NULL_HANDLE;
+    }
+    // Invalidate the texture alias's dangling view (the id is kept stable across resize).
+    if (fb.colorTexId != 0 && fb.colorTexId < mTextures.size()) {
+        mTextures[fb.colorTexId].view = VK_NULL_HANDLE;
+        mTextures[fb.colorTexId].uploaded = false;
+    }
+    fb.colorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    fb.depthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+}
+
+namespace {
+// Access + pipeline-stage masks for an image layout, used to derive transition barriers.
+std::pair<VkAccessFlags, VkPipelineStageFlags> vk_layout_masks(VkImageLayout l) {
+    switch (l) {
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+            return { VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+            return { VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                     VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT };
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+            return { VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT };
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+            return { VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT };
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            return { VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT };
+        case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+            return { VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT };
+        case VK_IMAGE_LAYOUT_UNDEFINED:
+        default:
+            return { 0, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT };
+    }
+}
+} // namespace
+
+void GfxRenderingAPIVulkan::TransitionImageLayout(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect,
+                                                  VkImageLayout& tracked, VkImageLayout newLayout) {
+    if (tracked == newLayout)
+        return;
+    auto src = vk_layout_masks(tracked);
+    auto dst = vk_layout_masks(newLayout);
+    VkImageMemoryBarrier b{};
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.oldLayout = tracked;
+    b.newLayout = newLayout;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = { aspect, 0, 1, 0, 1 };
+    b.srcAccessMask = src.first;
+    b.dstAccessMask = dst.first;
+    vkCmdPipelineBarrier(cmd, src.second, dst.second, 0, 0, nullptr, 0, nullptr, 1, &b);
+    tracked = newLayout;
+}
+
+void GfxRenderingAPIVulkan::BeginPassIfNeeded() {
+    if (mPassOpen)
+        return;
+    if (mCurrentFb < 0 || mCurrentFb >= (int)mFramebuffers.size())
+        return;
+    FramebufferVulkan& fb = mFramebuffers[mCurrentFb];
+    if (fb.fb == VK_NULL_HANDLE)
+        return; // not a drawable render target (no VkFramebuffer)
+
+    VkCommandBuffer cmd = mCommandBuffers[mCurrentFrame];
+    TransitionImageLayout(cmd, fb.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, fb.colorLayout,
+                          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    if (fb.depthImage != VK_NULL_HANDLE)
+        TransitionImageLayout(cmd, fb.depthImage, VK_IMAGE_ASPECT_DEPTH_BIT, fb.depthLayout,
+                              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+    VkRenderPassBeginInfo rp{};
+    rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rp.renderPass = mFbRenderPass;
+    rp.framebuffer = fb.fb;
+    rp.renderArea.offset = { 0, 0 };
+    rp.renderArea.extent = { fb.width, fb.height };
+    rp.clearValueCount = 0; // LOAD_OP_LOAD; clears come from ClearFramebuffer
+    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    mPassOpen = true;
+}
+
+void GfxRenderingAPIVulkan::EndPassIfOpen() {
+    if (!mPassOpen)
+        return;
+    vkCmdEndRenderPass(mCommandBuffers[mCurrentFrame]);
+    mPassOpen = false;
+    // The images are now in mFbRenderPass's finalLayout (= the *_ATTACHMENT_OPTIMAL the
+    // tracked layouts already hold), so no tracked-layout update is needed.
+}
+
+bool GfxRenderingAPIVulkan::BeginSoH3DPass(SoH3DVkContext& out) {
+    if (!mFrameAcquired)
+        return false;
+    BeginPassIfNeeded(); // open the current FB's render pass so the SoH3D draws share its depth
+    if (!mPassOpen)
+        return false;
+    out.device = mDevice;
+    out.physicalDevice = mPhysicalDevice;
+    out.graphicsQueue = mGraphicsQueue;
+    out.commandPool = mCommandPool;
+    out.cmd = mCommandBuffers[mCurrentFrame];
+    out.renderPass = mFbRenderPass;
+    out.viewport = mCurrentViewport;
+    out.scissor = mCurrentScissor;
+    out.frameIndex = mCurrentFrame;
+    out.framesInFlight = kMaxFramesInFlight;
+    return true;
+}
+
+void GfxRenderingAPIVulkan::FlushCommandsAndWait() {
+    if (!mFrameAcquired)
+        return;
+    EndPassIfOpen();
+    VkCommandBuffer cmd = mCommandBuffers[mCurrentFrame];
+    VK_CHECK(vkEndCommandBuffer(cmd));
+
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    VkFence fence;
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VK_CHECK(vkCreateFence(mDevice, &fci, nullptr, &fence));
+    // No semaphores: this split submit touches only offscreen FBs, not the swapchain
+    // image, and the GPU executes queue submissions in order, so the later FinishRender
+    // submit (which does wait on the acquire semaphore) stays correctly ordered after it.
+    VK_CHECK(vkQueueSubmit(mGraphicsQueue, 1, &submit, fence));
+    vkWaitForFences(mDevice, 1, &fence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(mDevice, fence, nullptr);
+
+    // Resume recording into the same command buffer. The per-frame rings and descriptor
+    // pool are intentionally NOT reset — the frame keeps accumulating.
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+    mPassOpen = false;
+}
+
 int GfxRenderingAPIVulkan::CreateFramebuffer() {
-    return mFramebufferCount++;
+    int id = (int)mFramebuffers.size();
+    mFramebuffers.emplace_back();
+    return id;
 }
-void GfxRenderingAPIVulkan::UpdateFramebufferParameters(int, uint32_t, uint32_t, uint32_t, bool, bool, bool, bool) {
+
+void GfxRenderingAPIVulkan::UpdateFramebufferParameters(int fbId, uint32_t width, uint32_t height, uint32_t msaaLevel,
+                                                        bool openglInvertY, bool renderTarget, bool hasDepthBuffer,
+                                                        bool canExtractDepth) {
+    (void)msaaLevel;       // single-sample only for now (see FramebufferVulkan note)
+    (void)canExtractDepth; // depth is always stored, so always extractable
+    if (fbId < 0)
+        return;
+    if (fbId >= (int)mFramebuffers.size())
+        mFramebuffers.resize(fbId + 1);
+    FramebufferVulkan& fb = mFramebuffers[fbId];
+    width = std::max(width, 1u);
+    height = std::max(height, 1u);
+
+    fb.invertY = openglInvertY;
+    fb.renderTarget = renderTarget || fbId == 0; // fb 0 is always the main render target
+
+    const bool changed =
+        fb.colorImage == VK_NULL_HANDLE || fb.width != width || fb.height != height || fb.hasDepth != hasDepthBuffer;
+    if (changed) {
+        // Images may still be referenced by an in-flight frame.
+        vkDeviceWaitIdle(mDevice);
+        uint32_t keepTexId = fb.colorTexId; // stable alias id across resize
+        DestroyFbResources(fb);
+        fb.colorTexId = keepTexId;
+        CreateFbResources(fb, width, height, hasDepthBuffer);
+    }
 }
-void GfxRenderingAPIVulkan::StartDrawToFramebuffer(int, float noiseScale) {
+
+void GfxRenderingAPIVulkan::StartDrawToFramebuffer(int fbId, float noiseScale) {
     if (noiseScale != 0.0f)
         mCurrentNoiseScale = 1.0f / noiseScale;
+    if (fbId == mCurrentFb)
+        return;
+    // Switching targets: end the current pass; the new one opens lazily on the next draw.
+    EndPassIfOpen();
+    mCurrentFb = fbId;
 }
-void GfxRenderingAPIVulkan::CopyFramebuffer(int, int, int, int, int, int, int, int, int, int) {
+
+void GfxRenderingAPIVulkan::ClearFramebuffer(bool color, bool depth) {
+    BeginPassIfNeeded();
+    if (!mPassOpen)
+        return;
+    FramebufferVulkan& fb = mFramebuffers[mCurrentFb];
+    VkClearAttachment att[2]{};
+    uint32_t n = 0;
+    if (color) {
+        att[n].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        att[n].colorAttachment = 0;
+        att[n].clearValue.color = { { 0.0f, 0.0f, 0.0f, 1.0f } };
+        n++;
+    }
+    if (depth && fb.hasDepth) {
+        att[n].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        att[n].clearValue.depthStencil = { 1.0f, 0 };
+        n++;
+    }
+    if (n == 0)
+        return;
+    VkClearRect rect{};
+    rect.rect.offset = { 0, 0 };
+    rect.rect.extent = { fb.width, fb.height };
+    rect.baseArrayLayer = 0;
+    rect.layerCount = 1;
+    vkCmdClearAttachments(mCommandBuffers[mCurrentFrame], n, att, 1, &rect);
 }
-void GfxRenderingAPIVulkan::ClearFramebuffer(bool, bool) {
+
+void GfxRenderingAPIVulkan::CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1,
+                                            int dstX0, int dstY0, int dstX1, int dstY1) {
+    if (fbDstId < 0 || fbSrcId < 0 || fbDstId >= (int)mFramebuffers.size() || fbSrcId >= (int)mFramebuffers.size())
+        return;
+    FramebufferVulkan& src = mFramebuffers[fbSrcId];
+    FramebufferVulkan& dst = mFramebuffers[fbDstId];
+    if (src.colorImage == VK_NULL_HANDLE || dst.colorImage == VK_NULL_HANDLE)
+        return;
+
+    // Y handling mirrors gfx_opengl.cpp::CopyFramebuffer (GL's bottom-left origin).
+    if (!src.invertY) {
+        int temp = srcY1 - srcY0;
+        srcY1 = (int)src.height - srcY0;
+        srcY0 = srcY1 - temp;
+    }
+    if (src.invertY != dst.invertY) {
+        std::swap(srcY0, srcY1); // reversed offsets => vkCmdBlitImage flips vertically
+    }
+
+    EndPassIfOpen();
+    VkCommandBuffer cmd = mCommandBuffers[mCurrentFrame];
+    TransitionImageLayout(cmd, src.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, src.colorLayout,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    TransitionImageLayout(cmd, dst.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, dst.colorLayout,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageBlit blit{};
+    blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    blit.srcOffsets[0] = { srcX0, srcY0, 0 };
+    blit.srcOffsets[1] = { srcX1, srcY1, 1 };
+    blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    blit.dstOffsets[0] = { dstX0, dstY0, 0 };
+    blit.dstOffsets[1] = { dstX1, dstY1, 1 };
+    vkCmdBlitImage(cmd, src.colorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.colorImage,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
 }
-void GfxRenderingAPIVulkan::ReadFramebufferToCPU(int, uint32_t, uint32_t, uint16_t*) {
+
+void GfxRenderingAPIVulkan::ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) {
+    if (fbIdTarger < 0 || fbIdSrc < 0 || fbIdTarger >= (int)mFramebuffers.size() ||
+        fbIdSrc >= (int)mFramebuffers.size())
+        return;
+    FramebufferVulkan& dst = mFramebuffers[fbIdTarger];
+    FramebufferVulkan& src = mFramebuffers[fbIdSrc];
+    if (src.colorImage == VK_NULL_HANDLE || dst.colorImage == VK_NULL_HANDLE)
+        return;
+    // Single-sample FBs (no true MSAA yet): a plain full-image color blit. Equivalent to
+    // the GL backend's resolve-then-present when MSAA is off.
+    EndPassIfOpen();
+    VkCommandBuffer cmd = mCommandBuffers[mCurrentFrame];
+    TransitionImageLayout(cmd, src.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, src.colorLayout,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    TransitionImageLayout(cmd, dst.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, dst.colorLayout,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageBlit blit{};
+    blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    blit.srcOffsets[0] = { 0, 0, 0 };
+    blit.srcOffsets[1] = { (int32_t)src.width, (int32_t)src.height, 1 };
+    blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    blit.dstOffsets[0] = { 0, 0, 0 };
+    blit.dstOffsets[1] = { (int32_t)dst.width, (int32_t)dst.height, 1 };
+    vkCmdBlitImage(cmd, src.colorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.colorImage,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
 }
-void GfxRenderingAPIVulkan::ResolveMSAAColorBuffer(int, int) {
-}
+
 std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
-GfxRenderingAPIVulkan::GetPixelDepth(int, const std::set<std::pair<float, float>>& coordinates) {
+GfxRenderingAPIVulkan::GetPixelDepth(int fbId, const std::set<std::pair<float, float>>& coordinates) {
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> res;
-    for (const auto& c : coordinates)
-        res.emplace(c, 0);
+    if (fbId < 0 || fbId >= (int)mFramebuffers.size() || coordinates.empty()) {
+        for (const auto& c : coordinates)
+            res.emplace(c, 0);
+        return res;
+    }
+    FramebufferVulkan& fb = mFramebuffers[fbId];
+    if (!fb.hasDepth || fb.depthImage == VK_NULL_HANDLE) {
+        for (const auto& c : coordinates)
+            res.emplace(c, 0);
+        return res;
+    }
+
+    // Make all prior depth writes for this frame visible on the GPU, then copy the
+    // requested depth texels (D32_SFLOAT) back to the host via a one-shot transfer.
+    FlushCommandsAndWait();
+
+    const VkDeviceSize size = (VkDeviceSize)coordinates.size() * sizeof(float);
+    VkBuffer buffer;
+    VkDeviceMemory mem;
+    void* mapped = nullptr;
+    CreateBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, buffer, mem, &mapped);
+
+    std::vector<VkBufferImageCopy> regions;
+    regions.reserve(coordinates.size());
+    {
+        VkDeviceSize off = 0;
+        for (const auto& c : coordinates) {
+            int x = (int)c.first;
+            int y = (int)c.second;
+            if (fb.invertY)
+                y = (int)fb.height - y;
+            x = std::clamp(x, 0, (int)fb.width - 1);
+            y = std::clamp(y, 0, (int)fb.height - 1);
+            VkBufferImageCopy r{};
+            r.bufferOffset = off;
+            r.imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+            r.imageOffset = { x, y, 0 };
+            r.imageExtent = { 1, 1, 1 };
+            regions.push_back(r);
+            off += sizeof(float);
+        }
+    }
+
+    VkCommandBufferAllocateInfo cai{};
+    cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cai.commandPool = mCommandPool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkCommandBuffer cmd;
+    VK_CHECK(vkAllocateCommandBuffers(mDevice, &cai, &cmd));
+    VkCommandBufferBeginInfo cbi{};
+    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(cmd, &cbi));
+    TransitionImageLayout(cmd, fb.depthImage, VK_IMAGE_ASPECT_DEPTH_BIT, fb.depthLayout,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    vkCmdCopyImageToBuffer(cmd, fb.depthImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, (uint32_t)regions.size(),
+                           regions.data());
+    TransitionImageLayout(cmd, fb.depthImage, VK_IMAGE_ASPECT_DEPTH_BIT, fb.depthLayout,
+                          VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    VK_CHECK(vkEndCommandBuffer(cmd));
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    VkFence fence;
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VK_CHECK(vkCreateFence(mDevice, &fci, nullptr, &fence));
+    VK_CHECK(vkQueueSubmit(mGraphicsQueue, 1, &submit, fence));
+    vkWaitForFences(mDevice, 1, &fence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(mDevice, fence, nullptr);
+    vkFreeCommandBuffers(mDevice, mCommandPool, 1, &cmd);
+
+    const float* depths = static_cast<const float*>(mapped);
+    {
+        size_t i = 0;
+        for (const auto& c : coordinates) {
+            // Match the GL backend's 24-bit depth -> N64 16-bit mapping:
+            // GL returns ((d24 << 8) >> 18) << 2 == (d24 >> 10) << 2.
+            uint32_t d24 = (uint32_t)(std::clamp(depths[i], 0.0f, 1.0f) * 16777215.0f);
+            res.emplace(c, (uint16_t)((d24 >> 10) << 2));
+            i++;
+        }
+    }
+    vkUnmapMemory(mDevice, mem);
+    vkDestroyBuffer(mDevice, buffer, nullptr);
+    vkFreeMemory(mDevice, mem, nullptr);
     return res;
 }
-void* GfxRenderingAPIVulkan::GetFramebufferTextureId(int) {
-    return nullptr;
+
+void* GfxRenderingAPIVulkan::GetFramebufferTextureId(int fbId) {
+    if (fbId < 0 || fbId >= (int)mFramebuffers.size())
+        return nullptr;
+    return (void*)(uintptr_t)mFramebuffers[fbId].colorTexId;
 }
-void GfxRenderingAPIVulkan::SelectTextureFb(int) {
+
+void GfxRenderingAPIVulkan::SelectTextureFb(int fbId) {
+    if (fbId < 0 || fbId >= (int)mFramebuffers.size())
+        return;
+    FramebufferVulkan& fb = mFramebuffers[fbId];
+    if (fb.colorImage == VK_NULL_HANDLE)
+        return;
+    // Make the FB's color image shader-readable (outside any render pass), then bind its
+    // texture alias on tile 0 so the next combiner draw samples it.
+    EndPassIfOpen();
+    TransitionImageLayout(mCommandBuffers[mCurrentFrame], fb.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, fb.colorLayout,
+                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (fb.colorTexId != 0 && fb.colorTexId < mTextures.size()) {
+        mTextures[fb.colorTexId].view = fb.colorView;
+        mTextures[fb.colorTexId].uploaded = (fb.colorView != VK_NULL_HANDLE);
+    }
+    SelectTexture(0, fb.colorTexId);
 }
+
+void GfxRenderingAPIVulkan::ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) {
+    if (fbId < 0 || fbId >= (int)mFramebuffers.size())
+        return;
+    FramebufferVulkan& fb = mFramebuffers[fbId];
+    if (fb.colorImage == VK_NULL_HANDLE)
+        return;
+    width = std::min(width, fb.width);
+    height = std::min(height, fb.height);
+
+    FlushCommandsAndWait();
+
+    const VkDeviceSize size = (VkDeviceSize)fb.width * fb.height * 4;
+    VkBuffer buffer;
+    VkDeviceMemory mem;
+    void* mapped = nullptr;
+    CreateBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, buffer, mem, &mapped);
+
+    VkCommandBufferAllocateInfo cai{};
+    cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cai.commandPool = mCommandPool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkCommandBuffer cmd;
+    VK_CHECK(vkAllocateCommandBuffers(mDevice, &cai, &cmd));
+    VkCommandBufferBeginInfo cbi{};
+    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(cmd, &cbi));
+    TransitionImageLayout(cmd, fb.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, fb.colorLayout,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy region{};
+    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageExtent = { fb.width, fb.height, 1 };
+    vkCmdCopyImageToBuffer(cmd, fb.colorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
+    TransitionImageLayout(cmd, fb.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, fb.colorLayout,
+                          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VK_CHECK(vkEndCommandBuffer(cmd));
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    VkFence fence;
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VK_CHECK(vkCreateFence(mDevice, &fci, nullptr, &fence));
+    VK_CHECK(vkQueueSubmit(mGraphicsQueue, 1, &submit, fence));
+    vkWaitForFences(mDevice, 1, &fence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(mDevice, fence, nullptr);
+    vkFreeCommandBuffers(mDevice, mCommandPool, 1, &cmd);
+
+    // Pack BGRA8 (host byte order of the swapchain-format FB image) into RGBA 5551,
+    // matching gfx_opengl.cpp::ReadFramebufferToCPU's r/g/b/a layout.
+    const uint8_t* px = static_cast<const uint8_t*>(mapped);
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+            const uint8_t* p = &px[((size_t)y * fb.width + x) * 4];
+            uint8_t r = (p[2] >> 3) & 0x1F;
+            uint8_t g = (p[1] >> 3) & 0x1F;
+            uint8_t b = (p[0] >> 3) & 0x1F;
+            uint8_t a = p[3] ? 1 : 0;
+            rgba16Buf[(size_t)y * width + x] = (r << 11) | (g << 6) | (b << 1) | a;
+        }
+    }
+    vkUnmapMemory(mDevice, mem);
+    vkDestroyBuffer(mDevice, buffer, nullptr);
+    vkFreeMemory(mDevice, mem, nullptr);
+}
+
 void GfxRenderingAPIVulkan::SetTextureFilter(FilteringMode mode) {
     mCurrentFilterMode = mode;
 }

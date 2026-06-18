@@ -76,12 +76,67 @@ struct TextureVulkan {
     bool linearFilter = false;
     uint32_t cms = 0, cmt = 0;
     bool uploaded = false;
+    // When true this entry does NOT own its image/memory/view — it aliases a
+    // framebuffer's color image so the combiner draw path can sample an FB as a
+    // texture (SelectTextureFb). Skipped by DeleteTexture / teardown.
+    bool isFbAlias = false;
+};
+
+// An offscreen render target: a color image (+ optional depth) plus the VkFramebuffer
+// that binds them to mFbRenderPass. Mirrors the GL backend's FramebufferOGL. fb id 0
+// is the "main" framebuffer the whole frame renders into; FinishRender blits its color
+// image onto the acquired swapchain image to present (the swapchain itself is never a
+// render target here). Higher ids are the interpreter's intermediate effect buffers
+// (pause-menu blur, transitions, motion blur, ...). Color uses the swapchain format so
+// the present/copy blits never have to swizzle channels; sampling still yields logical
+// RGBA, so it is transparent to shaders. Single-sample only for now — true MSAA (an
+// extra multisampled attachment + resolve) is a later sub-feature; the renderer runs at
+// MSAA off, where ResolveMSAAColorBuffer degrades to a plain color blit.
+struct FramebufferVulkan {
+    uint32_t width = 0, height = 0;
+    bool hasDepth = false;
+    bool invertY = false; // OpenGL-style bottom-left origin flag (for Copy/Read Y-flip)
+    bool renderTarget = false;
+
+    VkImage colorImage = VK_NULL_HANDLE;
+    VkDeviceMemory colorMem = VK_NULL_HANDLE;
+    VkImageView colorView = VK_NULL_HANDLE;
+    VkImageLayout colorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VkImage depthImage = VK_NULL_HANDLE;
+    VkDeviceMemory depthMem = VK_NULL_HANDLE;
+    VkImageView depthView = VK_NULL_HANDLE;
+    VkImageLayout depthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VkFramebuffer fb = VK_NULL_HANDLE; // bound to mFbRenderPass; only when renderTarget
+    uint32_t colorTexId = 0;           // mTextures alias index, for SelectTextureFb / GetFramebufferTextureId
+};
+
+// Handles the SoH3D 3DS render pass (soh3d_vk.cpp) needs to record its own draws into the SAME
+// command buffer + render pass the Fast3D Vulkan backend has open for the current framebuffer, so
+// the OoT3D content interleaves depth-correctly with the N64 geometry (exactly as the GL pass shares
+// gfx_opengl's context). Filled by GfxRenderingAPIVulkan::BeginSoH3DPass.
+struct SoH3DVkContext {
+    VkDevice device;
+    VkPhysicalDevice physicalDevice;
+    VkQueue graphicsQueue;
+    VkCommandPool commandPool;
+    VkCommandBuffer cmd;     // current frame's command buffer, with a render pass already open
+    VkRenderPass renderPass; // the FB render pass (use to build compatible pipelines)
+    VkViewport viewport;
+    VkRect2D scissor;
+    uint32_t frameIndex;     // 0..framesInFlight-1, for double-buffering the pass's own ring
+    uint32_t framesInFlight;
 };
 
 class GfxRenderingAPIVulkan : public GfxRenderingAPI {
   public:
     explicit GfxRenderingAPIVulkan(GfxWindowBackendSDL2* windowBackend);
     ~GfxRenderingAPIVulkan() override;
+
+    // Open (lazily) the current framebuffer's render pass and hand the SoH3D pass the handles +
+    // dynamic state it needs to record interleaved draws. Returns false if no drawable target.
+    bool BeginSoH3DPass(SoH3DVkContext& out);
 
     const char* GetName() override;
     int GetMaxTextureSize() override;
@@ -162,6 +217,23 @@ class GfxRenderingAPIVulkan : public GfxRenderingAPI {
     VkPipeline GetOrCreatePipeline(ShaderProgramVulkan* prg, uint32_t stateBits);
     VkSampler GetOrCreateSampler(bool linear, uint32_t cms, uint32_t cmt);
     void BeginFrameRings(); // reset per-frame vbo/ubo/descriptor pool at acquire
+
+    // ---- M3: offscreen framebuffers ----
+    void CreateFbRenderPass();
+    void CreateFbResources(FramebufferVulkan& fb, uint32_t width, uint32_t height, bool hasDepth);
+    void DestroyFbResources(FramebufferVulkan& fb);
+    // Insert a layout-transition barrier into the given command buffer, updating the
+    // tracked layout. No-op if already in newLayout.
+    void TransitionImageLayout(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect,
+                               VkImageLayout& tracked, VkImageLayout newLayout);
+    // Lazily (re)begin the render pass for mCurrentFb (draws/clears need an open pass);
+    // ends + reopens nothing if already open on the same FB.
+    void BeginPassIfNeeded();
+    void EndPassIfOpen();
+    // Split the frame's command buffer: end any open pass, submit what's recorded so
+    // far, wait for the GPU, then begin a fresh command buffer. Used by the CPU-readback
+    // entry points (GetPixelDepth / ReadFramebufferToCPU) which need prior draws visible.
+    void FlushCommandsAndWait();
 
     GfxWindowBackendSDL2* mWindowBackend = nullptr;
     SDL_Window* mWindow = nullptr;
@@ -258,8 +330,20 @@ class GfxRenderingAPIVulkan : public GfxRenderingAPI {
 
     FilteringMode mCurrentFilterMode = FILTER_THREE_POINT;
     uint32_t mNextTextureId = 1;
-    int mFramebufferCount = 1; // id 0 = screen
+
+    // Offscreen framebuffers (id 0 = main). mFbRenderPass is the single render pass all
+    // drawable FBs share (BGRA color + D32 depth, LOAD/STORE); pipelines are built
+    // against it. mCurrentFb is the bound target; mPassOpen tracks whether its render
+    // pass is currently recording in the frame command buffer.
+    std::vector<FramebufferVulkan> mFramebuffers;
+    VkRenderPass mFbRenderPass = VK_NULL_HANDLE;
+    int mCurrentFb = 0;
+    bool mPassOpen = false;
 };
+
+// Set to the live Vulkan backend in Init() (cleared in the destructor); null when the GL backend is
+// active. The SoH3D Vulkan pass uses this to find the backend it must record into.
+extern GfxRenderingAPIVulkan* g_activeVulkanApi;
 } // namespace Fast
 
 #endif

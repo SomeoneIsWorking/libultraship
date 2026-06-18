@@ -2,6 +2,9 @@
 #ifdef ENABLE_OPENGL
 
 #include "fast/soh3d_gl.h"
+#ifdef ENABLE_VULKAN
+#include "fast/soh3d_vk.h" // dispatch the GPU pass to Vulkan when that backend is live
+#endif
 
 // Match the GL headers the OpenGL backend uses (see gfx_opengl.h).
 #ifdef _MSC_VER
@@ -333,6 +336,9 @@ extern "C" float gSoH3dAoMaxDiff = 0.0090f;  // depth delta beyond which a neigh
 
 extern "C" void SoH3D_GL_SetModelProvider(SoH3DModelProvider fn) {
     g_provider = fn;
+#ifdef ENABLE_VULKAN
+    SoH3D_Vk_SetProvider(fn); // the Vulkan model store uses the same provider
+#endif
 }
 
 extern "C" void SoH3D_GL_SetBones(int modelId, const float* mats16, int n) {
@@ -955,6 +961,17 @@ static void aoPass(GLint gameFbo, const GLint vp[4], float step) {
 // frame's SoH3D content once.
 extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsigned char r, unsigned char g,
                               unsigned char b, float aspectAdj) {
+#ifdef ENABLE_VULKAN
+    if (SoH3D_Vk_Active()) {
+        auto mit = g_models.find(modelId);
+        const float* pose = (mit != g_models.end() && !mit->second.bones.empty()) ? mit->second.bones.data() : nullptr;
+        int bc = (mit != g_models.end()) ? mit->second.boneCount : 0;
+        SoH3D_Vk_BeginPass();
+        SoH3D_Vk_DrawModel(modelId, mp16, mp16, /*lit=*/0, invertY, r, g, b, aspectAdj, pose, bc, ~0ull);
+        SoH3D_Vk_EndPass();
+        return;
+    }
+#endif
     if (!ensureProgram()) return;
     GlModel* m = ensureUploaded(modelId);
     if (!m) return;
@@ -1018,6 +1035,31 @@ extern "C" void SoH3D_GL_FrameBegin(void) {
 
 extern "C" void SoH3D_GL_RenderPass(void) {
     if (g_drawList.empty()) return;
+
+#ifdef ENABLE_VULKAN
+    // Vulkan backend active: dispatch the GPU submission to soh3d_vk.cpp. The per-item pose
+    // interpolation is identical to the GL path below (shadows/AO are not yet ported there).
+    if (SoH3D_Vk_Active()) {
+        SoH3D_Vk_BeginPass();
+        std::vector<float> lerped;
+        float step = gSoH3dInterpStep;
+        for (const DrawItem& it : g_drawList) {
+            const float* pose = it.bones.empty() ? nullptr : it.bones.data();
+            if (pose && step < 0.999f && !it.prevBones.empty() && it.prevBones.size() == it.bones.size()) {
+                lerped.resize(it.bones.size());
+                float w = 1.0f - step;
+                for (size_t i = 0; i < it.bones.size(); i++) lerped[i] = w * it.prevBones[i] + step * it.bones[i];
+                pose = lerped.data();
+            }
+            SoH3D_Vk_DrawModel(it.modelId, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.aspectAdj, pose,
+                               it.boneCount, it.midMask);
+        }
+        SoH3D_Vk_EndPass();
+        g_drawList.clear();
+        return;
+    }
+#endif
+
     if (!ensureProgram()) { g_drawList.clear(); return; }
     static int nodraw = -1;
     if (nodraw < 0) { const char* e = getenv("SOH3D_GL_NODRAW"); nodraw = (e && e[0] == '1') ? 1 : 0; }
