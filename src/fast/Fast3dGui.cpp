@@ -72,6 +72,9 @@ void Fast3dGui::HandleWindowEvents(Fast::WindowEvent event) {
     switch (mImpl.Backend) {
         case WindowBackend::FAST3D_SDL_OPENGL:
         case WindowBackend::FAST3D_SDL_METAL:
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN:
+#endif
             ImGui_ImplSDL2_ProcessEvent(static_cast<const SDL_Event*>(event.Sdl.Event));
 #if defined(__ANDROID__) || defined(__IOS__)
             Ship::Mobile::ImGuiProcessEvent(ImGui::GetIO().WantTextInput);
@@ -97,6 +100,17 @@ void Fast3dGui::ImGuiWMInit() {
             }
             ImGui_ImplSDL2_InitForOpenGL(static_cast<SDL_Window*>(mImpl.Opengl.Window), mImpl.Opengl.Context);
             break;
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN:
+            SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "1");
+            if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_ALLOW_BACKGROUND_INPUTS, 1)) {
+                SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+            }
+            // Platform backend only in M1; the ImGui Vulkan *renderer* backend is M4,
+            // so ImGui draw data is produced but not yet rendered for Vulkan.
+            ImGui_ImplSDL2_InitForVulkan(static_cast<SDL_Window*>(mImpl.Vulkan.Window));
+            break;
+#endif
 #if __APPLE__
         case WindowBackend::FAST3D_SDL_METAL:
             SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "1");
@@ -120,6 +134,11 @@ void Fast3dGui::ImGuiWMShutdown() {
     switch (mImpl.Backend) {
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
+            ImGui_ImplSDL2_Shutdown();
+            break;
+#endif
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN:
             ImGui_ImplSDL2_Shutdown();
             break;
 #endif
@@ -172,6 +191,13 @@ void Fast3dGui::ImGuiBackendInit() {
         }
 #endif
 
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN:
+            // M1: no ImGui Vulkan *renderer* backend yet (that is M4). The font atlas
+            // is built lazily on first NewFrame (see ImGuiBackendNewFrame) once SoH has
+            // added its fonts; nothing is uploaded/drawn until the renderer lands.
+            break;
+#endif
 #ifdef ENABLE_DX11
         case WindowBackend::FAST3D_DXGI_DX11:
             ImGui_ImplDX11_Init(static_cast<ID3D11Device*>(mImpl.Dx11.Device),
@@ -213,6 +239,22 @@ void Fast3dGui::ImGuiBackendNewFrame() {
             ImGui_ImplOpenGL3_NewFrame();
             break;
 #endif
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN: {
+            // M1: stand in for the (M4) ImGui Vulkan renderer's first-frame work.
+            // The renderer backends normally build/upload the font atlas on their first
+            // NewFrame; without one, ImGui::NewFrame would SetCurrentFont(null) and crash.
+            // Build it CPU-side once SoH's fonts are registered (a default font if none).
+            ImGuiIO& io = ImGui::GetIO();
+            if (!io.Fonts->IsBuilt()) {
+                if (io.Fonts->Fonts.empty()) {
+                    io.Fonts->AddFontDefault();
+                }
+                io.Fonts->Build();
+            }
+            break;
+        }
+#endif
 
 #ifdef ENABLE_DX11
         case WindowBackend::FAST3D_DXGI_DX11:
@@ -236,6 +278,9 @@ void Fast3dGui::ImGuiWMNewFrame() {
     switch (mImpl.Backend) {
         case WindowBackend::FAST3D_SDL_OPENGL:
         case WindowBackend::FAST3D_SDL_METAL:
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN:
+#endif
             ImGui_ImplSDL2_NewFrame();
             break;
 #ifdef ENABLE_DX11

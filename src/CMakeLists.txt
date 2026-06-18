@@ -134,6 +134,21 @@ if (USE_OPENGLES)
     endif()
 endif()
 
+# ----- Vulkan backend (soh3d single-renderer port) -----
+# Adds a new selectable Fast3D backend (FAST3D_SDL_VULKAN) so the engine can render
+# through Vulkan (and via MoltenVK on macOS). OpenGL remains the default until the
+# Vulkan path reaches parity. Desktop Linux / macOS only (not GLES/iOS/Android).
+if (NOT USE_OPENGLES AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+    find_package(Vulkan)
+    if (Vulkan_FOUND)
+        target_link_libraries(libultraship PRIVATE Vulkan::Vulkan)
+        target_compile_definitions(libultraship PRIVATE ENABLE_VULKAN)
+        message(STATUS "soh3d: Vulkan backend ENABLED (${Vulkan_LIBRARIES})")
+    else()
+        message(STATUS "soh3d: Vulkan not found; Vulkan backend disabled")
+    endif()
+endif()
+
 target_link_libraries(libultraship PUBLIC prism monocypher)
 
 if(ENABLE_SCRIPTING)

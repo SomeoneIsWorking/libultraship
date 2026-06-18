@@ -9,6 +9,7 @@
 #include "fast/backends/gfx_dxgi.h"
 #include "fast/backends/gfx_opengl.h"
 #include "fast/backends/gfx_metal.h"
+#include "fast/backends/gfx_vulkan.h"
 #include "fast/backends/gfx_direct3d_common.h"
 #include "fast/backends/gfx_direct3d11.h"
 #include "fast/backends/gfx_window_manager_api.h"
@@ -37,6 +38,9 @@ Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui, std::shared_ptr<FastM
     }
 #endif
     AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_OPENGL);
+#ifdef ENABLE_VULKAN
+    AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_VULKAN);
+#endif
 }
 
 Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui)
@@ -136,6 +140,14 @@ uint16_t Fast3dWindow::GetPixelDepth(float x, float y) {
 void Fast3dWindow::InitWindowManager() {
     SetWindowBackend(GetSavedWindowBackend());
 
+#ifdef ENABLE_VULKAN
+    // Opt into the Vulkan backend at runtime (env override) while it is being
+    // brought up, without disturbing the saved/default backend (still GL).
+    if (const char* v = std::getenv("SOH3D_VULKAN"); v != nullptr && v[0] == '1') {
+        SetWindowBackend(WindowBackend::FAST3D_SDL_VULKAN);
+    }
+#endif
+
     switch (GetWindowBackend()) {
 #ifdef ENABLE_DX11
         case WindowBackend::FAST3D_DXGI_DX11:
@@ -147,6 +159,12 @@ void Fast3dWindow::InitWindowManager() {
         case WindowBackend::FAST3D_SDL_OPENGL:
             mRenderingApi = new GfxRenderingAPIOGL();
             mWindowManagerApi = new GfxWindowBackendSDL2();
+            break;
+#endif
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN:
+            mWindowManagerApi = new GfxWindowBackendSDL2();
+            mRenderingApi = new GfxRenderingAPIVulkan(static_cast<GfxWindowBackendSDL2*>(mWindowManagerApi));
             break;
 #endif
 #ifdef __APPLE__

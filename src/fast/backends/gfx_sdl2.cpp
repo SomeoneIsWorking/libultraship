@@ -41,6 +41,10 @@
 #include <SDL2/SDL_opengles2.h>
 #endif
 
+#ifdef ENABLE_VULKAN
+#include <SDL2/SDL_vulkan.h>
+#endif
+
 #include "ship/window/gui/Gui.h"
 #include "fast/Fast3dGui.h"
 
@@ -336,10 +340,14 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
 
     SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
 
+#ifdef ENABLE_VULKAN
+    mUseVulkan = strcmp(gfxApiName, "Vulkan") == 0;
+#endif
+
 #if defined(__APPLE__)
-    bool use_opengl = strcmp(gfxApiName, "OpenGL") == 0;
+    bool use_opengl = !mUseVulkan && strcmp(gfxApiName, "OpenGL") == 0;
 #else
-    constexpr bool use_opengl = true;
+    bool use_opengl = !mUseVulkan;
 #endif
 
     if (use_opengl) {
@@ -394,7 +402,12 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
         flags = (flags & ~(Uint32)SDL_WINDOW_SHOWN) | SDL_WINDOW_HIDDEN;
     }
 
-    if (use_opengl) {
+#ifdef ENABLE_VULKAN
+    if (mUseVulkan) {
+        flags = flags | SDL_WINDOW_VULKAN;
+    } else
+#endif
+        if (use_opengl) {
         flags = flags | SDL_WINDOW_OPENGL;
     } else {
         flags = flags | SDL_WINDOW_METAL;
@@ -419,7 +432,19 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
         posY = 100;
     }
 
-    if (use_opengl) {
+#ifdef ENABLE_VULKAN
+    if (mUseVulkan) {
+        // The window is SDL_WINDOW_VULKAN; the Vulkan rendering API creates the
+        // instance/surface/swapchain from mWnd in its Init(). No GL context here.
+        SDL_Vulkan_GetDrawableSize(mWnd, &mWindowWidth, &mWindowHeight);
+        if (startFullScreen) {
+            SetFullscreenImpl(true, false);
+        }
+        window_impl.Vulkan = { mWnd };
+        window_impl.Backend = WindowBackend::FAST3D_SDL_VULKAN;
+    } else
+#endif
+        if (use_opengl) {
         SDL_GL_GetDrawableSize(mWnd, &mWindowWidth, &mWindowHeight);
 
         if (startFullScreen) {
@@ -540,11 +565,18 @@ void GfxWindowBackendSDL2::SetMouseCallbacks(bool (*onMouseButtonDown)(int btn),
 }
 
 void GfxWindowBackendSDL2::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
-#ifdef __APPLE__
-    SDL_GetWindowSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
-#else
-    SDL_GL_GetDrawableSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
+#ifdef ENABLE_VULKAN
+    if (mUseVulkan) {
+        SDL_Vulkan_GetDrawableSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
+    } else
 #endif
+    {
+#ifdef __APPLE__
+        SDL_GetWindowSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
+#else
+        SDL_GL_GetDrawableSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
+#endif
+    }
     SDL_GetWindowPosition(mWnd, static_cast<int*>(posX), static_cast<int*>(posY));
 }
 
@@ -654,10 +686,15 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
         case SDL_WINDOWEVENT:
             switch (event.window.event) {
                 case SDL_WINDOWEVENT_SIZE_CHANGED:
+#ifdef ENABLE_VULKAN
+                    if (mUseVulkan) {
+                        SDL_Vulkan_GetDrawableSize(mWnd, &mWindowWidth, &mWindowHeight);
+                    } else
+#endif
 #ifdef __APPLE__
-                    SDL_GetWindowSize(mWnd, &mWindowWidth, &mWindowHeight);
+                        SDL_GetWindowSize(mWnd, &mWindowWidth, &mWindowHeight);
 #else
-                    SDL_GL_GetDrawableSize(mWnd, &mWindowWidth, &mWindowHeight);
+                        SDL_GL_GetDrawableSize(mWnd, &mWindowWidth, &mWindowHeight);
 #endif
                     break;
                 case SDL_WINDOWEVENT_CLOSE:
@@ -776,6 +813,16 @@ static void Soh3dWritePpm(SDL_Window* wnd, const char* path) {
 }
 
 void GfxWindowBackendSDL2::SwapBuffersBegin() {
+#ifdef ENABLE_VULKAN
+    if (mUseVulkan) {
+        // Vulkan: the rendering API owns submit/present and the frame dump (it must
+        // read the rendered swapchain image, not the GL back buffer). Here we only
+        // pace the frame; everything GL-specific below is skipped.
+        SyncFramerateWithTime();
+        return;
+    }
+#endif
+
     bool nextVsyncEnabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_VSYNC_ENABLED, 1);
 
     if (mVsyncEnabled != nextVsyncEnabled) {

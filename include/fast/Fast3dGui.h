@@ -44,6 +44,9 @@ typedef struct {
             SDL_Renderer* Renderer; ///< SDL_Renderer* (for Metal layer)
         } Metal;
         struct {
+            void* Window; ///< SDL_Window* (created with SDL_WINDOW_VULKAN)
+        } Vulkan;
+        struct {
             uint32_t Width;  ///< Framebuffer width in pixels.
             uint32_t Height; ///< Framebuffer height in pixels.
         } Gx2;

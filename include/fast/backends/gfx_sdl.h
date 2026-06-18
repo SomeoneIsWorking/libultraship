@@ -41,6 +41,12 @@ class GfxWindowBackendSDL2 final : public GfxWindowBackend {
     void Destroy() override;
     bool IsFullscreen() override;
 
+    // Vulkan backend support: the Vulkan rendering API creates its VkSurfaceKHR
+    // from this SDL_Window (made with SDL_WINDOW_VULKAN). Valid after Init().
+    SDL_Window* GetSdlWindow() const {
+        return mWnd;
+    }
+
   private:
     void SetFullscreenImpl(bool on, bool call_callback);
     void HandleSingleEvent(SDL_Event& event);
@@ -66,5 +72,9 @@ class GfxWindowBackendSDL2 final : public GfxWindowBackend {
     int mWindowWidth = 640;
     int mWindowHeight = 480;
     void (*mOnAllKeysUp)();
+    // True when the window was created for the Vulkan backend (SDL_WINDOW_VULKAN).
+    // The Vulkan rendering API owns submit+present, so the SDL2 window backend
+    // skips GL context creation, SDL_GL_SwapWindow, and the glReadPixels dump.
+    bool mUseVulkan = false;
 };
 } // namespace Fast
