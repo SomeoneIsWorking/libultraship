@@ -614,8 +614,12 @@ void GfxRenderingAPIVulkan::CreateInstance() {
         if (const char* sdk = getenv("VULKAN_SDK")) {
             candidates.push_back(std::string(sdk) + "/share/vulkan/icd.d/MoltenVK_icd.json");
         }
-        candidates.push_back("/opt/homebrew/share/vulkan/icd.d/MoltenVK_icd.json"); // brew (Apple Silicon)
-        candidates.push_back("/usr/local/share/vulkan/icd.d/MoltenVK_icd.json");    // brew (Intel)
+        // Homebrew installs the ICD under the molten-vk prefix (NOT the shared loader dir), e.g.
+        // /opt/homebrew/opt/molten-vk/share/vulkan/icd.d/MoltenVK_icd.json.
+        candidates.push_back("/opt/homebrew/opt/molten-vk/share/vulkan/icd.d/MoltenVK_icd.json"); // brew, Apple Silicon
+        candidates.push_back("/usr/local/opt/molten-vk/share/vulkan/icd.d/MoltenVK_icd.json");    // brew, Intel
+        candidates.push_back("/opt/homebrew/share/vulkan/icd.d/MoltenVK_icd.json");
+        candidates.push_back("/usr/local/share/vulkan/icd.d/MoltenVK_icd.json");
         bool found = false;
         for (const std::string& p : candidates) {
             if (access(p.c_str(), R_OK) == 0) {
@@ -626,8 +630,14 @@ void GfxRenderingAPIVulkan::CreateInstance() {
             }
         }
         if (!found) {
-            SPDLOG_WARN("[Vulkan] macOS: no MoltenVK ICD found — install the Vulkan SDK or `brew "
-                        "install molten-vk`. The loader will find no devices and the game stays black.");
+            std::string looked;
+            for (const std::string& p : candidates) {
+                looked += "\n    " + p;
+            }
+            SPDLOG_WARN("[Vulkan] macOS: no MoltenVK ICD found. Looked in:{}\n  Find yours with: find "
+                        "$(brew --prefix) -name MoltenVK_icd.json, then export VK_ICD_FILENAMES=<that "
+                        "path> before ./run.sh.",
+                        looked);
         }
     }
 #endif
