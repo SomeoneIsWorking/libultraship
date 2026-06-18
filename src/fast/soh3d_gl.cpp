@@ -99,6 +99,16 @@ bool g_progFailed = false;
 GLuint g_shadowFbo = 0, g_shadowTex = 0;
 int g_shadowRes = 2048;
 
+// --- Ambient occlusion: a screen-space SSAO over a private camera-view depth render of the SoH3D
+// content (so it stays pixel-aligned with the visible draw and never has to blit Fast3D's
+// MSAA/renderbuffer depth). g_aoProgram is a separate full-screen shader. ---
+GLuint g_aoFbo = 0, g_aoDepthTex = 0;
+int g_aoW = 0, g_aoH = 0;
+GLuint g_aoProgram = 0;
+bool g_aoProgFailed = false;
+GLint g_uAoDepth = -1, g_uAoTexel = -1, g_uAoRadius = -1, g_uAoStrength = -1, g_uAoBias = -1,
+      g_uAoMaxDiff = -1;
+
 // GPU skinning: pos_skinned = sum_i aBoneW[i] * uBones[aBoneId[i]] * pos. uBones is
 // an array of affine matrices, so the result's w = sum_i aBoneW[i] = 1 (weights sum
 // to 1). uBones defaults to identity (set via glUniformMatrix per draw) -> bind pose.
@@ -313,6 +323,13 @@ extern "C" void SoH3D_GL_SetShadowFocus(float x, float y, float z) {
     gSoH3dShadowFocus[2] = z;
     gSoH3dShadowHasFocus = 1;
 }
+
+// --- Ambient-occlusion tunables (REPL `ao*`; env SOH3D_AO master gate). -1 = uninit. ---
+extern "C" int gSoH3dAoEnable = -1;
+extern "C" float gSoH3dAoRadius = 22.0f;     // SSAO sample radius in PIXELS
+extern "C" float gSoH3dAoStrength = 0.7f;    // how dark fully-occluded fragments get (0..1)
+extern "C" float gSoH3dAoBias = 0.00040f;    // min depth delta to count an occluder (fights flat-surface noise)
+extern "C" float gSoH3dAoMaxDiff = 0.0090f;  // depth delta beyond which a neighbour is a silhouette, not a crease
 
 extern "C" void SoH3D_GL_SetModelProvider(SoH3DModelProvider fn) {
     g_provider = fn;
@@ -774,6 +791,163 @@ static void renderShadowMap(GLint gameFbo, const GLint vp[4], const float lightV
     glViewport(vp[0], vp[1], vp[2], vp[3]);
 }
 
+// --- Ambient occlusion ---------------------------------------------------------------------------
+// Full-screen SSAO program (separate from the model shader). Vertex = one big triangle from
+// gl_VertexID (no VBO). Fragment = screen-space depth-only AO over the private SoH3D depth render:
+// for each fragment it walks a spiral of neighbours and darkens where nearby surfaces sit closer to
+// the camera (a crease/contact), with a range check so silhouette edges (huge depth jump) don't count.
+const char* kAoVert =
+    "#version 130\n"
+    "void main(){\n"
+    "  vec2 p = vec2((gl_VertexID == 2) ? 3.0 : -1.0, (gl_VertexID == 1) ? 3.0 : -1.0);\n"
+    "  gl_Position = vec4(p, 0.0, 1.0);\n"
+    "}\n";
+const char* kAoFrag =
+    "#version 130\n"
+    "uniform sampler2D uAoDepth; uniform vec2 uAoTexel;\n"
+    "uniform float uAoRadius; uniform float uAoStrength; uniform float uAoBias; uniform float uAoMaxDiff;\n"
+    "out vec4 frag;\n"
+    "void main(){\n"
+    "  vec2 uv = gl_FragCoord.xy * uAoTexel;\n"
+    "  float d0 = texture(uAoDepth, uv).r;\n"
+    "  if (d0 >= 0.99999) { frag = vec4(1.0); return; }\n" // no SoH3D content here -> no AO
+    "  float occ = 0.0;\n"
+    "  for (int i = 0; i < 12; i++) {\n"
+    "    float a = float(i) * 2.3998277;\n"                       // golden angle spiral
+    "    float r = uAoRadius * (float(i) + 0.5) / 12.0;\n"
+    "    vec2 off = vec2(cos(a), sin(a)) * r * uAoTexel;\n"
+    "    float di = texture(uAoDepth, uv + off).r;\n"
+    "    float diff = d0 - di;\n"                                  // >0 => neighbour closer to camera
+    "    if (diff > uAoBias) {\n"
+    "      occ += clamp(1.0 - (diff - uAoBias) / uAoMaxDiff, 0.0, 1.0);\n" // crease counts, silhouette doesn't
+    "    }\n"
+    "  }\n"
+    "  float ao = 1.0 - uAoStrength * (occ / 12.0);\n"
+    "  frag = vec4(vec3(ao), 1.0);\n"
+    "}\n";
+
+static bool ensureAoProgram() {
+    if (g_aoProgram) return true;
+    if (g_aoProgFailed) return false;
+    GLuint vs = compile(GL_VERTEX_SHADER, kAoVert);
+    GLuint fs = compile(GL_FRAGMENT_SHADER, kAoFrag);
+    if (!vs || !fs) { g_aoProgFailed = true; return false; }
+    GLuint p = glCreateProgram();
+    glAttachShader(p, vs);
+    glAttachShader(p, fs);
+    glLinkProgram(p);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    if (!ok) {
+        char log[1024];
+        glGetProgramInfoLog(p, sizeof(log), nullptr, log);
+        fprintf(stderr, "[SoH3D_GL] AO program link failed: %s\n", log);
+        g_aoProgFailed = true;
+        return false;
+    }
+    g_aoProgram = p;
+    g_uAoDepth = glGetUniformLocation(p, "uAoDepth");
+    g_uAoTexel = glGetUniformLocation(p, "uAoTexel");
+    g_uAoRadius = glGetUniformLocation(p, "uAoRadius");
+    g_uAoStrength = glGetUniformLocation(p, "uAoStrength");
+    g_uAoBias = glGetUniformLocation(p, "uAoBias");
+    g_uAoMaxDiff = glGetUniformLocation(p, "uAoMaxDiff");
+    return true;
+}
+
+// Lazily create / resize the AO depth texture to the frame size. Saves & restores the bound FBO+tex.
+static bool ensureAoFbo(int w, int h) {
+    if (w <= 0 || h <= 0) return false;
+    if (g_aoFbo && g_aoW == w && g_aoH == h) return true;
+    GLint prevFbo = 0, prevTex = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+    if (!g_aoDepthTex) glGenTextures(1, &g_aoDepthTex);
+    glBindTexture(GL_TEXTURE_2D, g_aoDepthTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, w, h, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (!g_aoFbo) glGenFramebuffers(1, &g_aoFbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_aoFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, g_aoDepthTex, 0);
+#ifndef USE_OPENGLES
+    glDrawBuffer(GL_NONE);
+    glReadBuffer(GL_NONE);
+#endif
+    GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prevTex);
+    if (st != GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "[SoH3D_GL] AO FBO incomplete: 0x%x\n", st);
+        return false;
+    }
+    g_aoW = w;
+    g_aoH = h;
+    fprintf(stderr, "[SoH3D_GL] AO depth %dx%d ready\n", w, h);
+    return true;
+}
+
+// Run after the visible main-pass draws. (1) Re-render the SoH3D content's depth into our private
+// AO depth texture using the SAME camera transforms as the visible draw (so it is pixel-aligned).
+// (2) Full-screen SSAO pass that multiplies the scene colour by the occlusion factor (darkens only
+// where OoT3D content exists; far/empty texels output 1.0 so N64-only pixels are untouched).
+// Assumes g_program is current (the main loop just ran). Restores the game FBO+viewport.
+static void aoPass(GLint gameFbo, const GLint vp[4], float step) {
+    int w = vp[2], h = vp[3];
+    if (!ensureAoFbo(w, h) || !ensureAoProgram()) return;
+    // (1) depth render of the SoH3D content (camera view), into the AO depth texture.
+    glBindFramebuffer(GL_FRAMEBUFFER, g_aoFbo);
+    glViewport(0, 0, w, h);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    GLfloat prevClearDepth = 1.0f;
+    glGetFloatv(GL_DEPTH_CLEAR_VALUE, &prevClearDepth);
+    glClearDepth(1.0);
+    glDepthFunc(GL_LEQUAL);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glClearDepth(prevClearDepth);
+    glUniform1f(g_uShadowOn, 0.0f); // depth only: no shadow sampling
+    std::vector<float> lerped;
+    for (const DrawItem& it : g_drawList) {
+        GlModel* m = ensureUploaded(it.modelId);
+        if (!m) continue;
+        const float* pose = it.bones.empty() ? nullptr : it.bones.data();
+        if (pose && step < 0.999f && !it.prevBones.empty() && it.prevBones.size() == it.bones.size()) {
+            lerped.resize(it.bones.size());
+            float wgt = 1.0f - step;
+            for (size_t i = 0; i < it.bones.size(); i++) lerped[i] = wgt * it.prevBones[i] + step * it.bones[i];
+            pose = lerped.data();
+        }
+        // IDENTICAL transforms to the visible draw (it.mp, it.aspectAdj, it.invertY) -> pixel-aligned.
+        drawOne(*m, it.mp, it.mv, /*lit=*/0, it.invertY, 255, 255, 255, it.aspectAdj, pose, it.boneCount,
+                it.midMask);
+    }
+    // (2) full-screen SSAO composite onto the scene FBO (dst *= ao).
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)gameFbo);
+    glViewport(vp[0], vp[1], vp[2], vp[3]);
+    glUseProgram(g_aoProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_aoDepthTex);
+    glUniform1i(g_uAoDepth, 0);
+    glUniform2f(g_uAoTexel, 1.0f / (float)w, 1.0f / (float)h);
+    glUniform1f(g_uAoRadius, gSoH3dAoRadius);
+    glUniform1f(g_uAoStrength, gSoH3dAoStrength);
+    glUniform1f(g_uAoBias, gSoH3dAoBias);
+    glUniform1f(g_uAoMaxDiff, gSoH3dAoMaxDiff);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ZERO, GL_SRC_COLOR); // multiply: scene *= ao
+    glBlendEquation(GL_FUNC_ADD);
+    for (int a = 0; a <= 5; a++) glDisableVertexAttribArray(a); // full-screen tri uses gl_VertexID only
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glUseProgram(g_program); // hand back to the model program; endPass restores Fast3D's
+}
+
 } // namespace
 
 // Inline single-model draw (legacy entry; still used by any direct caller). Brackets one model
@@ -900,6 +1074,20 @@ extern "C" void SoH3D_GL_RenderPass(void) {
                 it.midMask);
         drawn++;
     }
+
+    // --- Ambient-occlusion phase (after the visible draws): SSAO over a private depth render of the
+    // SoH3D content, multiplied onto the scene colour. Darkens only OoT3D pixels. ---
+    if (gSoH3dAoEnable < 0) {
+        const char* e = getenv("SOH3D_AO");
+        gSoH3dAoEnable = (e && e[0] == '0') ? 0 : 1;
+    }
+    if (gSoH3dAoEnable) {
+        GLint gameFbo = 0, vp[4] = { 0, 0, 0, 0 };
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &gameFbo);
+        glGetIntegerv(GL_VIEWPORT, vp);
+        aoPass(gameFbo, vp, step);
+    }
+
     endPass(s);
     checkGlLeak(pre, "renderpass"); // verify our pass handed every captured state field back
 
