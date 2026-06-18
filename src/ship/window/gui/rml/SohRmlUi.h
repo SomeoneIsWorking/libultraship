@@ -3,6 +3,7 @@
 #ifdef __cplusplus
 
 #include <memory>
+#include <vector>
 
 // Forward declarations keep the heavy RmlUi / SDL / GL headers out of this header so it
 // can be included from Fast3dGui (and elsewhere) without dragging in the bundled glad
@@ -12,11 +13,13 @@ class SystemInterface_SDL;
 namespace Rml {
 class Context;
 class ElementDocument;
+class EventListener;
 } // namespace Rml
 
 namespace Ship {
 
 class RmlRenderInterfaceVk;
+class TabClickListener; // per-tab mouse-click handler (defined in the .cpp), needs SetActiveTab
 
 /**
  * @brief Owns the RmlUi runtime for the Fast3D OpenGL backend.
@@ -37,6 +40,8 @@ class SohRmlUi {
 
     SohRmlUi(const SohRmlUi&) = delete;
     SohRmlUi& operator=(const SohRmlUi&) = delete;
+
+    friend class TabClickListener;
 
     /**
      * @brief Initialises RmlUi against the already-current SDL/GL context.
@@ -93,6 +98,9 @@ class SohRmlUi {
     void SetActiveTab(int index);
     void NextTab();
     void PrevTab();
+    // Attach a click handler to each <tab> so a mouse click switches to that tab (built once
+    // after the document loads; the listeners are owned by mTabClickListeners).
+    void AttachTabClickHandlers();
     // Focus the first focusable row of the active pane (default focus on open / after a tab switch).
     void FocusFirstInActivePane();
     // Curated CVar toggle rows: reflect each `toggle="<id>"` row's live value into its <value> text
@@ -114,6 +122,8 @@ class SohRmlUi {
     std::unique_ptr<SystemInterface_SDL> mSystemInterface;
     Rml::Context* mContext = nullptr;          // owned by RmlUi, freed by Rml::Shutdown()
     Rml::ElementDocument* mDocument = nullptr;  // owned by the context
+    // Per-<tab> click listeners (own their lifetime; must outlive the document's elements).
+    std::vector<std::unique_ptr<Rml::EventListener>> mTabClickListeners;
 };
 
 } // namespace Ship

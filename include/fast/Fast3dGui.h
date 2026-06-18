@@ -154,6 +154,14 @@ class Fast3dGui : public Ship::Gui {
      */
     void RmlMenuInjectKey(int sdlKeycode);
 
+    /**
+     * Move the cursor to (@p x, @p y) in window pixels and synthesize a left mouse click there,
+     * fed through the menu's normal ProcessSdlEvent path (so REPL-driven clicks exercise the same
+     * RmlUi mouse handling as a real click). Used by the `menuclick` REPL command for headless
+     * verification of mouse interactions (e.g. tab switching).
+     */
+    void RmlMenuInjectClick(int x, int y);
+
   protected:
     void ImGuiWMInit() override;
     void ImGuiWMShutdown() override;

@@ -9,6 +9,7 @@
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Input.h>
+#include <RmlUi/Core/EventListener.h>
 #include <SDL2/SDL_video.h>
 #include <SDL2/SDL_events.h>
 
@@ -68,6 +69,20 @@ static void SetToggleValueText(Rml::Element* row, bool on) {
 // RmlUi runtime is process-global (Rml::Initialise / Rml::Shutdown). Track init so a second
 // SohRmlUi (e.g. after a backend switch) does not double-initialise the library.
 static bool sRmlLibraryInitialised = false;
+
+// Click handler bound to one <tab>: switches the menu to that tab's index (mouse parity with the
+// Left/Right keyboard/D-pad tab nav). Owned by SohRmlUi::mTabClickListeners.
+class TabClickListener : public Rml::EventListener {
+  public:
+    TabClickListener(SohRmlUi* ui, int index) : mUi(ui), mIndex(index) {}
+    void ProcessEvent(Rml::Event& /*event*/) override {
+        mUi->SetActiveTab(mIndex);
+    }
+
+  private:
+    SohRmlUi* mUi;
+    int mIndex;
+};
 
 SohRmlUi::SohRmlUi() = default;
 
@@ -154,6 +169,8 @@ bool SohRmlUi::Init(void* sdlWindow, void* glContext, int width, int height, boo
     // Start hidden; the menu is shown on demand via ToggleVisible() (Phase 2). The document stays
     // loaded either way — we gate update/render + input on mVisible.
     mDocument->Show();
+    // Mouse parity: clicking a <tab> switches to it (keyboard/D-pad Left/Right already do).
+    AttachTabClickHandlers();
 
     SPDLOG_INFO("[SohRmlUi] RmlUi initialised ({}x{}) — {} ({})", mWidth, mHeight, docPath, gl_message);
     mInitialised = true;
@@ -290,6 +307,21 @@ void SohRmlUi::SetActiveTab(int index) {
     RefreshToggleRows();
     mContext->Update();
     FocusFirstInActivePane();
+}
+
+void SohRmlUi::AttachTabClickHandlers() {
+    if (!mDocument) {
+        return;
+    }
+    Rml::ElementList tabs;
+    mDocument->GetElementsByTagName(tabs, "tab");
+    mTabClickListeners.clear();
+    mTabClickListeners.reserve(tabs.size());
+    for (int i = 0; i < (int)tabs.size(); i++) {
+        auto listener = std::make_unique<TabClickListener>(this, i);
+        tabs[i]->AddEventListener("click", listener.get());
+        mTabClickListeners.push_back(std::move(listener));
+    }
 }
 
 void SohRmlUi::NextTab() {

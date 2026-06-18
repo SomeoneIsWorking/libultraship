@@ -372,6 +372,30 @@ void Fast3dGui::RmlMenuInjectKey(int sdlKeycode) {
     mRml->ProcessSdlEvent(&ev);
 }
 
+void Fast3dGui::RmlMenuInjectClick(int x, int y) {
+    if (!mRml) {
+        return;
+    }
+    // Position the cursor first (RmlUi resolves the hovered element from the last mouse move), then
+    // a left button down + up so the click dispatches to whatever element is under (x, y).
+    SDL_Event ev{};
+    ev.type = SDL_MOUSEMOTION;
+    ev.motion.x = x;
+    ev.motion.y = y;
+    mRml->ProcessSdlEvent(&ev);
+    ev = SDL_Event{};
+    ev.type = SDL_MOUSEBUTTONDOWN;
+    ev.button.button = SDL_BUTTON_LEFT;
+    ev.button.state = SDL_PRESSED;
+    ev.button.clicks = 1;
+    ev.button.x = x;
+    ev.button.y = y;
+    mRml->ProcessSdlEvent(&ev);
+    ev.type = SDL_MOUSEBUTTONUP;
+    ev.button.state = SDL_RELEASED;
+    mRml->ProcessSdlEvent(&ev);
+}
+
 // C bridge for the SoH3D REPL (`menu <action>`): resolve the active Fast3dGui and inject the key
 // that drives the requested navigation. The action codes (kept SDL-free for the C caller in
 // soh3d.c) match SoH3D_RmlMenuAction in tools/soh3d_repl.py:
@@ -408,6 +432,19 @@ extern "C" void SoH3D_RmlMenuKey(int action) {
             break;
     }
     gui->RmlMenuInjectKey(keycode);
+}
+
+// C bridge for the SoH3D REPL (`menuclick <x> <y>`): synthesize a left click at window pixel
+// (x, y) through the menu's real input path (used to verify mouse interactions headlessly).
+extern "C" void SoH3D_RmlMenuClick(int x, int y) {
+    auto ctx = Ship::Context::GetRawInstance();
+    if (!ctx || !ctx->GetWindow()) {
+        return;
+    }
+    auto* gui = dynamic_cast<Fast::Fast3dGui*>(ctx->GetWindow()->GetGui().get());
+    if (gui) {
+        gui->RmlMenuInjectClick(x, y);
+    }
 }
 
 void Fast3dGui::DrawFloatingWindows() {
