@@ -15,6 +15,7 @@
 #include "ship/Context.h"
 #include "ship/controller/controldeck/ControlDeck.h"
 #include <spdlog/spdlog.h>
+#include <algorithm>
 
 // Unique id for blocking game input while the RML menu is open (sequence continues the existing
 // *_BLOCK_ID constants in gfx_dxgi.cpp / InputEditorWindow.cpp). Without this, SoH polls the
@@ -138,24 +139,10 @@ void SohRmlUi::SetVisible(bool visible) {
         }
     }
     if (mVisible && mContext) {
-        // Update once so layout is current, then drop focus onto the first focusable element so a
-        // controller/keyboard can drive it immediately (matches Dusklight opening with a default focus).
-        // Focus the element directly rather than simulating Tab: at open time (e.g. the startup
-        // auto-open) a synthesised Tab does not reliably land on the first item, leaving nothing
-        // highlighted. QuerySelector finds the first element opted into focus via tabindex.
+        // Lay out, then apply the active tab (shows its pane, sets selected/active classes) and drop
+        // focus onto that pane's first row so a controller/keyboard can drive it immediately.
         mContext->Update();
-        Rml::Element* first = nullptr;
-        if (mDocument) {
-            // Match the first element that opts INTO focus (tabindex="auto"); a bare [tabindex]
-            // selector would also match items opted out with tabindex="none" (e.g. the tabs),
-            // and focusing one of those leaves nothing visibly highlighted.
-            first = mDocument->QuerySelector("[tabindex='auto']");
-        }
-        if (first) {
-            first->Focus();
-        } else {
-            FocusNext();
-        }
+        SetActiveTab(mActiveTab);
     } else if (mContext) {
         if (Rml::Element* focus = mContext->GetFocusElement()) {
             focus->Blur();
@@ -195,6 +182,59 @@ void SohRmlUi::ActivateFocused() {
     }
 }
 
+void SohRmlUi::SetActiveTab(int index) {
+    if (!mContext || !mDocument) {
+        return;
+    }
+    Rml::ElementList tabs, panes;
+    mDocument->GetElementsByTagName(tabs, "tab");
+    mDocument->GetElementsByTagName(panes, "pane");
+    const int n = (int)std::min(tabs.size(), panes.size());
+    if (n == 0) {
+        return;
+    }
+    // Wrap around at the ends so left/right cycles through every tab.
+    if (index < 0) {
+        index = n - 1;
+    } else if (index >= n) {
+        index = 0;
+    }
+    mActiveTab = index;
+    for (int i = 0; i < (int)tabs.size(); i++) {
+        tabs[i]->SetClass("selected", i == index);
+    }
+    for (int i = 0; i < (int)panes.size(); i++) {
+        panes[i]->SetClass("active", i == index);
+    }
+    // Lay out with the new pane shown before focusing into it.
+    mContext->Update();
+    FocusFirstInActivePane();
+}
+
+void SohRmlUi::NextTab() {
+    SetActiveTab(mActiveTab + 1);
+}
+
+void SohRmlUi::PrevTab() {
+    SetActiveTab(mActiveTab - 1);
+}
+
+void SohRmlUi::FocusFirstInActivePane() {
+    if (!mDocument) {
+        return;
+    }
+    Rml::ElementList panes;
+    mDocument->GetElementsByTagName(panes, "pane");
+    if (mActiveTab < 0 || mActiveTab >= (int)panes.size()) {
+        return;
+    }
+    // First row that opts into focus (tabindex="auto"); rows in hidden panes (display:none) are not
+    // focusable, so Tab navigation naturally stays within the active pane.
+    if (Rml::Element* first = panes[mActiveTab]->QuerySelector("[tabindex='auto']")) {
+        first->Focus();
+    }
+}
+
 bool SohRmlUi::ProcessSdlEvent(void* sdlEvent) {
     if (!mInitialised || !mContext || !sdlEvent) {
         return false;
@@ -223,12 +263,16 @@ bool SohRmlUi::ProcessSdlEvent(void* sdlEvent) {
         case SDL_KEYDOWN:
             switch (ev.key.keysym.sym) {
                 case SDLK_DOWN:
-                case SDLK_RIGHT:
                     FocusNext();
                     return true;
                 case SDLK_UP:
-                case SDLK_LEFT:
                     FocusPrev();
+                    return true;
+                case SDLK_RIGHT:
+                    NextTab();
+                    return true;
+                case SDLK_LEFT:
+                    PrevTab();
                     return true;
                 case SDLK_RETURN:
                 case SDLK_KP_ENTER:
@@ -242,12 +286,16 @@ bool SohRmlUi::ProcessSdlEvent(void* sdlEvent) {
         case SDL_CONTROLLERBUTTONDOWN:
             switch (ev.cbutton.button) {
                 case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
-                case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
                     FocusNext();
                     return true;
                 case SDL_CONTROLLER_BUTTON_DPAD_UP:
-                case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
                     FocusPrev();
+                    return true;
+                case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
+                    NextTab();
+                    return true;
+                case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
+                    PrevTab();
                     return true;
                 case SDL_CONTROLLER_BUTTON_A:
                     ActivateFocused();

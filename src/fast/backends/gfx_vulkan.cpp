@@ -41,6 +41,11 @@
 #include <array>
 #include <mutex>
 #include <stdexcept>
+#include <string>
+#include <vector>
+#if defined(__APPLE__)
+#include <unistd.h> // access() for locating the MoltenVK ICD
+#endif
 #include <spdlog/spdlog.h>
 
 namespace {
@@ -598,6 +603,34 @@ const char* GfxRenderingAPIVulkan::GetName() {
 // ---------------------------------------------------------------------------
 
 void GfxRenderingAPIVulkan::CreateInstance() {
+#if defined(__APPLE__)
+    // MoltenVK is loaded via an ICD manifest (MoltenVK_icd.json). If the Vulkan loader has no ICD
+    // configured — e.g. the Vulkan SDK env wasn't sourced — it enumerates ZERO devices and the
+    // screen stays black (you'll see "vkDeviceWaitIdle: Invalid device" from the null device).
+    // Best-effort: point the loader at a MoltenVK ICD we can find, so it works without the user
+    // setting VK_ICD_FILENAMES by hand.
+    if (getenv("VK_ICD_FILENAMES") == nullptr && getenv("VK_DRIVER_FILES") == nullptr) {
+        std::vector<std::string> candidates;
+        if (const char* sdk = getenv("VULKAN_SDK")) {
+            candidates.push_back(std::string(sdk) + "/share/vulkan/icd.d/MoltenVK_icd.json");
+        }
+        candidates.push_back("/opt/homebrew/share/vulkan/icd.d/MoltenVK_icd.json"); // brew (Apple Silicon)
+        candidates.push_back("/usr/local/share/vulkan/icd.d/MoltenVK_icd.json");    // brew (Intel)
+        bool found = false;
+        for (const std::string& p : candidates) {
+            if (access(p.c_str(), R_OK) == 0) {
+                setenv("VK_ICD_FILENAMES", p.c_str(), 1);
+                SPDLOG_INFO("[Vulkan] macOS: using MoltenVK ICD {}", p);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            SPDLOG_WARN("[Vulkan] macOS: no MoltenVK ICD found — install the Vulkan SDK or `brew "
+                        "install molten-vk`. The loader will find no devices and the game stays black.");
+        }
+    }
+#endif
     // SDL needs the window to report the instance extensions it requires.
     unsigned int extCount = 0;
     if (!SDL_Vulkan_GetInstanceExtensions(mWindow, &extCount, nullptr)) {

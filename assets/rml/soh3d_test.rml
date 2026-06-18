@@ -8,42 +8,40 @@
 	<window id="window">
 		<tab-bar id="tab-bar">
 			<tab class="selected">Settings</tab>
-			<tab>Enhancements</tab>
 			<tab>Graphics</tab>
 			<tab>Audio</tab>
-			<tab>Controls</tab>
 			<tab>About</tab>
 		</tab-bar>
 		<content id="content">
-			<!-- Each row is a <select-button> with a <key> (label) and <value>. Two separate things
-			     make a row focusable, and BOTH are required (RmlUi does not bridge them):
-			       * the `tab-index: auto` RCSS property (soh3d_test.rcss) drives Down/Up Tab
-			         navigation between rows;
-			       * the `tabindex="auto"` attribute here is only the marker SohRmlUi::SetVisible
-			         matches (QuerySelector "[tabindex='auto']") to pick the default-focus row on open.
-			         RmlUi itself ignores this attribute. -->
-			<pane id="pane">
+			<!-- One <pane> per tab; SohRmlUi shows only the active tab's pane and moves the
+			     `selected`/`active` classes. Each focusable row is a <select-button> with a <key>
+			     (label) + <value>; both `tab-index: auto` (RCSS, drives Tab nav) and the
+			     `tabindex="auto"` attribute (SetVisible's default-focus marker) are required. -->
+			<pane class="active">
 				<div class="section-heading">General</div>
 				<select-button tabindex="auto"><key>Controller Navigation</key><value>On</value></select-button>
 				<select-button tabindex="auto"><key>Cursor Always Visible</key><value>Off</value></select-button>
-				<select-button tabindex="auto"><key>Menu Background Opacity</key><value>90%</value></select-button>
 				<select-button tabindex="auto"><key>Language</key><value>English</value></select-button>
-
-				<div class="section-heading spaced">Graphics</div>
+				<p class="hint">&#8596; switch tab &middot; &#8597; move &middot; Enter / A select &middot; Esc / B close</p>
+			</pane>
+			<pane>
+				<div class="section-heading">Graphics</div>
 				<select-button tabindex="auto"><key>Renderer API</key><value>Vulkan</value></select-button>
 				<select-button tabindex="auto"><key>Internal Resolution</key><value>1x</value></select-button>
 				<select-button tabindex="auto"><key>Anti-aliasing (MSAA)</key><value>2x</value></select-button>
-				<select-button tabindex="auto"><key>Match Refresh Rate</key><value>On</value></select-button>
 				<select-button tabindex="auto"><key>Enable Vsync</key><value>On</value></select-button>
 				<select-button tabindex="auto"><key>Texture Filter</key><value>Three-Point</value></select-button>
-
-				<div class="section-heading spaced">Audio</div>
+			</pane>
+			<pane>
+				<div class="section-heading">Audio</div>
 				<select-button tabindex="auto"><key>Master Volume</key><value>100%</value></select-button>
 				<select-button tabindex="auto"><key>Main Music Volume</key><value>75%</value></select-button>
 				<select-button tabindex="auto"><key>Sound Effects Volume</key><value>100%</value></select-button>
-				<select-button tabindex="auto"><key>Audio API</key><value>SDL</value></select-button>
-
-				<p class="hint">&#8597; move &middot; &#8596; switch tab &middot; Enter / A select &middot; Esc / B close</p>
+			</pane>
+			<pane>
+				<div class="section-heading">About</div>
+				<p>Ship of Harkinian &mdash; rendering Ocarina of Time 3D assets.</p>
+				<p class="hint">RmlUi menu over the Vulkan renderer.</p>
 			</pane>
 		</content>
 	</window>

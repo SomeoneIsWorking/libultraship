@@ -88,8 +88,16 @@ class SohRmlUi {
     void FocusPrev();
     // Activate (click) the currently focused element, mirroring a controller "A"/Enter press.
     void ActivateFocused();
+    // Switch the visible tab: show its <pane>, move the `selected`/`active` classes, and focus the
+    // first row of the new pane. SetActiveTab wraps around; NextTab/PrevTab step by ±1.
+    void SetActiveTab(int index);
+    void NextTab();
+    void PrevTab();
+    // Focus the first focusable row of the active pane (default focus on open / after a tab switch).
+    void FocusFirstInActivePane();
 
   private:
+    int mActiveTab = 0;
     bool mInitialised = false;
     bool mVisible = false;
     bool mVulkan = false;

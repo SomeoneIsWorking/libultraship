@@ -94,13 +94,18 @@ content {
 	overflow: hidden;
 }
 
+/* One pane per tab; only the active tab's pane is shown (SohRmlUi toggles the `active` class). */
 pane {
-	display: block;
+	display: none;
 	flex: 1 1 0;
 	min-height: 0;
 	padding: 24px;
 	font-size: 20px;
 	overflow-y: auto;
+}
+
+pane.active {
+	display: block;
 }
 
 .section-heading {

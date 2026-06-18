@@ -375,7 +375,8 @@ void Fast3dGui::RmlMenuInjectKey(int sdlKeycode) {
 // C bridge for the SoH3D REPL (`menu <action>`): resolve the active Fast3dGui and inject the key
 // that drives the requested navigation. The action codes (kept SDL-free for the C caller in
 // soh3d.c) match SoH3D_RmlMenuAction in tools/soh3d_repl.py:
-//   0 next (Down)  1 prev (Up)  2 activate (Enter)  3 close (Esc)  4 toggle (Esc)
+//   0 next-row (Down)  1 prev-row (Up)  2 activate (Enter)  3 close (Esc)
+//   4 next-tab (Right)  5 prev-tab (Left)
 extern "C" void SoH3D_RmlMenuKey(int action) {
     auto ctx = Ship::Context::GetRawInstance();
     if (!ctx || !ctx->GetWindow()) {
@@ -396,8 +397,14 @@ extern "C" void SoH3D_RmlMenuKey(int action) {
         case 2:
             keycode = SDLK_RETURN;
             break;
+        case 4:
+            keycode = SDLK_RIGHT;
+            break;
+        case 5:
+            keycode = SDLK_LEFT;
+            break;
         default:
-            keycode = SDLK_ESCAPE; // 3 (close) and 4 (toggle) both ride the Esc toggle binding
+            keycode = SDLK_ESCAPE; // 3 (close) rides the Esc toggle binding
             break;
     }
     gui->RmlMenuInjectKey(keycode);
