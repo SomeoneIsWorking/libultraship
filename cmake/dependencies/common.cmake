@@ -35,6 +35,35 @@ target_sources(ImGui
 
 target_include_directories(ImGui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends PRIVATE ${SDL2_INCLUDE_DIRS})
 
+#=================== RmlUi ===================
+# RmlUi provides the HTML/CSS-driven menu (Dusklight-style port). It needs a font
+# engine; the default is FreeType, located via find_package(Freetype) -> the
+# Freetype::Freetype target. On Linux/macOS we rely on the system FreeType
+# (present here as freetype2). Windows/other platforms will need FreeType vendored
+# before RmlUi can configure there -- deferred until the GL/Linux path lands.
+#
+# RmlUi defaults to a shared library (BUILD_SHARED_LIBS ON) and builds samples;
+# force a static lib (single-binary deploy like the rest of libultraship's deps)
+# and disable samples. We pull only Core + Debugger; the GL3/SDL backend sources
+# under ${rmlui_SOURCE_DIR}/Backends are compiled into our own integration layer
+# rather than by RmlUi itself.
+set(RMLUI_SAMPLES OFF)
+set(RMLUI_FONT_ENGINE "freetype")
+set(RMLUI_LUA_BINDINGS OFF)
+# Force RmlUi's sub-targets static regardless of the parent's BUILD_SHARED_LIBS.
+set(rmlui_saved_build_shared_libs "${BUILD_SHARED_LIBS}")
+set(BUILD_SHARED_LIBS OFF)
+
+FetchContent_Declare(
+    RmlUi
+    GIT_REPOSITORY https://github.com/mikke89/RmlUi.git
+    GIT_TAG 6.2
+)
+FetchContent_MakeAvailable(RmlUi)
+
+set(BUILD_SHARED_LIBS "${rmlui_saved_build_shared_libs}")
+list(APPEND ADDITIONAL_LIB_INCLUDES ${rmlui_SOURCE_DIR}/Include)
+
 # ========= StormLib =============
 if(INCLUDE_MPQ_SUPPORT)
     set(stormlib_patch_file ${CMAKE_CURRENT_SOURCE_DIR}/cmake/dependencies/patches/stormlib-optimizations.patch)

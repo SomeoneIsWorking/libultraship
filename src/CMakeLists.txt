@@ -83,6 +83,8 @@ target_link_libraries(libultraship
     PUBLIC ImGui
 )
 
+target_link_libraries(libultraship PUBLIC RmlUi::RmlUi)
+
 target_link_libraries(libultraship PRIVATE stb)
 
 if (GFX_DEBUG_DISASSEMBLER)
