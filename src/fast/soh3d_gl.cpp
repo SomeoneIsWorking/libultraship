@@ -5,6 +5,7 @@
 #ifdef ENABLE_VULKAN
 #include "fast/soh3d_vk.h" // dispatch the GPU pass to Vulkan when that backend is live
 #endif
+#include "libultraship/bridge/consolevariablebridge.h" // CVar-backed shadow/AO/lighting toggles
 
 // Match the GL headers the OpenGL backend uses (see gfx_opengl.h).
 #ifdef _MSC_VER
@@ -579,7 +580,7 @@ void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int inve
     glUniformMatrix4fv(g_uMP, 1, GL_FALSE, mp); // row-major matches GLSL col-major load (header math)
     // Modelview (no projection, no aspect squeeze) -> view-space normal for the lighting term.
     // Global gate (REPL `light 0|1` / env SOH3D_LIGHT, default on) to A/B or disable the form term.
-    if (gSoH3dLightEnable < 0) { const char* e = getenv("SOH3D_LIGHT"); gSoH3dLightEnable = (e && e[0] == '0') ? 0 : 1; }
+    if (gSoH3dLightEnable < 0) { const char* e = getenv("SOH3D_LIGHT"); gSoH3dLightEnable = CVarGetInteger("gSoH3d.Lighting", (e && e[0] == '0') ? 0 : 1); }
     glUniformMatrix4fv(g_uMV, 1, GL_FALSE, mv16);
     glUniform1f(g_uLit, (lit && gSoH3dLightEnable) ? 1.0f : 0.0f);
     glUniform1f(g_uInvertY, invertY ? -1.0f : 1.0f);
@@ -1075,7 +1076,7 @@ extern "C" void SoH3D_GL_RenderPass(void) {
     // light into the shadow map, bind it on unit 1, and enable sampling for the main draws. ---
     if (gSoH3dShadowEnable < 0) {
         const char* e = getenv("SOH3D_SHADOW");
-        gSoH3dShadowEnable = (e && e[0] == '0') ? 0 : 1;
+        gSoH3dShadowEnable = CVarGetInteger("gSoH3d.Shadows", (e && e[0] == '0') ? 0 : 1);
     }
     if (gSoH3dShadowEnable && gSoH3dShadowHasFocus && ensureShadowFbo()) {
         GLint gameFbo = 0, vp[4] = { 0, 0, 0, 0 };
@@ -1121,7 +1122,7 @@ extern "C" void SoH3D_GL_RenderPass(void) {
     // SoH3D content, multiplied onto the scene colour. Darkens only OoT3D pixels. ---
     if (gSoH3dAoEnable < 0) {
         const char* e = getenv("SOH3D_AO");
-        gSoH3dAoEnable = (e && e[0] == '0') ? 0 : 1;
+        gSoH3dAoEnable = CVarGetInteger("gSoH3d.AO", (e && e[0] == '0') ? 0 : 1);
     }
     if (gSoH3dAoEnable) {
         GLint gameFbo = 0, vp[4] = { 0, 0, 0, 0 };

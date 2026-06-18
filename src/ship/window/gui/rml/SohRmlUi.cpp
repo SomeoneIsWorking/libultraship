@@ -14,8 +14,18 @@
 
 #include "ship/Context.h"
 #include "ship/controller/controldeck/ControlDeck.h"
+#include "libultraship/bridge/consolevariablebridge.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
+
+// SoH3D render toggles live as extern "C" ints in libultraship's soh3d_gl.cpp (the live state the
+// GL pass reads each frame). The RML rows flip these directly for an immediate, visible effect and
+// persist the choice to a CVar (which the GL pass also reads to seed the global at first use).
+extern "C" {
+extern int gSoH3dShadowEnable;
+extern int gSoH3dAoEnable;
+extern int gSoH3dLightEnable;
+}
 
 // Unique id for blocking game input while the RML menu is open (sequence continues the existing
 // *_BLOCK_ID constants in gfx_dxgi.cpp / InputEditorWindow.cpp). Without this, SoH polls the
@@ -23,6 +33,37 @@
 #define SOH3D_RML_MENU_BLOCK_ID 95237931
 
 namespace Ship {
+
+// Curated toggle rows: an RML row carrying `toggle="<id>"` maps to one render feature. Each entry
+// names the persisted CVar and the live extern global the GL pass reads; the menu keeps both in sync.
+struct ToggleSpec {
+    const char* id;
+    const char* cvar;
+    int* live;
+};
+static const ToggleSpec kToggles[] = {
+    { "shadows", "gSoH3d.Shadows", &gSoH3dShadowEnable },
+    { "ao", "gSoH3d.AO", &gSoH3dAoEnable },
+    { "lighting", "gSoH3d.Lighting", &gSoH3dLightEnable },
+};
+static const ToggleSpec* FindToggle(const Rml::String& id) {
+    for (const auto& t : kToggles) {
+        if (id == t.id) {
+            return &t;
+        }
+    }
+    return nullptr;
+}
+// Current on/off state for a toggle: prefer the live global (reflects REPL changes); when it is
+// still uninitialised (-1, before the first GL frame) fall back to the persisted CVar.
+static bool ToggleState(const ToggleSpec& t) {
+    return *t.live >= 0 ? *t.live != 0 : CVarGetInteger(t.cvar, 1) != 0;
+}
+static void SetToggleValueText(Rml::Element* row, bool on) {
+    if (Rml::Element* val = row->QuerySelector("value")) {
+        val->SetInnerRML(on ? "On" : "Off");
+    }
+}
 
 // RmlUi runtime is process-global (Rml::Initialise / Rml::Shutdown). Track init so a second
 // SohRmlUi (e.g. after a backend switch) does not double-initialise the library.
@@ -175,11 +216,50 @@ void SohRmlUi::ActivateFocused() {
     // If the focused element is a container row (the whole row takes focus for a clear highlight),
     // toggle the control it wraps; otherwise activate the focused element directly. This lets a
     // controller "A"/Enter flip a checkbox while focus rests on the readable row, not the tiny box.
+    // Curated CVar toggle rows take priority: flip the feature in place rather than "clicking" a row.
+    if (ToggleFocusedRow()) {
+        return;
+    }
     if (Rml::Element* control = focus->QuerySelector("input, select, button")) {
         control->Click();
     } else {
         focus->Click();
     }
+}
+
+void SohRmlUi::RefreshToggleRows() {
+    if (!mDocument) {
+        return;
+    }
+    Rml::ElementList rows;
+    mDocument->GetElementsByTagName(rows, "select-button");
+    for (Rml::Element* row : rows) {
+        const Rml::String id = row->GetAttribute<Rml::String>("toggle", "");
+        if (const ToggleSpec* t = id.empty() ? nullptr : FindToggle(id)) {
+            SetToggleValueText(row, ToggleState(*t));
+        }
+    }
+}
+
+bool SohRmlUi::ToggleFocusedRow() {
+    if (!mContext) {
+        return false;
+    }
+    Rml::Element* focus = mContext->GetFocusElement();
+    if (!focus) {
+        return false;
+    }
+    const Rml::String id = focus->GetAttribute<Rml::String>("toggle", "");
+    const ToggleSpec* t = id.empty() ? nullptr : FindToggle(id);
+    if (!t) {
+        return false;
+    }
+    const bool next = !ToggleState(*t);
+    *t->live = next ? 1 : 0;            // immediate effect (GL pass reads this next frame)
+    CVarSetInteger(t->cvar, next ? 1 : 0); // persist the choice
+    CVarSave();
+    SetToggleValueText(focus, next);
+    return true;
 }
 
 void SohRmlUi::SetActiveTab(int index) {
@@ -206,7 +286,8 @@ void SohRmlUi::SetActiveTab(int index) {
     for (int i = 0; i < (int)panes.size(); i++) {
         panes[i]->SetClass("active", i == index);
     }
-    // Lay out with the new pane shown before focusing into it.
+    // Reflect each curated row's live CVar/feature state, then lay out and focus into the pane.
+    RefreshToggleRows();
     mContext->Update();
     FocusFirstInActivePane();
 }

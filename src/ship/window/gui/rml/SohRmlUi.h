@@ -95,6 +95,10 @@ class SohRmlUi {
     void PrevTab();
     // Focus the first focusable row of the active pane (default focus on open / after a tab switch).
     void FocusFirstInActivePane();
+    // Curated CVar toggle rows: reflect each `toggle="<id>"` row's live value into its <value> text
+    // (called on open / tab switch), and flip+persist the focused row's CVar (called on activate).
+    void RefreshToggleRows();
+    bool ToggleFocusedRow();
 
   private:
     int mActiveTab = 0;
