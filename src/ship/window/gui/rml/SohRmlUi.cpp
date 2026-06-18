@@ -28,6 +28,11 @@ extern int gSoH3dAoEnable;
 extern int gSoH3dLightEnable;
 }
 
+// Debug-menu warp request: a row with `warp="<entrance>"` sets this to the target entrance index;
+// soh3d.c's per-frame SoH3D_ReplPoll consumes it (it has the PlayState) and triggers the scene
+// transition. -1 = nothing pending. Defined here (libultraship) so soh can extern-reference it.
+extern "C" int gSoH3dMenuWarp = -1;
+
 // Unique id for blocking game input while the RML menu is open (sequence continues the existing
 // *_BLOCK_ID constants in gfx_dxgi.cpp / InputEditorWindow.cpp). Without this, SoH polls the
 // controller/keyboard directly and the game keeps responding under the open menu.
@@ -233,6 +238,13 @@ void SohRmlUi::ActivateFocused() {
     // If the focused element is a container row (the whole row takes focus for a clear highlight),
     // toggle the control it wraps; otherwise activate the focused element directly. This lets a
     // controller "A"/Enter flip a checkbox while focus rests on the readable row, not the tiny box.
+    // Debug warp rows: `warp="<entrance>"` requests a scene transition (level select / boss fight).
+    const Rml::String warp = focus->GetAttribute<Rml::String>("warp", "");
+    if (!warp.empty()) {
+        gSoH3dMenuWarp = std::atoi(warp.c_str());
+        SetVisible(false); // close the menu so the transition is visible
+        return;
+    }
     // Curated CVar toggle rows take priority: flip the feature in place rather than "clicking" a row.
     if (ToggleFocusedRow()) {
         return;
