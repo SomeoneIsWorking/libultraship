@@ -47,6 +47,7 @@ typedef struct SoH3DGlGroup {
     int depthWrite;           // 0/1 (translucent volumes disable depth write)
     float polygonOffset;      // window-depth bias for decals (gl_FragDepth += this); 0 = none
     int cull;                 // 1 = skip this group entirely (e.g. Link baked-equipment mesh hidden)
+    int meshId;               // CMB mesh_id of this group (visibility-switch key; -1 = none)
 } SoH3DGlGroup;
 
 // One decoded texture (RGBA8, w*h*4 bytes, row 0 = top).
@@ -114,6 +115,12 @@ void SoH3D_GL_SetLightDir(const float dirWorld[3]);
 // SOH3D_GL_MAX_BONES. Passing n==0 resets to the bind pose (identity). Cheap — just
 // stores the matrices; call once per game frame after computing the animated pose.
 void SoH3D_GL_SetBones(int modelId, const float* mats16, int n);
+
+// Set the per-frame mesh_id visibility mask for a model (bit i = mesh_id i visible). Groups whose
+// CMB mesh_id is clear in the mask are skipped at draw; mesh_id < 0 or >= 64 are always drawn.
+// The player path calls this each frame (before its EmitPose) to select Link's live equipment /
+// hand-pose variant subset from the all-variants childlink_v2 mesh. ~0 = show everything (default).
+void SoH3D_GL_SetMidMask(int modelId, unsigned long long mask);
 
 #ifdef __cplusplus
 }

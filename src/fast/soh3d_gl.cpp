@@ -41,6 +41,7 @@ struct GlGroup {
     int depthWrite = 1;
     float polygonOffset = 0.0f; // window-depth bias for decals (gl_FragDepth += this)
     int cull = 0;               // 1 = skip (hidden group, e.g. Link baked equipment)
+    int meshId = -1;            // CMB mesh_id (per-frame visibility-switch key; -1 = always shown)
 };
 
 struct GlModel {
@@ -51,6 +52,10 @@ struct GlModel {
     std::vector<GLuint> textures;
     std::vector<float> bones;  // flat row-major 16*boneCount; empty = bind pose (identity)
     int boneCount = 0;
+    // Per-frame mesh_id visibility mask the player path sets (SoH3D_GL_SetMidMask) before EMIT;
+    // bit i = mesh_id i visible. Snapshotted per emit into ItemPose so it survives the deferred
+    // render (like bones). ~0 = all visible (default; non-Link models never set it). See drawOne.
+    uint64_t pendingMidMask = ~0ull;
 };
 
 std::unordered_map<int, GlModel> g_models; // keyed by stable model id
@@ -64,6 +69,7 @@ SoH3DModelProvider g_provider = nullptr;
 struct ItemPose {
     std::vector<float> bones;
     int boneCount = 0;
+    uint64_t midMask = ~0ull; // mesh_id visibility for this emit (see GlModel::pendingMidMask)
 };
 std::unordered_map<int, std::vector<ItemPose>> g_curPoses;  // this logic frame, per modelId
 std::unordered_map<int, std::vector<ItemPose>> g_prevPoses; // last logic frame, per modelId
@@ -254,6 +260,14 @@ extern "C" void SoH3D_GL_SetBones(int modelId, const float* mats16, int n) {
     m.boneCount = n;
 }
 
+// Set the per-frame mesh_id visibility mask for a model (bit i = mesh_id i visible). The player
+// path calls this each frame BEFORE its EmitPose, to select Link's live equipment/hand-pose
+// variant subset out of the all-variants childlink_v2 mesh. Snapshotted at EmitPose so it pairs
+// with the right deferred DrawItem. ~0 = all visible. No-op effect on models that never call it.
+extern "C" void SoH3D_GL_SetMidMask(int modelId, unsigned long long mask) {
+    g_models[modelId].pendingMidMask = mask;
+}
+
 extern "C" void SoH3D_GL_EmitPose(int modelId) {
     // Snapshot this actor's just-set pose at EMIT time (during dlist build, logic-frame rate) so it
     // survives later same-modelId SetBones calls. Appended in emit order; the k-th submit of this
@@ -261,9 +275,12 @@ extern "C" void SoH3D_GL_EmitPose(int modelId) {
     // the draw opcode. No bones set -> push an empty entry so emit/submit stay 1:1.
     ItemPose p;
     auto it = g_models.find(modelId);
-    if (it != g_models.end() && !it->second.bones.empty()) {
-        p.bones = it->second.bones;
-        p.boneCount = it->second.boneCount;
+    if (it != g_models.end()) {
+        if (!it->second.bones.empty()) {
+            p.bones = it->second.bones;
+            p.boneCount = it->second.boneCount;
+        }
+        p.midMask = it->second.pendingMidMask;
     }
     g_curPoses[modelId].push_back(std::move(p));
 }
@@ -290,6 +307,7 @@ static bool uploadModel(GlModel& m, const SoH3DGlGroup* groups, int groupCount, 
         g.depthWrite = groups[i].depthWrite;
         g.polygonOffset = groups[i].polygonOffset;
         g.cull = groups[i].cull;
+        g.meshId = groups[i].meshId;
         for (int k = 0; k < 4; k++) g.blendColor[k] = groups[i].blendColor[k];
         all.insert(all.end(), groups[i].verts, groups[i].verts + groups[i].vertCount);
         m.groups.push_back(g);
@@ -453,7 +471,8 @@ void endPass(const SavedGl& s) {
 // Draw one already-uploaded model with the given MP/invertY/tint, using the model's currently
 // set skinning pose. Assumes beginPass installed the common state and the VAO is g_vao.
 void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int invertY, unsigned char r,
-             unsigned char g, unsigned char b, float aspectAdj, const float* boneData, int boneCnt) {
+             unsigned char g, unsigned char b, float aspectAdj, const float* boneData, int boneCnt,
+             uint64_t midMask = ~0ull) {
     // Mirror Fast3D's per-vertex `x = AdjXForAspectRatio(x)` (interpreter.cpp): scale the
     // clip-space X output of MP by the factor the N64 actors get (MP column 0 = row-major
     // indices 0,4,8,12). Without it the OoT3D content shears vs N64 actors as the camera pans.
@@ -499,6 +518,9 @@ void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int inve
 
     for (const GlGroup& grp : m.groups) {
         if (grp.cull) continue; // hidden group (e.g. Link baked equipment, SOH3D_LINK_HIDEITEMS)
+        // Per-frame mesh_id visibility: skip groups whose mesh_id bit is clear in midMask (the
+        // player picks Link's live equipment/hand variant subset). mesh_id<0 or >=64 = always shown.
+        if (grp.meshId >= 0 && grp.meshId < 64 && !((midMask >> grp.meshId) & 1ull)) continue;
         glUniform1f(g_uAlphaRef, grp.alphaTest ? grp.alphaRef : 0.0f);
         glUniform1f(g_uDepthOffset, grp.polygonOffset);
         if (grp.blendEnable) {
@@ -531,6 +553,7 @@ struct DrawItem {
     std::vector<float> bones;     // this-frame skin pose (so same-modelId actors keep own poses)
     std::vector<float> prevBones; // same item's previous-frame pose (for FPS interpolation); may be empty
     int boneCount = 0;
+    uint64_t midMask = ~0ull;     // mesh_id visibility for this draw (see GlModel::pendingMidMask)
 };
 std::vector<DrawItem> g_drawList;
 
@@ -576,6 +599,7 @@ extern "C" void SoH3D_GL_Submit(int modelId, const float* mp16, const float* mv1
     for (const DrawItem& d : g_drawList)
         if (d.modelId == modelId) k++;
     auto cit = g_curPoses.find(modelId);
+    if (cit != g_curPoses.end() && k < cit->second.size()) it.midMask = cit->second[k].midMask;
     if (cit != g_curPoses.end() && k < cit->second.size() && !cit->second[k].bones.empty()) {
         it.bones = cit->second[k].bones;
         it.boneCount = cit->second[k].boneCount;
@@ -629,7 +653,8 @@ extern "C" void SoH3D_GL_RenderPass(void) {
             for (size_t i = 0; i < it.bones.size(); i++) lerped[i] = w * it.prevBones[i] + step * it.bones[i];
             pose = lerped.data();
         }
-        drawOne(*m, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.aspectAdj, pose, it.boneCount);
+        drawOne(*m, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.aspectAdj, pose, it.boneCount,
+                it.midMask);
         drawn++;
     }
     endPass(s);
