@@ -2119,8 +2119,23 @@ int GfxRenderingAPIVulkan::GetMaxTextureSize() {
                                                            : 4096;
 }
 GfxClipParameters GfxRenderingAPIVulkan::GetClipParameters() {
-    // Vulkan clip space: z in [0,1], Y points down (invert).
-    return { true, true };
+    // Vulkan clip space: z in [0,1] (z_is_from_0_to_1 = true), and +Y points DOWN (opposite of
+    // OpenGL's +Y up). The interpreter negates vertex Y and shifts the viewport/scissor origin
+    // when invertY is set (see SetVertices / AdjustVIewportOrScissor), so the value must be chosen
+    // per the CURRENTLY-BOUND framebuffer, exactly like the GL backend does
+    // (GfxRenderingAPIOGL::GetClipParameters returns the current fb's invertY).
+    //
+    // Framebuffer openglInvertY flags (set in Interpreter::UpdateFramebuffers): fb 0 (the window)
+    // = false; every render-to-texture framebuffer (mGameFb + the game's effect FBs, e.g. the
+    // title-screen 3D backdrop and the pause/inventory capture) = true. Because Vulkan's Y is
+    // already flipped vs GL, we return the INVERSE of that flag: fb 0 -> true (negate Y so the
+    // window image is upright after the present blit, which does not flip), and sampled FBs ->
+    // false (don't double-flip, so they read back upright when sampled as a texture).
+    //
+    // The old code hardcoded {true, true}: correct for fb 0 only, which is why the main scene was
+    // fine but every framebuffer-sampled image (title backdrop, inventory) rendered upside down.
+    int fb = (mCurrentFb >= 0 && mCurrentFb < (int)mFramebuffers.size()) ? mCurrentFb : 0;
+    return { true, !mFramebuffers[fb].invertY };
 }
 uint32_t GfxRenderingAPIVulkan::NewTexture() {
     uint32_t id = mNextTextureId++;
