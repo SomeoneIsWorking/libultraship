@@ -89,8 +89,11 @@ void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsigned char r,
 // modelId) is used at RenderPass time, as with the inline path.
 // sky=1 marks the skybox dome: pinned to the far plane in the shader (no occlusion / no far-clip),
 // excluded from shadow casting and AO. Its model is loaded with depth-write off (see soh3d_model.cpp).
+// uvOffU/uvOffV = per-draw texcoord scroll offset (fractional UV; 0 = none) — animates the OoT3D
+// sky cloud band per its BlueSky.zar .cmab rate (#28b); 0 for every other draw.
 void SoH3D_GL_Submit(int modelId, const float* mp16, const float* mv16, int lit, int invertY, unsigned char r,
-                     unsigned char g, unsigned char b, unsigned char a, float aspectAdj, int sky);
+                     unsigned char g, unsigned char b, unsigned char a, float aspectAdj, int sky,
+                     float uvOffU, float uvOffV);
 // RenderPass: draw every submitted item in one bracketed pass, then clear the list. Called
 // from the OTR_G_SOH3D_RENDERPASS opcode, emitted once per frame after the actor draw-all
 // (so our content composites after Fast3D's opaque 3D, before the 2D/UI pass).

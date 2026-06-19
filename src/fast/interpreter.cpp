@@ -4336,8 +4336,13 @@ bool gfx_soh3d_draw_handler_custom(F3DGfx** cmd0) {
     int sky = (handle >> 30) & 1;      // bit 30 = skybox dome (far-plane depth, no shadow/AO)
     int modelId = handle & 0x3FFFFFFF; // low 30 bits = model id (small)
     uint8_t a = (uint8_t)((w1 >> 32) & 0xFF); // w1[32:40] = per-draw alpha (255 = opaque)
-    uint32_t tint = (uint32_t)(cmd->words.w0 & 0xFFFFFF);
+    uint64_t w0 = (uint64_t)cmd->words.w0;
+    uint32_t tint = (uint32_t)(w0 & 0xFFFFFF);
     uint8_t r = (tint >> 16) & 0xFF, g = (tint >> 8) & 0xFF, b = tint & 0xFF;
+    // w0[32:48]=U, w0[48:64]=V: per-draw texcoord scroll offset, 16-bit fixed (value/65536 = UV).
+    // Animates the OoT3D sky cloud band per its .cmab rate (#28b); 0 for every other draw.
+    float uvOffU = (float)((w0 >> 32) & 0xFFFF) / 65536.0f;
+    float uvOffV = (float)((w0 >> 48) & 0xFFFF) / 65536.0f;
     bool invertY = gfx->mRapi->GetClipParameters().invertY;
     // N64 vertices get `x = AdjXForAspectRatio(x)` per-vertex (see gfx_sp_vertex); our draw must
     // apply the SAME clip-X scale or the OoT3D scene shears vs the N64 actors as the camera pans.
@@ -4345,7 +4350,8 @@ bool gfx_soh3d_draw_handler_custom(F3DGfx** cmd0) {
     // Modelview (no projection) for the view-space normal: top of the current modelview stack, the
     // same matrix MP_matrix was built from (gSPMatrix LOAD set it just before this opcode).
     const float* mv = &gfx->mRsp->modelview_matrix_stack[gfx->mRsp->modelview_matrix_stack_size - 1][0][0];
-    SoH3D_GL_Submit(modelId, &gfx->mRsp->MP_matrix[0][0], mv, lit, invertY ? 1 : 0, r, g, b, a, aspectAdj, sky);
+    SoH3D_GL_Submit(modelId, &gfx->mRsp->MP_matrix[0][0], mv, lit, invertY ? 1 : 0, r, g, b, a, aspectAdj, sky,
+                    uvOffU, uvOffV);
     return false;
 }
 

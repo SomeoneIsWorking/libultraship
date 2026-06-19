@@ -2773,19 +2773,25 @@ typedef union Gfx {
         _g1->words.w1 = (uintptr_t)replc;                \
     }
 
-// SoH3D direct-GL model draw: handle in w1[0:32], flat tint RGB packed in w0[0:24], and a per-draw
-// alpha in w1[32:40] (255 = opaque). The alpha rides the upper 32 bits of the 64-bit w1 so it never
-// disturbs the 32-bit handle (model id + lit bit31 + sky bit30) the interpreter already decodes.
-// (64-bit native port: uintptr_t is 64-bit; the alpha byte is only meaningful there.)
-#define gSPSoH3DDrawA(pkt, handle, alpha, tintR, tintG, tintB)                                    \
+// SoH3D direct-GL model draw: handle in w1[0:32], flat tint RGB packed in w0[0:24], a per-draw
+// alpha in w1[32:40] (255 = opaque), and a per-draw texcoord SCROLL offset in w0[32:48]=U,
+// w0[48:64]=V (16-bit fixed: value/65536 = fractional UV, 0 = none). The alpha rides the upper 32
+// bits of the 64-bit w1 and the UV offset the upper 32 bits of w0, so neither disturbs the 32-bit
+// handle (model id + lit bit31 + sky bit30) nor the 24-bit tint the interpreter already decodes.
+// (64-bit native port: uintptr_t is 64-bit; the alpha/UV bytes are only meaningful there.) The UV
+// offset animates the OoT3D sky cloud band (kumo) per its BlueSky.zar .cmab scroll rate — #28b.
+#define gSPSoH3DDrawUV(pkt, handle, alpha, uvU, uvV, tintR, tintG, tintB)                         \
     {                                                                                             \
         Gfx* _g = (Gfx*)(pkt);                                                                    \
-        _g->words.w0 = _SHIFTL(G_SOH3D_DRAW, 24, 8) |                                             \
-                       _SHIFTL(((tintR) & 0xFF) << 16 | ((tintG) & 0xFF) << 8 | ((tintB) & 0xFF), 0, 24); \
+        _g->words.w0 = (uintptr_t)((uint64_t)(_SHIFTL(G_SOH3D_DRAW, 24, 8) |                      \
+                       _SHIFTL(((tintR) & 0xFF) << 16 | ((tintG) & 0xFF) << 8 | ((tintB) & 0xFF), 0, 24)) | \
+                       ((uint64_t)((uvU) & 0xFFFF) << 32) | ((uint64_t)((uvV) & 0xFFFF) << 48));  \
         _g->words.w1 = (uintptr_t)(((uint64_t)(uint32_t)(uintptr_t)(handle)) |                    \
                                    ((uint64_t)((alpha) & 0xFF) << 32));                           \
     }
-// Opaque convenience wrapper (alpha = 255), preserving every existing call site verbatim.
+// Alpha wrapper (no UV scroll); and opaque wrapper (alpha = 255) — both preserve existing call sites.
+#define gSPSoH3DDrawA(pkt, handle, alpha, tintR, tintG, tintB)                                    \
+    gSPSoH3DDrawUV(pkt, handle, alpha, 0, 0, tintR, tintG, tintB)
 #define gSPSoH3DDraw(pkt, handle, tintR, tintG, tintB) gSPSoH3DDrawA(pkt, handle, 255, tintR, tintG, tintB)
 
 // SoH3D auto-scale measure bracket: key in w1, phase in w0[0] (1=begin, 0=end).

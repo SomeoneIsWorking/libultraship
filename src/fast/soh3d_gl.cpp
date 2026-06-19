@@ -248,6 +248,7 @@ GLuint g_vao = 0;
 GLint g_locPos = -1, g_locNrm = -1, g_locUv = -1, g_locBoneId = -1, g_locBoneW = -1;
 GLint g_uMP = -1, g_uInvertY = -1, g_uTint = -1, g_uAlphaRef = -1, g_uTex = -1, g_uBones = -1, g_uSkin = -1;
 GLint g_uAlpha = -1;
+GLint g_uUVOffset = -1;
 GLint g_uSky = -1;
 GLuint g_whiteTex = 0; // 1x1 white, bound for untextured groups (e.g. the vertex-coloured sky dome)
 GLint g_uDepthOffset = -1, g_uMV = -1, g_uLit = -1, g_uLightDir = -1;
@@ -277,6 +278,7 @@ const char* kVert =
     "in vec3 aPos; in vec3 aNrm; in vec2 aUv; in vec4 aBoneId; in vec4 aBoneW; in vec4 aColor;\n"
     "uniform mat4 uMP; uniform mat4 uMV; uniform float uInvertY; uniform mat4 uBones[32]; uniform float uSkin;\n"
     "uniform float uSky;\n" // 1 = skybox dome: force clip z to the far plane (z=w) so it sits behind everything
+    "uniform vec2 uUVOffset;\n" // per-draw texcoord scroll (cloud-band drift, #28b); 0 = none
 
     "out vec2 vUv; out vec4 vColor; out vec3 vNrmView; out vec3 vWorld;\n"
     "void main(){\n"
@@ -314,7 +316,7 @@ const char* kVert =
     // World-space surface position (uMV is model->world; see above). Needed by the fragment
     // shadow term to project into the sun's light-space and sample the shadow map.
     "  vWorld = (uMV * vec4(sp.xyz, 1.0)).xyz;\n"
-    "  vUv = vec2(aUv.x, 1.0 - aUv.y);\n" // PICA/CMB UVs are top-origin; GL samples bottom-origin
+    "  vUv = vec2(aUv.x + uUVOffset.x, 1.0 - aUv.y + uUVOffset.y);\n" // PICA/CMB UVs top-origin; GL bottom-origin; + cloud drift
     "}\n";
 
 const char* kFrag =
@@ -426,6 +428,7 @@ bool ensureProgram() {
     g_uTint = glGetUniformLocation(p, "uTint");
     g_uAlphaRef = glGetUniformLocation(p, "uAlphaRef");
     g_uAlpha = glGetUniformLocation(p, "uAlpha");
+    g_uUVOffset = glGetUniformLocation(p, "uUVOffset");
     g_uTex = glGetUniformLocation(p, "uTex");
     g_uBones = glGetUniformLocation(p, "uBones");
     g_uSkin = glGetUniformLocation(p, "uSkin");
@@ -760,7 +763,7 @@ void endPass(const SavedGl& s) {
 // set skinning pose. Assumes beginPass installed the common state and the VAO is g_vao.
 void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int invertY, unsigned char r,
              unsigned char g, unsigned char b, unsigned char a, float aspectAdj, const float* boneData, int boneCnt,
-             uint64_t midMask = ~0ull, bool sky = false) {
+             uint64_t midMask = ~0ull, bool sky = false, float uvOffU = 0.0f, float uvOffV = 0.0f) {
     // Mirror Fast3D's per-vertex `x = AdjXForAspectRatio(x)` (interpreter.cpp): scale the
     // clip-space X output of MP by the factor the N64 actors get (MP column 0 = row-major
     // indices 0,4,8,12). Without it the OoT3D content shears vs N64 actors as the camera pans.
@@ -778,6 +781,7 @@ void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int inve
     glUniform1f(g_uLit, (lit && gSoH3dLightEnable) ? 1.0f : 0.0f);
     glUniform1f(g_uInvertY, invertY ? -1.0f : 1.0f);
     glUniform1f(g_uSky, sky ? 1.0f : 0.0f);
+    glUniform2f(g_uUVOffset, uvOffU, uvOffV); // cloud-band drift (#28b); 0 for every other draw
     glUniform3f(g_uTint, r / 255.0f, g / 255.0f, b / 255.0f);
     glUniform1f(g_uAlpha, a / 255.0f);
     bool forceBlend = (a < 255); // translucent draw -> alpha-blend over the framebuffer regardless
@@ -851,6 +855,7 @@ struct DrawItem {
     int invertY;
     unsigned char r, g, b;
     unsigned char a = 255; // per-draw opacity (255 = opaque); <255 cross-fades (e.g. dawn/dusk dome)
+    float uvOffU = 0.0f, uvOffV = 0.0f; // per-draw texcoord scroll (cloud-band drift, #28b); 0 = none
     float aspectAdj;
     std::vector<float> bones;     // this-frame skin pose (so same-modelId actors keep own poses)
     std::vector<float> prevBones; // same item's previous-frame pose (for FPS interpolation); may be empty
@@ -1138,7 +1143,7 @@ static void aoPass(GLint gameFbo, const GLint vp[4], float step) {
         // IDENTICAL transforms to the visible draw (it.mp, it.aspectAdj, it.invertY) -> pixel-aligned.
         // Sky goes to the far plane here too (uSky), so its texels read 1.0 and contribute no AO.
         drawOne(*m, it.mp, it.mv, /*lit=*/0, it.invertY, 255, 255, 255, 255, it.aspectAdj, pose, it.boneCount,
-                it.midMask, it.sky != 0);
+                it.midMask, it.sky != 0, it.uvOffU, it.uvOffV);
     }
     // (2) full-screen SSAO composite onto the scene FBO (dst *= ao).
     glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)gameFbo);
@@ -1175,7 +1180,8 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
         const float* pose = (mit != g_models.end() && !mit->second.bones.empty()) ? mit->second.bones.data() : nullptr;
         int bc = (mit != g_models.end()) ? mit->second.boneCount : 0;
         SoH3D_Vk_BeginPass();
-        SoH3D_Vk_DrawModel(modelId, mp16, mp16, /*lit=*/0, invertY, r, g, b, 255, aspectAdj, pose, bc, ~0ull, /*sky=*/0);
+        SoH3D_Vk_DrawModel(modelId, mp16, mp16, /*lit=*/0, invertY, r, g, b, 255, aspectAdj, pose, bc, ~0ull, /*sky=*/0,
+                           /*uvOffU=*/0.0f, /*uvOffV=*/0.0f);
         SoH3D_Vk_EndPass();
         return;
     }
@@ -1196,7 +1202,7 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
 
 extern "C" void SoH3D_GL_Submit(int modelId, const float* mp16, const float* mv16, int lit, int invertY,
                                 unsigned char r, unsigned char g, unsigned char b, unsigned char a, float aspectAdj,
-                                int sky) {
+                                int sky, float uvOffU, float uvOffV) {
     DrawItem it;
     it.modelId = modelId;
     memcpy(it.mp, mp16, sizeof(it.mp));
@@ -1208,6 +1214,8 @@ extern "C" void SoH3D_GL_Submit(int modelId, const float* mp16, const float* mv1
     it.g = g;
     it.b = b;
     it.a = a;
+    it.uvOffU = uvOffU;
+    it.uvOffV = uvOffV;
     it.aspectAdj = aspectAdj;
     // Per-item pose pairing. Submit runs at dlist INTERPRET time (and re-runs once per interpolation
     // subframe), by which point g_models[modelId].bones holds only the LAST actor's pose. So pair by
@@ -1264,7 +1272,7 @@ extern "C" void SoH3D_GL_RenderPass(void) {
                 pose = lerped.data();
             }
             SoH3D_Vk_DrawModel(it.modelId, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.a, it.aspectAdj,
-                               pose, it.boneCount, it.midMask, it.sky);
+                               pose, it.boneCount, it.midMask, it.sky, it.uvOffU, it.uvOffV);
         }
         SoH3D_Vk_EndPass();
         g_drawList.clear();
@@ -1324,7 +1332,7 @@ extern "C" void SoH3D_GL_RenderPass(void) {
             pose = lerped.data();
         }
         drawOne(*m, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.a, it.aspectAdj, pose, it.boneCount,
-                it.midMask, it.sky != 0);
+                it.midMask, it.sky != 0, it.uvOffU, it.uvOffV);
         drawn++;
     }
 

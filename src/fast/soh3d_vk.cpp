@@ -79,7 +79,7 @@ layout(binding=0, std140) uniform UBO {
     vec4 uLightDir;  // xyz: world-space sun dir; w: 1 = skybox dome (pin to far plane)
     vec4 uParams;    // x=invertY(+1/-1) y=lit z=alphaRef w=depthOffset
     vec4 uTintSkin;  // xyz=tint w=skin(0/1)
-    vec4 uExtra;     // x=per-draw alpha (1=opaque)
+    vec4 uExtra;     // x=per-draw alpha (1=opaque) y=texcoord scroll U z=scroll V (cloud drift, #28b)
 } ubo;
 void main() {
     vColor = aColor;
@@ -105,7 +105,7 @@ void main() {
     // Vulkan (the bottom-left/top-left API difference is framebuffer-only, NOT texture data), so the
     // same 1-v flip GL uses is required here too. (Visible only on detailed texels - face/emblem -
     // not on near-uniform cloth, which is why it looked fine at first.)
-    vUv = vec2(aUv.x, 1.0 - aUv.y);
+    vUv = vec2(aUv.x + ubo.uExtra.y, 1.0 - aUv.y + ubo.uExtra.z); // + per-draw cloud-band drift (#28b)
 }
 )";
 
@@ -145,7 +145,7 @@ struct VkUbo {
     float uLightDir[4];
     float uParams[4];
     float uTintSkin[4];
-    float uExtra[4]; // x = per-draw alpha (1 = opaque)
+    float uExtra[4]; // x = per-draw alpha (1 = opaque); y/z = texcoord scroll U/V (cloud drift, #28b)
 };
 
 struct VkTex {
@@ -687,7 +687,7 @@ extern "C" void SoH3D_Vk_BeginPass(void) {
 extern "C" void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* mv16, int lit, int invertY,
                                    unsigned char r8, unsigned char g8, unsigned char b8, unsigned char a8,
                                    float aspectAdj, const float* boneData, int boneCnt,
-                                   unsigned long long midMask, int sky) {
+                                   unsigned long long midMask, int sky, float uvOffU, float uvOffV) {
     if (!g_ctxValid)
         return;
     VkModel* m = ensureUploaded(modelId);
@@ -735,6 +735,8 @@ extern "C" void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* 
     base.uLightDir[2] = gSoH3dLightDirWorld[2];
     base.uLightDir[3] = sky ? 1.0f : 0.0f; // skybox dome: pin to far plane in the vertex shader
     base.uExtra[0] = a8 / 255.0f;          // per-draw opacity (dawn/dusk dome cross-fade); 1 = opaque
+    base.uExtra[1] = uvOffU;               // texcoord scroll U (cloud-band drift, #28b); 0 = none
+    base.uExtra[2] = uvOffV;               // texcoord scroll V
     bool forceBlend = (a8 < 255);          // translucent draw -> alpha-over even if the material is opaque
 
     bool vboBound = false;
