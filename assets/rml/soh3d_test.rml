@@ -58,6 +58,8 @@
 				<select-button tabindex="auto" warp="264"><key>Zora's Domain</key><value>&#8594;</value></select-button>
 				<select-button tabindex="auto" warp="333"><key>Goron City</key><value>&#8594;</value></select-button>
 				<select-button tabindex="auto" warp="83"><key>Temple of Time</key><value>&#8594;</value></select-button>
+				<select-button tabindex="auto" warp="312"><key>Hyrule Castle Grounds</key><value>&#8594;</value></select-button>
+				<select-button tabindex="auto" warp="1024"><key>Castle Courtyard (Zelda)</key><value>&#8594;</value></select-button>
 				<div class="section-heading">Boss Fight</div>
 				<select-button tabindex="auto" warp="1039"><key>Gohma (Deku Tree)</key><value>&#9876;</value></select-button>
 				<select-button tabindex="auto" warp="1035"><key>King Dodongo</key><value>&#9876;</value></select-button>
