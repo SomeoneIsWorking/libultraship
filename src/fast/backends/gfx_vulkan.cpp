@@ -2778,15 +2778,16 @@ void GfxRenderingAPIVulkan::CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0,
     if (src.colorImage == VK_NULL_HANDLE || dst.colorImage == VK_NULL_HANDLE)
         return;
 
-    // Y handling mirrors gfx_opengl.cpp::CopyFramebuffer (GL's bottom-left origin).
-    if (!src.invertY) {
-        int temp = srcY1 - srcY0;
-        srcY1 = (int)src.height - srcY0;
-        srcY0 = srcY1 - temp;
-    }
-    if (src.invertY != dst.invertY) {
-        std::swap(srcY0, srcY1); // reversed offsets => vkCmdBlitImage flips vertically
-    }
+    // NO Y compensation, unlike gfx_opengl.cpp::CopyFramebuffer. That GL code flips Y to
+    // account for GL's bottom-left framebuffer origin; in Vulkan EVERY framebuffer color
+    // image is stored top-down upright (the present blit is a straight copy, and
+    // render-to-texture FBs rasterize upright via the GetClipParameters invertY inversion).
+    // So all FBs share one storage orientation and a straight image-space blit is correct.
+    // The old code mirrored the GL Y-flip verbatim, which injected a spurious vertical flip
+    // whenever src.invertY != dst.invertY -- e.g. capturing fb 0 (invertY=false) into the
+    // pause/inventory buffer (invertY=true), the #12 upside-down-pause-background bug.
+    // (Same root cause class the GetClipParameters comment already fixed: a GL flag/flip that
+    // must NOT be replicated for Vulkan.) The interpreter passes top-left rects directly.
 
     EndPassIfOpen();
     VkCommandBuffer cmd = mCommandBuffers[mCurrentFrame];
