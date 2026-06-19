@@ -48,6 +48,11 @@ extern "C" int gSoH3dMenuLinkMode = 0;
 // gSoH3dForceTime before the transition (so the new scene's Play_Init picks the right day/night set).
 extern "C" int gSoH3dMenuWarpTime = 0;
 
+// Generated stair step size, cycled by the `stairsize` row: 0 = Small, 1 = Medium, 2 = Large.
+// soh3d.c's SoH3D_ReplPoll maps it to a step rise (SoH3D_SetStairRiserY) and seeds it from the
+// current rise on the first frame.
+extern "C" int gSoH3dMenuStairSize = 1;
+
 // Unique id for blocking game input while the RML menu is open (sequence continues the existing
 // *_BLOCK_ID constants in gfx_dxgi.cpp / InputEditorWindow.cpp). Without this, SoH polls the
 // controller/keyboard directly and the game keeps responding under the open menu.
@@ -98,6 +103,7 @@ struct CycleSpec {
 static const CycleSpec kCycles[] = {
     { "linkmode", &gSoH3dMenuLinkMode, { "N64", "3DS \xC2\xB7 N64 anim", "3DS \xC2\xB7 3DS anim", nullptr }, 3 },
     { "warptime", &gSoH3dMenuWarpTime, { "Default", "Day", "Night", nullptr }, 3 },
+    { "stairsize", &gSoH3dMenuStairSize, { "Small", "Medium", "Large", nullptr }, 3 },
 };
 static const CycleSpec* FindCycle(const Rml::String& id) {
     for (const auto& c : kCycles) {

@@ -36,6 +36,10 @@ void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* mv16, int l
                         float uvOffU, float uvOffV);
 void SoH3D_Vk_EndPass(void);
 
+// Mirror of SoH3D_GL_RequestEvictRange for the Vulkan model store (the GL request forwards here):
+// drop cached uploads with id in [lo,hi) at the next BeginPass so they re-upload at the new size.
+void SoH3D_Vk_RequestEvictRange(int lo, int hi);
+
 #ifdef __cplusplus
 }
 #endif

@@ -659,6 +659,33 @@ static GlModel* ensureUploaded(int modelId) {
     return m.uploaded ? &m : nullptr;
 }
 
+// Deferred model-cache eviction. A caller on another thread (e.g. the RmlUi menu changing the
+// stair step size) requests a model-id RANGE to drop; we apply it on the render thread (GL
+// current) so the GPU objects are deleted safely and the next draw re-uploads via the provider
+// (which the model layer has already re-pointed at fresh CPU geometry). [lo,hi) is half-open.
+static int g_evictLo = 0, g_evictHi = 0;
+static bool g_evictPending = false;
+extern "C" void SoH3D_GL_RequestEvictRange(int lo, int hi) {
+    g_evictLo = lo; g_evictHi = hi; g_evictPending = true;
+    SoH3D_Vk_RequestEvictRange(lo, hi); // mirror to the Vulkan model store (whichever backend is live)
+}
+static void applyPendingEvict() {
+    if (!g_evictPending) return;
+    g_evictPending = false;
+    for (auto it = g_models.begin(); it != g_models.end();) {
+        if (it->first >= g_evictLo && it->first < g_evictHi) {
+            if (it->second.vbo) glDeleteBuffers(1, &it->second.vbo);
+            if (!it->second.textures.empty())
+                glDeleteTextures((GLsizei)it->second.textures.size(), it->second.textures.data());
+            g_curPoses.erase(it->first);
+            g_prevPoses.erase(it->first);
+            it = g_models.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 namespace {
 
 // Fast3D GL state we touch and must hand back exactly as it was (or as gfx_opengl assumes
@@ -1294,6 +1321,7 @@ extern "C" void SoH3D_GL_FrameBegin(void) {
 }
 
 extern "C" void SoH3D_GL_RenderPass(void) {
+    applyPendingEvict(); // render thread, GL current: safe to delete evicted models' GPU objects
     if (g_drawList.empty()) return;
 
 #ifdef ENABLE_VULKAN

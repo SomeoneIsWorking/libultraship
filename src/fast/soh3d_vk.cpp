@@ -689,6 +689,37 @@ extern "C" void SoH3D_Vk_SetProvider(SoH3DModelProvider fn) {
     g_provider = fn;
 }
 
+// Deferred model-cache eviction (mirror of the GL path). A request from another thread (the
+// RmlUi stair-size row) names a model-id range; we drop those uploads at BeginPass — before this
+// frame records any SoH3D draws — so the next draw re-uploads from the (already refreshed) CPU
+// model. A full vkDeviceWaitIdle makes the destroy safe; it only happens on a config change.
+static int g_evictLo = 0, g_evictHi = 0;
+static bool g_evictPending = false;
+extern "C" void SoH3D_Vk_RequestEvictRange(int lo, int hi) {
+    g_evictLo = lo; g_evictHi = hi; g_evictPending = true;
+}
+static void applyPendingEvict() {
+    if (!g_evictPending || g_device == VK_NULL_HANDLE)
+        return;
+    g_evictPending = false;
+    vkDeviceWaitIdle(g_device);
+    for (auto it = g_models.begin(); it != g_models.end();) {
+        if (it->first >= g_evictLo && it->first < g_evictHi) {
+            VkModel& m = it->second;
+            for (auto& t : m.textures) {
+                if (t.view) vkDestroyImageView(g_device, t.view, nullptr);
+                if (t.image) vkDestroyImage(g_device, t.image, nullptr);
+                if (t.mem) vkFreeMemory(g_device, t.mem, nullptr);
+            }
+            if (m.vbo) vkDestroyBuffer(g_device, m.vbo, nullptr);
+            if (m.vboMem) vkFreeMemory(g_device, m.vboMem, nullptr);
+            it = g_models.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 extern "C" void SoH3D_Vk_BeginPass(void) {
     g_ctxValid = false;
     if (!Fast::g_activeVulkanApi)
@@ -697,6 +728,7 @@ extern "C" void SoH3D_Vk_BeginPass(void) {
         return;
     if (!ensureResources(g_ctx))
         return;
+    applyPendingEvict(); // drop any models flagged for reload (e.g. stair size changed) before drawing
     g_ctxValid = true;
     // Reset this frame-in-flight's UBO ring + descriptor pool (the backend's in-flight fence,
     // waited at StartFrame, guarantees the previous use of this index has completed).

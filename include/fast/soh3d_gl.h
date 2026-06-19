@@ -106,6 +106,13 @@ void SoH3D_GL_RenderPass(void);
 // e.g. a scene transition early-out) so they can't leak into the next frame.
 void SoH3D_GL_FrameBegin(void);
 
+// Request that cached uploaded models with id in [lo,hi) be evicted (GPU objects deleted, entry
+// dropped) so the next draw re-uploads from the provider. Thread-safe to call from anywhere; the
+// deletion is deferred to the render thread (top of the next RenderPass). Used to apply a stair
+// step-size change live: the model layer drops the CPU scene-room models and calls this for the
+// scene-room id range.
+void SoH3D_GL_RequestEvictRange(int lo, int hi);
+
 // Snapshot the current pose (the bones last set via SoH3D_GL_SetBones) for this model id, tagged
 // for the next draw of that id. Call once per actor at EMIT time, right after SoH3D_GL_SetBones and
 // before the draw opcode is written. This is what lets two actors that share a model id render with

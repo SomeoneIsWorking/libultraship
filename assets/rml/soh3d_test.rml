@@ -34,6 +34,8 @@
 				<select-button tabindex="auto" toggle="lighting"><key>Scene Lighting</key><value>On</value></select-button>
 				<!-- Cycle row: 0 N64 model+anim / 1 3DS model + N64-retarget anim / 2 3DS model + 3DS anim. -->
 				<select-button tabindex="auto" cycle="linkmode"><key>Link Model / Anim</key><value>N64</value></select-button>
+				<!-- Generated stair step size: Small / Medium / Large (applies live to loaded scenes). -->
+				<select-button tabindex="auto" cycle="stairsize"><key>Stair Step Size</key><value>Medium</value></select-button>
 				<p class="hint">&#8596; switch tab &middot; &#8597; move &middot; Enter / A toggle &middot; Esc / B close</p>
 			</pane>
 			<pane>
