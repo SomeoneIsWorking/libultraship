@@ -33,6 +33,17 @@ using Fast::SoH3DVkContext;
 
 // World-space sun direction, owned by soh3d_gl.cpp (set per frame by soh3d.c). C linkage.
 extern "C" float gSoH3dLightDirWorld[3];
+// Backface culling (shared toggle with the GL backend; see soh3d_gl.cpp). -1 = resolve from
+// env SOH3D_FACECULL (default ON). gSoH3dFaceCullFlip flips the front-face winding convention.
+extern "C" int gSoH3dFaceCull;
+extern "C" int gSoH3dFaceCullFlip;
+static int vkFaceCullOn() {
+    if (gSoH3dFaceCull < 0) {
+        const char* e = getenv("SOH3D_FACECULL");
+        gSoH3dFaceCull = (e && e[0] == '0') ? 0 : 1; // default ON
+    }
+    return gSoH3dFaceCull;
+}
 
 namespace {
 
@@ -167,6 +178,7 @@ struct VkGroup {
     int depthWrite = 1;
     float polygonOffset = 0.0f;
     int cull = 0;
+    int faceCull = 0; // 1 = cull back face (CMB cull byte 1); 0 = double-sided
     int meshId = -1;
 };
 
@@ -481,8 +493,12 @@ bool ensureResources(const SoH3DVkContext& ctx) {
     return true;
 }
 
-VkPipeline getPipeline(const VkGroup& g) {
-    std::array<uint32_t, 7> key = { (uint32_t)((g.blendEnable ? 1u : 0u) | (g.depthWrite ? 2u : 0u)),
+VkPipeline getPipeline(const VkGroup& g, int frontCW) {
+    // Backface cull is baked into the pipeline (cullMode/frontFace are not dynamic here), so the
+    // cull intent + the winding (which flips with invertY, carried in frontCW) join the key.
+    bool doCull = g.faceCull && vkFaceCullOn();
+    std::array<uint32_t, 7> key = { (uint32_t)((g.blendEnable ? 1u : 0u) | (g.depthWrite ? 2u : 0u) |
+                                               (doCull ? 4u : 0u) | (doCull && frontCW ? 8u : 0u)),
                                     g.bSrcRGB, g.bDstRGB, g.bEqRGB, g.bSrcA, g.bDstA, g.bEqA };
     auto it = g_pipelines.find(key);
     if (it != g_pipelines.end())
@@ -529,8 +545,12 @@ VkPipeline getPipeline(const VkGroup& g) {
     rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rs.depthClampEnable = VK_TRUE; // device feature is on; matches the Fast3D backend
     rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode = VK_CULL_MODE_NONE; // the GL pass disables culling
-    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    // Honor the CMB material cull byte (1 = cull back). The asset winds front faces CCW from the
+    // geometric normal; the vertex shader negates clip.y when invertY, flipping window winding ->
+    // frontCW carries that (plus the gSoH3dFaceCullFlip convention toggle). Double-sided groups
+    // (faceCull 0 / cull disabled) keep VK_CULL_MODE_NONE.
+    rs.cullMode = doCull ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+    rs.frontFace = frontCW ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.0f;
 
     VkPipelineMultisampleStateCreateInfo ms{};
@@ -620,6 +640,7 @@ VkModel* ensureUploaded(int modelId) {
         g.depthWrite = groups[i].depthWrite;
         g.polygonOffset = groups[i].polygonOffset;
         g.cull = groups[i].cull;
+        g.faceCull = groups[i].faceCull;
         g.meshId = groups[i].meshId;
         for (int k = 0; k < 4; k++)
             g.blendColor[k] = groups[i].blendColor[k];
@@ -804,7 +825,10 @@ extern "C" void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* 
             gb.bSrcRGB = 0x0302; gb.bDstRGB = 0x0303; gb.bEqRGB = 0x8006; // SRC_ALPHA / 1-SRC_ALPHA / ADD
             gb.bSrcA = 0x0302;   gb.bDstA = 0x0303;   gb.bEqA = 0x8006;
         }
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, getPipeline(gb));
+        // Front-face winding flips with invertY (clip.y negated in the vertex shader); the flip
+        // toggle lets the correct convention be found live. See the GL backend's drawOne.
+        int frontCW = (invertY != 0) ^ (gSoH3dFaceCullFlip != 0);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, getPipeline(gb, frontCW));
         vkCmdSetViewport(cmd, 0, 1, &g_ctx.viewport);
         vkCmdSetScissor(cmd, 0, 1, &g_ctx.scissor);
         vkCmdSetBlendConstants(cmd, grp.blendColor);

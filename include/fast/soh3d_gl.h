@@ -47,6 +47,10 @@ typedef struct SoH3DGlGroup {
     int depthWrite;           // 0/1 (translucent volumes disable depth write)
     float polygonOffset;      // window-depth bias for decals (gl_FragDepth += this); 0 = none
     int cull;                 // 1 = skip this group entirely (e.g. Link baked-equipment mesh hidden)
+    // Backface culling, from the CMB material's cull byte (1 = single-sided/cull back,
+    // 3 = double-sided/no cull — the only two values OoT3D uses). faceCull 1 => cull the
+    // face opposite the geometric normal (matches N64 G_CULL_BACK); 0 => draw both sides.
+    int faceCull;             // 0 = no cull (double-sided), 1 = cull back face
     int meshId;               // CMB mesh_id of this group (visibility-switch key; -1 = none)
 } SoH3DGlGroup;
 

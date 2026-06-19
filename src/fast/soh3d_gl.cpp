@@ -46,6 +46,7 @@ struct GlGroup {
     int depthWrite = 1;
     float polygonOffset = 0.0f; // window-depth bias for decals (gl_FragDepth += this)
     int cull = 0;               // 1 = skip (hidden group, e.g. Link baked equipment)
+    int faceCull = 0;           // 1 = cull back face (CMB cull byte 1); 0 = double-sided
     int meshId = -1;            // CMB mesh_id (per-frame visibility-switch key; -1 = always shown)
 };
 
@@ -518,6 +519,28 @@ extern "C" float gSoH3dAoStrength = 0.7f;    // how dark fully-occluded fragment
 extern "C" float gSoH3dAoBias = 0.00040f;    // min depth delta to count an occluder (fights flat-surface noise)
 extern "C" float gSoH3dAoMaxDiff = 0.0090f;  // depth delta beyond which a neighbour is a silhouette, not a crease
 
+// Backface culling of OoT3D meshes (honor the CMB cull byte; matches N64 G_CULL_BACK so
+// the camera never sees terrain undersides / mesh interiors). gSoH3dFaceCull: -1 uninit
+// (resolved from env SOH3D_FACECULL, default ON), 0 off, 1 on. gSoH3dFaceCullFlip flips the
+// front-face winding (the asset's CCW-from-normal front maps to GL CCW/CW depending on the
+// backend's clip-Y handling; exposed so the correct convention is found empirically without
+// a rebuild — see REPL `facecull`). Shared with the Vulkan backend (soh3d_vk.cpp).
+extern "C" int gSoH3dFaceCull = -1;
+// Front-face winding: the asset winds front faces CCW from the geometric normal, but the
+// renders go through the clip.y negation (invertY) so the window-space winding the rasterizer
+// sees is flipped. frontCW = invertY ^ flip; flip=1 is the VERIFIED-correct convention on
+// Vulkan (the headless + user backend): camera under Hyrule Field terrain culls the underside
+// (matches N64), normal view keeps terrain + sky dome. Both backends share the invertY term, so
+// this default holds for GL too (its screen invertY differs, which the XOR accounts for).
+extern "C" int gSoH3dFaceCullFlip = 1;
+static int faceCullOn() {
+    if (gSoH3dFaceCull < 0) {
+        const char* e = getenv("SOH3D_FACECULL");
+        gSoH3dFaceCull = (e && e[0] == '0') ? 0 : 1; // default ON
+    }
+    return gSoH3dFaceCull;
+}
+
 extern "C" void SoH3D_GL_SetModelProvider(SoH3DModelProvider fn) {
     g_provider = fn;
 #ifdef ENABLE_VULKAN
@@ -593,6 +616,7 @@ static bool uploadModel(GlModel& m, const SoH3DGlGroup* groups, int groupCount, 
         g.depthWrite = groups[i].depthWrite;
         g.polygonOffset = groups[i].polygonOffset;
         g.cull = groups[i].cull;
+        g.faceCull = groups[i].faceCull;
         g.meshId = groups[i].meshId;
         for (int k = 0; k < 4; k++) g.blendColor[k] = groups[i].blendColor[k];
         all.insert(all.end(), groups[i].verts, groups[i].verts + groups[i].vertCount);
@@ -641,7 +665,7 @@ namespace {
 // it constant). All vertex-array state is isolated in g_vao, so only this global context
 // state needs explicit save/restore. See [[soh3d-gl-state-leak]] / gfx_opengl.cpp.
 struct SavedGl {
-    GLint vao, prog, arrayBuf, activeTex, texBind, tex1Bind, depthFunc;
+    GLint vao, prog, arrayBuf, activeTex, texBind, tex1Bind, depthFunc, cullMode, frontFace;
     GLboolean blend, cull, depth, scissor, depthMask;
 };
 
@@ -714,6 +738,8 @@ void beginPass(SavedGl& s) {
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s.arrayBuf);
     glGetIntegerv(GL_ACTIVE_TEXTURE, &s.activeTex);
     glGetIntegerv(GL_DEPTH_FUNC, &s.depthFunc);
+    glGetIntegerv(GL_CULL_FACE_MODE, &s.cullMode); // we may set glCullFace per group; hand it back
+    glGetIntegerv(GL_FRONT_FACE, &s.frontFace);    // backface-cull winding flips with invertY; restore
     s.blend = glIsEnabled(GL_BLEND);
     s.cull = glIsEnabled(GL_CULL_FACE);
     s.depth = glIsEnabled(GL_DEPTH_TEST);
@@ -750,6 +776,8 @@ void endPass(const SavedGl& s) {
     glUseProgram((GLuint)s.prog);
     if (s.blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
     if (s.cull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+    glCullFace((GLenum)s.cullMode);   // we set GL_BACK per-group; restore Fast3D's value
+    glFrontFace((GLenum)s.frontFace); // we flip winding per invertY; restore Fast3D's value
     if (s.depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
     if (s.scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
     glDepthMask(s.depthMask);
@@ -763,7 +791,8 @@ void endPass(const SavedGl& s) {
 // set skinning pose. Assumes beginPass installed the common state and the VAO is g_vao.
 void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int invertY, unsigned char r,
              unsigned char g, unsigned char b, unsigned char a, float aspectAdj, const float* boneData, int boneCnt,
-             uint64_t midMask = ~0ull, bool sky = false, float uvOffU = 0.0f, float uvOffV = 0.0f) {
+             uint64_t midMask = ~0ull, bool sky = false, float uvOffU = 0.0f, float uvOffV = 0.0f,
+             bool cullPass = false) {
     // Mirror Fast3D's per-vertex `x = AdjXForAspectRatio(x)` (interpreter.cpp): scale the
     // clip-space X output of MP by the factor the N64 actors get (MP column 0 = row-major
     // indices 0,4,8,12). Without it the OoT3D content shears vs N64 actors as the camera pans.
@@ -834,6 +863,18 @@ void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int inve
             glDisable(GL_BLEND);
         }
         glDepthMask(grp.depthWrite ? GL_TRUE : GL_FALSE);
+        // Backface culling (color pass only): honor the CMB cull byte so we match N64 G_CULL_BACK.
+        // The asset winds front faces CCW from the geometric normal; the vertex shader negates clip.y
+        // when invertY, flipping window winding, so the GL front-face direction flips with invertY
+        // (gSoH3dFaceCullFlip lets the correct convention be found live). Reset per group so a
+        // double-sided group doesn't inherit the previous group's cull.
+        if (cullPass && grp.faceCull && faceCullOn()) {
+            glEnable(GL_CULL_FACE);
+            glCullFace(GL_BACK);
+            glFrontFace(((invertY != 0) ^ (gSoH3dFaceCullFlip != 0)) ? GL_CW : GL_CCW);
+        } else {
+            glDisable(GL_CULL_FACE);
+        }
         if (grp.texIndex >= 0 && grp.texIndex < (int)m.textures.size()) {
             glBindTexture(GL_TEXTURE_2D, m.textures[grp.texIndex]);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, grp.wrapS);
@@ -1332,7 +1373,7 @@ extern "C" void SoH3D_GL_RenderPass(void) {
             pose = lerped.data();
         }
         drawOne(*m, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.a, it.aspectAdj, pose, it.boneCount,
-                it.midMask, it.sky != 0, it.uvOffU, it.uvOffV);
+                it.midMask, it.sky != 0, it.uvOffU, it.uvOffV, /*cullPass=*/true);
         drawn++;
     }
 
