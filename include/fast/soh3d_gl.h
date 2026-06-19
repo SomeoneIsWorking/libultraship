@@ -87,8 +87,10 @@ void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsigned char r,
 // by the lighting term; lit=1 applies the half-Lambert form term (characters/props), 0 = scene
 // geometry (keeps baked vColor). The model's current skinning pose (SoH3D_GL_SetBones, keyed by
 // modelId) is used at RenderPass time, as with the inline path.
+// sky=1 marks the skybox dome: pinned to the far plane in the shader (no occlusion / no far-clip),
+// excluded from shadow casting and AO. Its model is loaded with depth-write off (see soh3d_model.cpp).
 void SoH3D_GL_Submit(int modelId, const float* mp16, const float* mv16, int lit, int invertY, unsigned char r,
-                     unsigned char g, unsigned char b, float aspectAdj);
+                     unsigned char g, unsigned char b, float aspectAdj, int sky);
 // RenderPass: draw every submitted item in one bracketed pass, then clear the list. Called
 // from the OTR_G_SOH3D_RENDERPASS opcode, emitted once per frame after the actor draw-all
 // (so our content composites after Fast3D's opaque 3D, before the 2D/UI pass).

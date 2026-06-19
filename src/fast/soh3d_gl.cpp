@@ -247,6 +247,8 @@ GLuint g_program = 0;
 GLuint g_vao = 0;
 GLint g_locPos = -1, g_locNrm = -1, g_locUv = -1, g_locBoneId = -1, g_locBoneW = -1;
 GLint g_uMP = -1, g_uInvertY = -1, g_uTint = -1, g_uAlphaRef = -1, g_uTex = -1, g_uBones = -1, g_uSkin = -1;
+GLint g_uSky = -1;
+GLuint g_whiteTex = 0; // 1x1 white, bound for untextured groups (e.g. the vertex-coloured sky dome)
 GLint g_uDepthOffset = -1, g_uMV = -1, g_uLit = -1, g_uLightDir = -1;
 GLint g_uLightVP = -1, g_uShadowMap = -1, g_uShadowOn = -1, g_uShadowBias = -1, g_uShadowStrength = -1,
       g_uShadowTexel = -1;
@@ -273,6 +275,8 @@ const char* kVert =
     "#version 130\n"
     "in vec3 aPos; in vec3 aNrm; in vec2 aUv; in vec4 aBoneId; in vec4 aBoneW; in vec4 aColor;\n"
     "uniform mat4 uMP; uniform mat4 uMV; uniform float uInvertY; uniform mat4 uBones[32]; uniform float uSkin;\n"
+    "uniform float uSky;\n" // 1 = skybox dome: force clip z to the far plane (z=w) so it sits behind everything
+
     "out vec2 vUv; out vec4 vColor; out vec3 vNrmView; out vec3 vWorld;\n"
     "void main(){\n"
     "  vColor = aColor;\n"
@@ -294,6 +298,10 @@ const char* kVert =
     "  }\n"
     "  vec4 c = uMP * vec4(sp.xyz, 1.0);\n"
     "  c.y *= uInvertY;\n"
+    // Skybox: pin the dome to the far plane (NDC z = +1, i.e. z=w) regardless of its geometric
+    // radius. With depth-write off + LEQUAL it then fills ONLY untouched (far) pixels, so it never
+    // occludes world geometry and never clips against the camera's far plane. (Same in GL/Vulkan.)
+    "  if (uSky > 0.5) c.z = c.w;\n"
     "  gl_Position = c;\n"
     // WORLD-space normal for the fragment lighting term. uMV is the N64 "modelview" = the
     // model->world matrix ONLY: OoT folds the camera/viewing transform into the PROJECTION
@@ -417,6 +425,7 @@ bool ensureProgram() {
     g_uTex = glGetUniformLocation(p, "uTex");
     g_uBones = glGetUniformLocation(p, "uBones");
     g_uSkin = glGetUniformLocation(p, "uSkin");
+    g_uSky = glGetUniformLocation(p, "uSky");
     g_uDepthOffset = glGetUniformLocation(p, "uDepthOffset");
     g_uMV = glGetUniformLocation(p, "uMV");
     g_uLit = glGetUniformLocation(p, "uLit");
@@ -430,6 +439,20 @@ bool ensureProgram() {
     glUseProgram(p);
     glUniform1i(g_uShadowMap, 1); // shadow map lives on texture unit 1 (color tex stays unit 0)
     glGenVertexArrays(1, &g_vao); // our isolated VAO (never touch Fast3D's)
+    // 1x1 white texture: bound for untextured groups so the fragment shader's texture() returns
+    // 1.0 (the dome is pure vertex colour). Without it, an untextured group would sample whatever
+    // texture happened to be bound last and tint the dome by it.
+    {
+        GLint prevTex = 0;
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+        const unsigned char white[4] = { 255, 255, 255, 255 };
+        glGenTextures(1, &g_whiteTex);
+        glBindTexture(GL_TEXTURE_2D, g_whiteTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, (GLuint)prevTex);
+    }
     return true;
 }
 
@@ -733,7 +756,7 @@ void endPass(const SavedGl& s) {
 // set skinning pose. Assumes beginPass installed the common state and the VAO is g_vao.
 void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int invertY, unsigned char r,
              unsigned char g, unsigned char b, float aspectAdj, const float* boneData, int boneCnt,
-             uint64_t midMask = ~0ull) {
+             uint64_t midMask = ~0ull, bool sky = false) {
     // Mirror Fast3D's per-vertex `x = AdjXForAspectRatio(x)` (interpreter.cpp): scale the
     // clip-space X output of MP by the factor the N64 actors get (MP column 0 = row-major
     // indices 0,4,8,12). Without it the OoT3D content shears vs N64 actors as the camera pans.
@@ -750,6 +773,7 @@ void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int inve
     glUniformMatrix4fv(g_uMV, 1, GL_FALSE, mv16);
     glUniform1f(g_uLit, (lit && gSoH3dLightEnable) ? 1.0f : 0.0f);
     glUniform1f(g_uInvertY, invertY ? -1.0f : 1.0f);
+    glUniform1f(g_uSky, sky ? 1.0f : 0.0f);
     glUniform3f(g_uTint, r / 255.0f, g / 255.0f, b / 255.0f);
 
     // uBones: identity by default (bind pose), else THIS draw item's per-frame skin matrices
@@ -797,6 +821,8 @@ void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int inve
             glBindTexture(GL_TEXTURE_2D, m.textures[grp.texIndex]);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, grp.wrapS);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, grp.wrapT);
+        } else {
+            glBindTexture(GL_TEXTURE_2D, g_whiteTex); // untextured -> sample 1.0 (use pure vertex colour)
         }
         glDrawArrays(GL_TRIANGLES, grp.first, grp.count);
     }
@@ -808,6 +834,7 @@ struct DrawItem {
     float mp[16];
     float mv[16]; // modelview (for the view-space normal lighting term)
     int lit;      // 1 = apply the half-Lambert form term (characters/props); 0 = scene geometry
+    int sky;      // 1 = skybox dome (force far-plane depth, no shadow cast, no AO occlusion)
     int invertY;
     unsigned char r, g, b;
     float aspectAdj;
@@ -945,6 +972,7 @@ static void renderShadowMap(GLint gameFbo, const GLint vp[4], const float lightV
     glUniform1f(g_uShadowOn, 0.0f); // building the map: no sampling (also avoids FB feedback)
     std::vector<float> lerped;
     for (const DrawItem& it : g_drawList) {
+        if (it.sky) continue;                          // the sky dome must never cast a shadow
         if (!gSoH3dShadowCastAll && !it.lit) continue; // default: only characters/props cast
         GlModel* m = ensureUploaded(it.modelId);
         if (!m) continue;
@@ -1094,8 +1122,9 @@ static void aoPass(GLint gameFbo, const GLint vp[4], float step) {
             pose = lerped.data();
         }
         // IDENTICAL transforms to the visible draw (it.mp, it.aspectAdj, it.invertY) -> pixel-aligned.
+        // Sky goes to the far plane here too (uSky), so its texels read 1.0 and contribute no AO.
         drawOne(*m, it.mp, it.mv, /*lit=*/0, it.invertY, 255, 255, 255, it.aspectAdj, pose, it.boneCount,
-                it.midMask);
+                it.midMask, it.sky != 0);
     }
     // (2) full-screen SSAO composite onto the scene FBO (dst *= ao).
     glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)gameFbo);
@@ -1132,7 +1161,7 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
         const float* pose = (mit != g_models.end() && !mit->second.bones.empty()) ? mit->second.bones.data() : nullptr;
         int bc = (mit != g_models.end()) ? mit->second.boneCount : 0;
         SoH3D_Vk_BeginPass();
-        SoH3D_Vk_DrawModel(modelId, mp16, mp16, /*lit=*/0, invertY, r, g, b, aspectAdj, pose, bc, ~0ull);
+        SoH3D_Vk_DrawModel(modelId, mp16, mp16, /*lit=*/0, invertY, r, g, b, aspectAdj, pose, bc, ~0ull, /*sky=*/0);
         SoH3D_Vk_EndPass();
         return;
     }
@@ -1152,12 +1181,13 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
 }
 
 extern "C" void SoH3D_GL_Submit(int modelId, const float* mp16, const float* mv16, int lit, int invertY,
-                                unsigned char r, unsigned char g, unsigned char b, float aspectAdj) {
+                                unsigned char r, unsigned char g, unsigned char b, float aspectAdj, int sky) {
     DrawItem it;
     it.modelId = modelId;
     memcpy(it.mp, mp16, sizeof(it.mp));
     memcpy(it.mv, mv16 ? mv16 : mp16, sizeof(it.mv));
     it.lit = lit;
+    it.sky = sky;
     it.invertY = invertY;
     it.r = r;
     it.g = g;
@@ -1218,7 +1248,7 @@ extern "C" void SoH3D_GL_RenderPass(void) {
                 pose = lerped.data();
             }
             SoH3D_Vk_DrawModel(it.modelId, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.aspectAdj, pose,
-                               it.boneCount, it.midMask);
+                               it.boneCount, it.midMask, it.sky);
         }
         SoH3D_Vk_EndPass();
         g_drawList.clear();
@@ -1278,7 +1308,7 @@ extern "C" void SoH3D_GL_RenderPass(void) {
             pose = lerped.data();
         }
         drawOne(*m, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.aspectAdj, pose, it.boneCount,
-                it.midMask);
+                it.midMask, it.sky != 0);
         drawn++;
     }
 

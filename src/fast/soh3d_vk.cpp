@@ -76,7 +76,7 @@ layout(binding=0, std140) uniform UBO {
     mat4 uMP;
     mat4 uMV;
     mat4 uBones[32];
-    vec4 uLightDir;  // xyz: world-space sun dir
+    vec4 uLightDir;  // xyz: world-space sun dir; w: 1 = skybox dome (pin to far plane)
     vec4 uParams;    // x=invertY(+1/-1) y=lit z=alphaRef w=depthOffset
     vec4 uTintSkin;  // xyz=tint w=skin(0/1)
 } ubo;
@@ -97,6 +97,7 @@ void main() {
     // the interpreter applies to N64 vertices (interpreter.cpp: y = -y). Do NOT negate again.
     c.y *= ubo.uParams.x;
     c.z = (c.z + c.w) * 0.5;  // GL clip z [-1,1] -> Vulkan [0,1]
+    if (ubo.uLightDir.w > 0.5) c.z = c.w; // skybox: pin to far plane (Vulkan far = z/w = 1)
     gl_Position = c;
     vNrmView = mat3(ubo.uMV) * nM; // world-space normal (uMV is model->world; see soh3d_gl.cpp)
     // CMB/PICA UVs are top-origin. Texture SAMPLING maps v=0 -> data row 0 identically in GL and
@@ -682,7 +683,7 @@ extern "C" void SoH3D_Vk_BeginPass(void) {
 
 extern "C" void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* mv16, int lit, int invertY,
                                    unsigned char r8, unsigned char g8, unsigned char b8, float aspectAdj,
-                                   const float* boneData, int boneCnt, unsigned long long midMask) {
+                                   const float* boneData, int boneCnt, unsigned long long midMask, int sky) {
     if (!g_ctxValid)
         return;
     VkModel* m = ensureUploaded(modelId);
@@ -728,6 +729,7 @@ extern "C" void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* 
     base.uLightDir[0] = gSoH3dLightDirWorld[0];
     base.uLightDir[1] = gSoH3dLightDirWorld[1];
     base.uLightDir[2] = gSoH3dLightDirWorld[2];
+    base.uLightDir[3] = sky ? 1.0f : 0.0f; // skybox dome: pin to far plane in the vertex shader
 
     bool vboBound = false;
     for (const VkGroup& grp : m->groups) {
