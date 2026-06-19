@@ -31,7 +31,7 @@ void SoH3D_Vk_SetProvider(SoH3DModelProvider fn);
 // caller (SoH3D_GL_RenderPass) does the per-item pose interpolation, exactly as for the GL path.
 void SoH3D_Vk_BeginPass(void);
 void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* mv16, int lit, int invertY,
-                        unsigned char r, unsigned char g, unsigned char b, float aspectAdj,
+                        unsigned char r, unsigned char g, unsigned char b, unsigned char a, float aspectAdj,
                         const float* boneData, int boneCnt, unsigned long long midMask, int sky);
 void SoH3D_Vk_EndPass(void);
 

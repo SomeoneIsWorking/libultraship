@@ -247,6 +247,7 @@ GLuint g_program = 0;
 GLuint g_vao = 0;
 GLint g_locPos = -1, g_locNrm = -1, g_locUv = -1, g_locBoneId = -1, g_locBoneW = -1;
 GLint g_uMP = -1, g_uInvertY = -1, g_uTint = -1, g_uAlphaRef = -1, g_uTex = -1, g_uBones = -1, g_uSkin = -1;
+GLint g_uAlpha = -1;
 GLint g_uSky = -1;
 GLuint g_whiteTex = 0; // 1x1 white, bound for untextured groups (e.g. the vertex-coloured sky dome)
 GLint g_uDepthOffset = -1, g_uMV = -1, g_uLit = -1, g_uLightDir = -1;
@@ -319,7 +320,7 @@ const char* kVert =
 const char* kFrag =
     "#version 130\n"
     "in vec2 vUv; in vec4 vColor; in vec3 vNrmView; in vec3 vWorld;\n"
-    "uniform sampler2D uTex; uniform vec3 uTint; uniform float uAlphaRef;\n"
+    "uniform sampler2D uTex; uniform vec3 uTint; uniform float uAlphaRef; uniform float uAlpha;\n"
     "uniform float uDepthOffset; uniform float uLit; uniform vec3 uLightDir;\n"
     // Dynamic sun-shadow: uLightVP maps WORLD -> the sun's light-space clip (built CPU-side from
     // the scene sun dir + a focus box around the camera target); uShadowMap is the depth render
@@ -368,7 +369,9 @@ const char* kFrag =
     "  if (uShadowOn > 0.5) {\n"
     "    shade *= (1.0 - uShadowStrength * (1.0 - shadowLit()));\n"
     "  }\n"
-    "  frag = vec4(t.rgb * vColor.rgb * shade, t.a * vColor.a);\n"
+    // uAlpha is a per-draw opacity (1 = opaque). Used to cross-fade the two skybox domes at
+    // dawn/dusk (dome2 drawn over dome1 with alpha = skyboxBlend); 1.0 for every other draw.
+    "  frag = vec4(t.rgb * vColor.rgb * shade, t.a * vColor.a * uAlpha);\n"
     "}\n";
 
 GLuint compile(GLenum type, const char* src) {
@@ -422,6 +425,7 @@ bool ensureProgram() {
     g_uInvertY = glGetUniformLocation(p, "uInvertY");
     g_uTint = glGetUniformLocation(p, "uTint");
     g_uAlphaRef = glGetUniformLocation(p, "uAlphaRef");
+    g_uAlpha = glGetUniformLocation(p, "uAlpha");
     g_uTex = glGetUniformLocation(p, "uTex");
     g_uBones = glGetUniformLocation(p, "uBones");
     g_uSkin = glGetUniformLocation(p, "uSkin");
@@ -755,7 +759,7 @@ void endPass(const SavedGl& s) {
 // Draw one already-uploaded model with the given MP/invertY/tint, using the model's currently
 // set skinning pose. Assumes beginPass installed the common state and the VAO is g_vao.
 void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int invertY, unsigned char r,
-             unsigned char g, unsigned char b, float aspectAdj, const float* boneData, int boneCnt,
+             unsigned char g, unsigned char b, unsigned char a, float aspectAdj, const float* boneData, int boneCnt,
              uint64_t midMask = ~0ull, bool sky = false) {
     // Mirror Fast3D's per-vertex `x = AdjXForAspectRatio(x)` (interpreter.cpp): scale the
     // clip-space X output of MP by the factor the N64 actors get (MP column 0 = row-major
@@ -775,6 +779,8 @@ void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int inve
     glUniform1f(g_uInvertY, invertY ? -1.0f : 1.0f);
     glUniform1f(g_uSky, sky ? 1.0f : 0.0f);
     glUniform3f(g_uTint, r / 255.0f, g / 255.0f, b / 255.0f);
+    glUniform1f(g_uAlpha, a / 255.0f);
+    bool forceBlend = (a < 255); // translucent draw -> alpha-blend over the framebuffer regardless
 
     // uBones: identity by default (bind pose), else THIS draw item's per-frame skin matrices
     // (boneData/boneCnt, snapshotted at Submit time so two actors sharing a modelId keep their own
@@ -813,6 +819,13 @@ void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int inve
             glBlendFuncSeparate(grp.blendSrcRGB, grp.blendDstRGB, grp.blendSrcA, grp.blendDstA);
             glBlendEquationSeparate(grp.blendEqRGB, grp.blendEqA);
             glBlendColor(grp.blendColor[0], grp.blendColor[1], grp.blendColor[2], grp.blendColor[3]);
+        } else if (forceBlend) {
+            // Opaque material drawn translucent (per-draw uAlpha): standard alpha-over blend so the
+            // fragment's uAlpha actually composites instead of writing opaquely (e.g. the upper dome
+            // of a dawn/dusk two-dome cross-fade). Matches gfx_opengl's permanent SRC_ALPHA assumption.
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glBlendEquation(GL_FUNC_ADD);
         } else {
             glDisable(GL_BLEND);
         }
@@ -837,6 +850,7 @@ struct DrawItem {
     int sky;      // 1 = skybox dome (force far-plane depth, no shadow cast, no AO occlusion)
     int invertY;
     unsigned char r, g, b;
+    unsigned char a = 255; // per-draw opacity (255 = opaque); <255 cross-fades (e.g. dawn/dusk dome)
     float aspectAdj;
     std::vector<float> bones;     // this-frame skin pose (so same-modelId actors keep own poses)
     std::vector<float> prevBones; // same item's previous-frame pose (for FPS interpolation); may be empty
@@ -984,7 +998,7 @@ static void renderShadowMap(GLint gameFbo, const GLint vp[4], const float lightV
         }
         float depthMP[16];
         mat4Mul(depthMP, lightVP, it.mv); // model -> light-clip = lightVP * (model -> world)
-        drawOne(*m, depthMP, it.mv, /*lit=*/0, /*invertY=*/0, 255, 255, 255, /*aspectAdj=*/1.0f, pose,
+        drawOne(*m, depthMP, it.mv, /*lit=*/0, /*invertY=*/0, 255, 255, 255, 255, /*aspectAdj=*/1.0f, pose,
                 it.boneCount, it.midMask);
     }
     glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)gameFbo);
@@ -1123,7 +1137,7 @@ static void aoPass(GLint gameFbo, const GLint vp[4], float step) {
         }
         // IDENTICAL transforms to the visible draw (it.mp, it.aspectAdj, it.invertY) -> pixel-aligned.
         // Sky goes to the far plane here too (uSky), so its texels read 1.0 and contribute no AO.
-        drawOne(*m, it.mp, it.mv, /*lit=*/0, it.invertY, 255, 255, 255, it.aspectAdj, pose, it.boneCount,
+        drawOne(*m, it.mp, it.mv, /*lit=*/0, it.invertY, 255, 255, 255, 255, it.aspectAdj, pose, it.boneCount,
                 it.midMask, it.sky != 0);
     }
     // (2) full-screen SSAO composite onto the scene FBO (dst *= ao).
@@ -1161,7 +1175,7 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
         const float* pose = (mit != g_models.end() && !mit->second.bones.empty()) ? mit->second.bones.data() : nullptr;
         int bc = (mit != g_models.end()) ? mit->second.boneCount : 0;
         SoH3D_Vk_BeginPass();
-        SoH3D_Vk_DrawModel(modelId, mp16, mp16, /*lit=*/0, invertY, r, g, b, aspectAdj, pose, bc, ~0ull, /*sky=*/0);
+        SoH3D_Vk_DrawModel(modelId, mp16, mp16, /*lit=*/0, invertY, r, g, b, 255, aspectAdj, pose, bc, ~0ull, /*sky=*/0);
         SoH3D_Vk_EndPass();
         return;
     }
@@ -1175,13 +1189,14 @@ extern "C" void SoH3D_GL_Draw(int modelId, const float* mp16, int invertY, unsig
     SavedGl s;
     beginPass(s);
     // legacy path: no lighting; pose = the model's current bones (single-actor inline draw)
-    drawOne(*m, mp16, mp16, /*lit=*/0, invertY, r, g, b, aspectAdj,
+    drawOne(*m, mp16, mp16, /*lit=*/0, invertY, r, g, b, 255, aspectAdj,
             m->bones.empty() ? nullptr : m->bones.data(), m->boneCount);
     endPass(s);
 }
 
 extern "C" void SoH3D_GL_Submit(int modelId, const float* mp16, const float* mv16, int lit, int invertY,
-                                unsigned char r, unsigned char g, unsigned char b, float aspectAdj, int sky) {
+                                unsigned char r, unsigned char g, unsigned char b, unsigned char a, float aspectAdj,
+                                int sky) {
     DrawItem it;
     it.modelId = modelId;
     memcpy(it.mp, mp16, sizeof(it.mp));
@@ -1192,6 +1207,7 @@ extern "C" void SoH3D_GL_Submit(int modelId, const float* mp16, const float* mv1
     it.r = r;
     it.g = g;
     it.b = b;
+    it.a = a;
     it.aspectAdj = aspectAdj;
     // Per-item pose pairing. Submit runs at dlist INTERPRET time (and re-runs once per interpolation
     // subframe), by which point g_models[modelId].bones holds only the LAST actor's pose. So pair by
@@ -1247,8 +1263,8 @@ extern "C" void SoH3D_GL_RenderPass(void) {
                 interpSkinPose(it.prevBones.data(), it.bones.data(), bd, bi, step, it.bones.size(), lerped);
                 pose = lerped.data();
             }
-            SoH3D_Vk_DrawModel(it.modelId, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.aspectAdj, pose,
-                               it.boneCount, it.midMask, it.sky);
+            SoH3D_Vk_DrawModel(it.modelId, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.a, it.aspectAdj,
+                               pose, it.boneCount, it.midMask, it.sky);
         }
         SoH3D_Vk_EndPass();
         g_drawList.clear();
@@ -1307,7 +1323,7 @@ extern "C" void SoH3D_GL_RenderPass(void) {
                            m->binv.empty() ? nullptr : m->binv.data(), step, it.bones.size(), lerped);
             pose = lerped.data();
         }
-        drawOne(*m, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.aspectAdj, pose, it.boneCount,
+        drawOne(*m, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.a, it.aspectAdj, pose, it.boneCount,
                 it.midMask, it.sky != 0);
         drawn++;
     }

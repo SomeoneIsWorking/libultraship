@@ -2773,14 +2773,20 @@ typedef union Gfx {
         _g1->words.w1 = (uintptr_t)replc;                \
     }
 
-// SoH3D direct-GL model draw: handle in w1, flat tint RGB packed in w0[0:24].
-#define gSPSoH3DDraw(pkt, handle, tintR, tintG, tintB)                                            \
+// SoH3D direct-GL model draw: handle in w1[0:32], flat tint RGB packed in w0[0:24], and a per-draw
+// alpha in w1[32:40] (255 = opaque). The alpha rides the upper 32 bits of the 64-bit w1 so it never
+// disturbs the 32-bit handle (model id + lit bit31 + sky bit30) the interpreter already decodes.
+// (64-bit native port: uintptr_t is 64-bit; the alpha byte is only meaningful there.)
+#define gSPSoH3DDrawA(pkt, handle, alpha, tintR, tintG, tintB)                                    \
     {                                                                                             \
         Gfx* _g = (Gfx*)(pkt);                                                                    \
         _g->words.w0 = _SHIFTL(G_SOH3D_DRAW, 24, 8) |                                             \
                        _SHIFTL(((tintR) & 0xFF) << 16 | ((tintG) & 0xFF) << 8 | ((tintB) & 0xFF), 0, 24); \
-        _g->words.w1 = (uintptr_t)(handle);                                                       \
+        _g->words.w1 = (uintptr_t)(((uint64_t)(uint32_t)(uintptr_t)(handle)) |                    \
+                                   ((uint64_t)((alpha) & 0xFF) << 32));                           \
     }
+// Opaque convenience wrapper (alpha = 255), preserving every existing call site verbatim.
+#define gSPSoH3DDraw(pkt, handle, tintR, tintG, tintB) gSPSoH3DDrawA(pkt, handle, 255, tintR, tintG, tintB)
 
 // SoH3D auto-scale measure bracket: key in w1, phase in w0[0] (1=begin, 0=end).
 // Emitted around an actor's N64 draw so the interpreter can measure its world size.

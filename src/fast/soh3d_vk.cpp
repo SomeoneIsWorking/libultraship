@@ -79,6 +79,7 @@ layout(binding=0, std140) uniform UBO {
     vec4 uLightDir;  // xyz: world-space sun dir; w: 1 = skybox dome (pin to far plane)
     vec4 uParams;    // x=invertY(+1/-1) y=lit z=alphaRef w=depthOffset
     vec4 uTintSkin;  // xyz=tint w=skin(0/1)
+    vec4 uExtra;     // x=per-draw alpha (1=opaque)
 } ubo;
 void main() {
     vColor = aColor;
@@ -120,6 +121,7 @@ layout(binding=0, std140) uniform UBO {
     vec4 uLightDir;
     vec4 uParams;
     vec4 uTintSkin;
+    vec4 uExtra;
 } ubo;
 layout(binding=1) uniform sampler2D uTex;
 void main() {
@@ -131,7 +133,7 @@ void main() {
         float hl = dot(normalize(vNrmView), normalize(ubo.uLightDir.xyz)) * 0.5 + 0.5;
         shade = ubo.uTintSkin.xyz * (0.55 + 0.45 * hl);
     }
-    frag = vec4(t.rgb * vColor.rgb * shade, t.a * vColor.a);
+    frag = vec4(t.rgb * vColor.rgb * shade, t.a * vColor.a * ubo.uExtra.x); // uExtra.x = per-draw alpha
 }
 )";
 
@@ -143,6 +145,7 @@ struct VkUbo {
     float uLightDir[4];
     float uParams[4];
     float uTintSkin[4];
+    float uExtra[4]; // x = per-draw alpha (1 = opaque)
 };
 
 struct VkTex {
@@ -682,8 +685,9 @@ extern "C" void SoH3D_Vk_BeginPass(void) {
 }
 
 extern "C" void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* mv16, int lit, int invertY,
-                                   unsigned char r8, unsigned char g8, unsigned char b8, float aspectAdj,
-                                   const float* boneData, int boneCnt, unsigned long long midMask, int sky) {
+                                   unsigned char r8, unsigned char g8, unsigned char b8, unsigned char a8,
+                                   float aspectAdj, const float* boneData, int boneCnt,
+                                   unsigned long long midMask, int sky) {
     if (!g_ctxValid)
         return;
     VkModel* m = ensureUploaded(modelId);
@@ -730,6 +734,8 @@ extern "C" void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* 
     base.uLightDir[1] = gSoH3dLightDirWorld[1];
     base.uLightDir[2] = gSoH3dLightDirWorld[2];
     base.uLightDir[3] = sky ? 1.0f : 0.0f; // skybox dome: pin to far plane in the vertex shader
+    base.uExtra[0] = a8 / 255.0f;          // per-draw opacity (dawn/dusk dome cross-fade); 1 = opaque
+    bool forceBlend = (a8 < 255);          // translucent draw -> alpha-over even if the material is opaque
 
     bool vboBound = false;
     for (const VkGroup& grp : m->groups) {
@@ -787,7 +793,16 @@ extern "C" void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* 
         w[1].pImageInfo = &ii;
         vkUpdateDescriptorSets(g_device, 2, w, 0, nullptr);
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, getPipeline(grp));
+        // Translucent draw over an opaque material: synthesize a standard alpha-over pipeline (the
+        // VkGroup blend-factor defaults are SRC_ALPHA / ONE_MINUS_SRC_ALPHA) so uExtra.x composites,
+        // mirroring the GL path's forceBlend. Depth-write/offset/etc. are inherited from the group.
+        VkGroup gb = grp;
+        if (forceBlend && !grp.blendEnable) {
+            gb.blendEnable = 1;
+            gb.bSrcRGB = 0x0302; gb.bDstRGB = 0x0303; gb.bEqRGB = 0x8006; // SRC_ALPHA / 1-SRC_ALPHA / ADD
+            gb.bSrcA = 0x0302;   gb.bDstA = 0x0303;   gb.bEqA = 0x8006;
+        }
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, getPipeline(gb));
         vkCmdSetViewport(cmd, 0, 1, &g_ctx.viewport);
         vkCmdSetScissor(cmd, 0, 1, &g_ctx.scissor);
         vkCmdSetBlendConstants(cmd, grp.blendColor);
