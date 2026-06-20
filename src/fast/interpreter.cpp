@@ -28,6 +28,7 @@
 #include "fast/lus_gbi.h"
 #include "fast/soh3d_gl.h"
 #include "fast/backends/gfx_window_manager_api.h"
+#include "fast/Fast3dWindow.h" // Fast::WindowBackend (FAST3D_SDL_VULKAN) for the present-path composite guard
 #include "fast/backends/gfx_rendering_api.h"
 
 #include "ship/window/gui/Gui.h"
@@ -5247,11 +5248,21 @@ void Interpreter::StartFrame() {
 
     mPrvDimensions = mCurDimensions;
     mPrevNativeDimensions = mNativeDimensions;
+    // On the Vulkan backend, mGameFb is composited onto fb 0 by a straight image blit and fb 0 is
+    // presented without a flip, so store mGameFb top-down like fb 0 (openglInvertY=false). This
+    // makes directly-rendered content AND framebuffer-captured content (the pause/inventory
+    // background, drawn by sampling a captured FB per the #12 fix, which assumes the fb 0
+    // orientation) share ONE orientation -- matching Linux, where the main render target is fb 0
+    // itself. With the old bottom-up mGameFb the captured background came out upside down behind
+    // the (correct) inventory on macOS. GL/Metal sample mGameFb via ImGui with the opposite
+    // convention, so they keep openglInvertY=true.
+    const bool gameFbInvertY =
+        Ship::Context::GetRawInstance()->GetWindow()->GetWindowBackend() != FAST3D_SDL_VULKAN;
     if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1) {
         mRendersToFb = true;
         if (!ViewportMatchesRendererResolution()) {
-            mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
-                                               true, true, true);
+            mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel,
+                                               gameFbInvertY, true, true, true);
         } else {
             // MSAA framebuffer needs to be resolved to an equally sized target when complete, which must therefore
             // match the window size
@@ -5301,6 +5312,21 @@ void Interpreter::RunGuiOnly() {
             }
         } else {
             mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFb);
+        }
+        // The Vulkan backend presents fb 0 directly via a swapchain blit; the ImGui
+        // DrawGame() composite that copies the game image (mGameFb) onto fb 0 is only
+        // wired for the GL/Metal backends. Without it fb 0 stays cleared and the screen
+        // is black except for RmlUi (which renders on its own Vulkan interface). macOS
+        // ALWAYS takes this mRendersToFb path because ViewportMatchesRendererResolution()
+        // is hardcoded false there for retina, so it was always black. Composite the game
+        // image onto fb 0 ourselves (stretch-blit) so the present shows the world.
+        if (Ship::Context::GetRawInstance()->GetWindow()->GetWindowBackend() == FAST3D_SDL_VULKAN &&
+            !(mMsaaLevel > 1 && ViewportMatchesRendererResolution())) {
+            int srcFb = (mMsaaLevel > 1) ? mGameFbMsaaResolved : mGameFb;
+            // Straight blit: mGameFb is now stored top-down like fb 0 (openglInvertY=false above),
+            // and fb 0 is presented without a flip, so no Y compensation is needed here.
+            mRapi->CopyFramebuffer(0, srcFb, 0, 0, mCurDimensions.width, mCurDimensions.height, 0, 0,
+                                   mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height);
         }
     } else if (mFbActive) {
         // Failsafe reset to main framebuffer to prevent softlocking the renderer
@@ -5401,6 +5427,21 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
             }
         } else {
             mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFb);
+        }
+        // The Vulkan backend presents fb 0 directly via a swapchain blit; the ImGui
+        // DrawGame() composite that copies the game image (mGameFb) onto fb 0 is only
+        // wired for the GL/Metal backends. Without it fb 0 stays cleared and the screen
+        // is black except for RmlUi (which renders on its own Vulkan interface). macOS
+        // ALWAYS takes this mRendersToFb path because ViewportMatchesRendererResolution()
+        // is hardcoded false there for retina, so it was always black. Composite the game
+        // image onto fb 0 ourselves (stretch-blit) so the present shows the world.
+        if (Ship::Context::GetRawInstance()->GetWindow()->GetWindowBackend() == FAST3D_SDL_VULKAN &&
+            !(mMsaaLevel > 1 && ViewportMatchesRendererResolution())) {
+            int srcFb = (mMsaaLevel > 1) ? mGameFbMsaaResolved : mGameFb;
+            // Straight blit: mGameFb is now stored top-down like fb 0 (openglInvertY=false above),
+            // and fb 0 is presented without a flip, so no Y compensation is needed here.
+            mRapi->CopyFramebuffer(0, srcFb, 0, 0, mCurDimensions.width, mCurDimensions.height, 0, 0,
+                                   mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height);
         }
     } else if (mFbActive) {
         // Failsafe reset to main framebuffer to prevent softlocking the renderer
