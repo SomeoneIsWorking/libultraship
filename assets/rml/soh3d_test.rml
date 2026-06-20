@@ -52,6 +52,9 @@
 				<select-button tabindex="auto" restart="1"><key>Restart &#8594; Title Screen</key><value>&#8635;</value></select-button>
 				<!-- Time-of-day applied to the NEXT warp below: Default (clock runs) / Day / Night. -->
 				<select-button tabindex="auto" cycle="warptime"><key>Warp Time-of-Day</key><value>Default</value></select-button>
+				<!-- Past/future variant of the warp target: sets linkAge so Play_Init loads the
+				     child (past) or adult (future) scene-setup layer. -->
+				<select-button tabindex="auto" cycle="warpage"><key>Warp Era</key><value>Default</value></select-button>
 				<div class="section-heading">Level Select</div>
 				<select-button tabindex="auto" warp="238"><key>Kokiri Forest</key><value>&#8594;</value></select-button>
 				<select-button tabindex="auto" warp="177"><key>Market</key><value>&#8594;</value></select-button>

@@ -53,6 +53,12 @@ extern "C" int gSoH3dMenuWarpTime = 0;
 // current rise on the first frame.
 extern "C" int gSoH3dMenuStairSize = 1;
 
+// Debug-warp era applied to the NEXT Level-Select / Boss / Dungeon warp: 0 = Default (keep the
+// current age), 1 = Child (past), 2 = Adult (future). soh3d.c sets gSaveContext.linkAge from this
+// before the warp, so Play_Init picks the child vs adult scene-setup layer (the past/future variant
+// of the destination). Composes with gSoH3dMenuWarpTime (day/night).
+extern "C" int gSoH3dMenuWarpAge = 0;
+
 // Live on-screen diagnostics text (Link coords / scene / yaw / floor). Owned here (libultraship,
 // no PlayState) and rewritten every frame by soh3d.c's SoH3D_ReplPoll, which DOES have the
 // PlayState. The "Diag" RML pane's #diagtext element is refreshed from this buffer each frame
@@ -109,6 +115,7 @@ struct CycleSpec {
 static const CycleSpec kCycles[] = {
     { "linkmode", &gSoH3dMenuLinkMode, { "N64", "3DS \xC2\xB7 N64 anim", "3DS \xC2\xB7 3DS anim", nullptr }, 3 },
     { "warptime", &gSoH3dMenuWarpTime, { "Default", "Day", "Night", nullptr }, 3 },
+    { "warpage", &gSoH3dMenuWarpAge, { "Default", "Child \xC2\xB7 past", "Adult \xC2\xB7 future", nullptr }, 3 },
     { "stairsize", &gSoH3dMenuStairSize, { "Small", "Medium", "Large", nullptr }, 3 },
 };
 static const CycleSpec* FindCycle(const Rml::String& id) {
