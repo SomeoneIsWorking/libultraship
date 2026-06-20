@@ -11,6 +11,7 @@
 			<tab>Graphics</tab>
 			<tab>Audio</tab>
 			<tab>Debug</tab>
+			<tab>Diag</tab>
 			<tab>About</tab>
 		</tab-bar>
 		<content id="content">
@@ -86,6 +87,14 @@
 				<select-button tabindex="auto" warp="136"><key>Ice Cavern</key><value>&#9760;</value></select-button>
 				<select-button tabindex="auto" warp="8"><key>Gerudo Training</key><value>&#9760;</value></select-button>
 				<select-button tabindex="auto" warp="1127"><key>Inside Ganon's Castle</key><value>&#9760;</value></select-button>
+			</pane>
+			<pane>
+				<!-- Live diagnostics: SohRmlUi rewrites #diagtext every frame from the gSoH3dDiagText
+				     buffer that soh3d.c fills in SoH3D_ReplPoll (Link coords, scene/room, yaw, floor).
+				     Read-only (no focusable rows) — screenshot it to read coords off-REPL. -->
+				<div class="section-heading">Diagnostics</div>
+				<p id="diagtext">(waiting for game state...)</p>
+				<p class="hint">&#8596; switch tab &middot; Esc / B close &middot; screenshot this for coords</p>
 			</pane>
 			<pane>
 				<div class="section-heading">About</div>

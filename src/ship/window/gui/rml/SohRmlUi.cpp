@@ -53,6 +53,12 @@ extern "C" int gSoH3dMenuWarpTime = 0;
 // current rise on the first frame.
 extern "C" int gSoH3dMenuStairSize = 1;
 
+// Live on-screen diagnostics text (Link coords / scene / yaw / floor). Owned here (libultraship,
+// no PlayState) and rewritten every frame by soh3d.c's SoH3D_ReplPoll, which DOES have the
+// PlayState. The "Diag" RML pane's #diagtext element is refreshed from this buffer each frame
+// (SohRmlUi::RefreshDiag), so a screenshot of that tab reports coords without the REPL FIFO.
+extern "C" char gSoH3dDiagText[512] = "(waiting for game state...)";
+
 // Unique id for blocking game input while the RML menu is open (sequence continues the existing
 // *_BLOCK_ID constants in gfx_dxgi.cpp / InputEditorWindow.cpp). Without this, SoH polls the
 // controller/keyboard directly and the game keeps responding under the open menu.
@@ -359,6 +365,29 @@ void SohRmlUi::RefreshToggleRows() {
     }
 }
 
+void SohRmlUi::RefreshDiag() {
+    if (!mDocument) {
+        return;
+    }
+    Rml::Element* el = mDocument->GetElementById("diagtext");
+    if (el == nullptr) {
+        return;
+    }
+    // gSoH3dDiagText is a plain C string filled by soh3d.c each frame; '\n' separates fields. RML
+    // ignores raw newlines, so translate them to <br/> for the on-screen multi-line readout.
+    Rml::String text;
+    for (const char* p = ::gSoH3dDiagText; *p != '\0'; ++p) {
+        if (*p == '\n') {
+            text += "<br/>";
+        } else {
+            text += *p;
+        }
+    }
+    if (text != el->GetInnerRML()) {
+        el->SetInnerRML(text);
+    }
+}
+
 bool SohRmlUi::ToggleFocusedRow() {
     if (!mContext) {
         return false;
@@ -557,6 +586,7 @@ void SohRmlUi::UpdateAndRender() {
         Resize(dw, dh);
     }
 
+    RefreshDiag();
     mContext->Update();
 
 #ifdef ENABLE_VULKAN

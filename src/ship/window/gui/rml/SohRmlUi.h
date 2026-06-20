@@ -110,6 +110,9 @@ class SohRmlUi {
     // (called on open / tab switch), and flip+persist the focused row's CVar (called on activate).
     void RefreshToggleRows();
     bool ToggleFocusedRow();
+    // Rewrite the Diag pane's #diagtext element from the gSoH3dDiagText buffer (filled per-frame by
+    // soh3d.c). Called every frame from UpdateAndRender so the on-screen coords stay live.
+    void RefreshDiag();
 
   private:
     int mActiveTab = 0;
