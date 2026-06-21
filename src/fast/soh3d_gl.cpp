@@ -541,6 +541,7 @@ extern "C" int gSoH3dFaceCull = -1;
 // (matches N64), normal view keeps terrain + sky dome. Both backends share the invertY term, so
 // this default holds for GL too (its screen invertY differs, which the XOR accounts for).
 extern "C" int gSoH3dFaceCullFlip = 1;
+extern "C" int gSoH3dHlGroup; // #29 room-group highlight (defined in soh3d.c; REPL `hlroom`)
 static int faceCullOn() {
     if (gSoH3dFaceCull < 0) {
         const char* e = getenv("SOH3D_FACECULL");
@@ -875,7 +876,15 @@ void drawOne(GlModel& m, const float* mp16, const float* mv16, int lit, int inve
     glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, weights));
     glVertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SoH3DGlVtx, color));
 
+    // #29 diagnostic: REPL `hlroom <n>` tints room-mesh group N red (room mesh = >20 groups) so a
+    // suspect backdrop group can be identified by index live (pair with SOH3D_DBG_ROOM).
+    bool roomHl = (gSoH3dHlGroup >= 0 && m.groups.size() > 20);
+    int gIdx = -1;
     for (const GlGroup& grp : m.groups) {
+        gIdx++;
+        if (roomHl) glUniform3f(g_uTint, (gIdx == gSoH3dHlGroup) ? 1.0f : r / 255.0f,
+                                (gIdx == gSoH3dHlGroup) ? 0.0f : g / 255.0f,
+                                (gIdx == gSoH3dHlGroup) ? 0.0f : b / 255.0f);
         if (grp.cull) continue; // hidden group (e.g. Link baked equipment, SOH3D_LINK_HIDEITEMS)
         // Per-frame mesh_id visibility: skip groups whose mesh_id bit is clear in midMask (the
         // player picks Link's live equipment/hand variant subset). mesh_id<0 or >=64 = always shown.

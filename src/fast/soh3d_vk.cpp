@@ -1354,6 +1354,7 @@ void recordDepthDraw(int modelId, const float* mp16, const float* mv16, int inve
 
     int frontCW = (invertY != 0) ^ (gSoH3dFaceCullFlip != 0);
     bool vboBound = false;
+    // depth/AO pass draws the whole model (the `hlroom` tint only affects the color pass).
     for (const VkGroup& grp : m->groups) {
         if (grp.cull)
             continue;
@@ -1552,7 +1553,13 @@ extern "C" void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* 
     bool forceBlend = (a8 < 255);          // translucent draw -> alpha-over even if the material is opaque
 
     bool vboBound = false;
+    // #29 diagnostic: REPL `hlroom <n>` tints room-mesh group N red (room mesh = >20 groups) so a
+    // suspect backdrop group (e.g. the untextured "dome") can be identified by index live.
+    extern int gSoH3dHlGroup;
+    bool roomHl = (gSoH3dHlGroup >= 0 && m->groups.size() > 20);
+    int gIdx = -1;
     for (const VkGroup& grp : m->groups) {
+        gIdx++;
         if (grp.cull)
             continue;
         if (grp.meshId >= 0 && grp.meshId < 64 && !((midMask >> grp.meshId) & 1ull))
@@ -1561,6 +1568,8 @@ extern "C" void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* 
             return; // ring exhausted this frame
 
         VkUbo ubo = base;
+        // #29: tint the highlighted room group bright red (keeps the full scene rendering) to ID it.
+        if (roomHl && gIdx == gSoH3dHlGroup) { ubo.uTintSkin[0] = 1.0f; ubo.uTintSkin[1] = 0.0f; ubo.uTintSkin[2] = 0.0f; }
         ubo.uParams[2] = grp.alphaTest ? grp.alphaRef : 0.0f;
         ubo.uParams[3] = grp.polygonOffset;
         const VkDeviceSize uboOff = ring.offset;
