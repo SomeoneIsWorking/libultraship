@@ -33,6 +33,10 @@ using Fast::SoH3DVkContext;
 
 // World-space sun direction, owned by soh3d_gl.cpp (set per frame by soh3d.c). C linkage.
 extern "C" float gSoH3dLightDirWorld[3];
+// Scene-lighting master toggle, owned by the GL pass (soh3d_gl.cpp) and driven by the REPL
+// `light` / RmlUi Graphics menu. The GL backend ANDs it with each draw's `lit` flag; mirror that
+// here so the toggle works under Vulkan too (#72). Default -1 (uninitialised) reads as ON.
+extern "C" int gSoH3dLightEnable;
 // Backface culling (shared toggle with the GL backend; see soh3d_gl.cpp). -1 = resolve from
 // env SOH3D_FACECULL (default ON). gSoH3dFaceCullFlip flips the front-face winding convention.
 extern "C" int gSoH3dFaceCull;
@@ -776,7 +780,10 @@ extern "C" void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* 
         }
     }
     base.uParams[0] = invertY ? -1.0f : 1.0f;
-    base.uParams[1] = lit ? 1.0f : 0.0f;
+    // Gate the half-Lambert form term on the scene-lighting master toggle (#72), matching the GL
+    // pass (soh3d_gl.cpp drawOne): lit && gSoH3dLightEnable. -1 (uninitialised, Vulkan-only run) reads
+    // as ON; the REPL/menu set it to 0/1 explicitly.
+    base.uParams[1] = (lit && gSoH3dLightEnable != 0) ? 1.0f : 0.0f;
     base.uTintSkin[0] = r8 / 255.0f;
     base.uTintSkin[1] = g8 / 255.0f;
     base.uTintSkin[2] = b8 / 255.0f;
