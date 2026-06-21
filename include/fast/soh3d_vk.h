@@ -15,6 +15,7 @@
 // TU. See the dispatch block in soh3d_gl.cpp.
 #pragma once
 #include "fast/soh3d_gl.h"
+#include <stddef.h> // size_t (SoH3D_Vk_ShadowCasterTris)
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,6 +61,8 @@ int SoH3D_Vk_BeginShadowPass(void);
 void SoH3D_Vk_ShadowCasterDraw(int modelId, const float* mp16, const float* mv16, const float* boneData,
                                int boneCnt, unsigned long long midMask);
 void SoH3D_Vk_EndShadowPass(void);
+// #72: record N64 opaque world-space caster triangles into the open shadow pass (world-space soup).
+void SoH3D_Vk_ShadowCasterTris(const float* worldXYZ, size_t triCount, const float* lightVP16);
 void SoH3D_Vk_SetShadow(int on, const float* lightVP16);
 
 // Mirror of SoH3D_GL_RequestEvictRange for the Vulkan model store (the GL request forwards here):

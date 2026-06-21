@@ -319,6 +319,18 @@ float g_shadowLightVP[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
 // sampler is statically used, so it must always be valid even though uShadow.x gates the sampling).
 VkTex g_dummyDepth{};
 
+// #72: per-frame host-visible vertex buffer holding the N64 opaque caster triangle soup
+// (SoH3DGlVtx with only pos set), drawn into the shadow pass by SoH3D_Vk_ShadowCasterTris. One per
+// frame-in-flight so a recorded draw's vertices stay alive until that frame's GPU work completes;
+// grown on demand. The vertex stride must match the depth pipeline's input (sizeof(SoH3DGlVtx)).
+struct N64CasterBuf {
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    void* mapped = nullptr;
+    VkDeviceSize capacity = 0; // bytes
+};
+std::vector<N64CasterBuf> g_n64CasterBufs; // per frame-in-flight
+
 // Depth-only fragment shader: only alpha-test discard (no colour attachment in the depth RP). The
 // vertex shader (kVert, reused) computes gl_Position identically to the visible draw -> pixel-aligned.
 const char* kAoDepthFrag = R"(#version 450
@@ -1764,6 +1776,101 @@ extern "C" void SoH3D_Vk_ShadowCasterDraw(int modelId, const float* mp16, const 
     if (!g_shadowPassActive)
         return;
     recordDepthDraw(modelId, mp16, mv16, /*invertY=*/0, /*aspectAdj=*/1.0f, boneData, boneCnt, midMask);
+}
+
+// #72: record the N64 opaque world-space caster triangle soup into the open shadow render pass, so
+// N64-drawn geometry (N64 Link, unreplaced actors, scene mesh) casts a sun shadow too — mirroring
+// the GL SoH3D_GL_ShadowCasterTris. worldXYZ = triCount*3 verts of xyz; positions are already
+// WORLD-space, so uMP = lightVP and uMV = identity, no skinning, no cull (depth-only). The vertices
+// are staged into a per-frame host-visible buffer kept alive until this frame's GPU work completes.
+extern "C" void SoH3D_Vk_ShadowCasterTris(const float* worldXYZ, size_t triCount, const float* lightVP16) {
+    if (!g_shadowPassActive || !worldXYZ || triCount == 0)
+        return;
+    const size_t vtxCount = triCount * 3;
+    const VkDeviceSize bytes = (VkDeviceSize)vtxCount * sizeof(SoH3DGlVtx);
+
+    if (g_n64CasterBufs.size() < g_rings.size())
+        g_n64CasterBufs.resize(g_rings.size());
+    N64CasterBuf& cb = g_n64CasterBufs[g_ctx.frameIndex];
+    if (cb.capacity < bytes) {
+        // Grow (and free any previous undersized buffer). Safe here: this frame index's prior GPU
+        // work has completed (the caller's frame fence gated re-recording).
+        if (cb.buf) {
+            vkDestroyBuffer(g_device, cb.buf, nullptr);
+            vkFreeMemory(g_device, cb.mem, nullptr);
+            cb = N64CasterBuf{};
+        }
+        VkDeviceSize cap = bytes + bytes / 2 + 4096; // headroom to amortise regrowth
+        makeBuffer(cap, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, cb.buf, cb.mem,
+                   &cb.mapped);
+        cb.capacity = cap;
+    }
+    // Fill SoH3DGlVtx with pos only (other fields unused: uSkin/uLit off; depth-only frag).
+    SoH3DGlVtx* dst = (SoH3DGlVtx*)cb.mapped;
+    for (size_t i = 0; i < vtxCount; i++) {
+        SoH3DGlVtx v{};
+        v.pos[0] = worldXYZ[i * 3 + 0];
+        v.pos[1] = worldXYZ[i * 3 + 1];
+        v.pos[2] = worldXYZ[i * 3 + 2];
+        dst[i] = v;
+    }
+
+    Ring& ring = g_rings[g_ctx.frameIndex];
+    VkCommandBuffer cmd = g_ctx.cmd;
+    if (ring.offset + g_uboStride > ring.capacity)
+        return;
+
+    VkUbo ubo{};
+    memcpy(ubo.uMP, lightVP16, sizeof(ubo.uMP)); // positions are world-space -> clip = lightVP*world
+    float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    memcpy(ubo.uMV, identity, sizeof(ubo.uMV));
+    for (int k = 0; k < 32; k++)
+        for (int e = 0; e < 16; e++)
+            ubo.uBones[k * 16 + e] = (e % 5 == 0) ? 1.0f : 0.0f;
+    ubo.uParams[0] = 1.0f;       // invertY off
+    ubo.uTintSkin[3] = 0.0f;     // no skinning -> aPos used directly
+    const VkDeviceSize uboOff = ring.offset;
+    memcpy((uint8_t*)ring.mapped + uboOff, &ubo, sizeof(ubo));
+    ring.offset += g_uboStride;
+
+    VkDescriptorSetAllocateInfo dai{};
+    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dai.descriptorPool = ring.pool;
+    dai.descriptorSetCount = 1;
+    dai.pSetLayouts = &g_setLayout;
+    VkDescriptorSet set;
+    if (vkAllocateDescriptorSets(g_device, &dai, &set) != VK_SUCCESS)
+        return;
+    VkDescriptorBufferInfo bi{};
+    bi.buffer = ring.ubo;
+    bi.offset = uboOff;
+    bi.range = sizeof(VkUbo);
+    VkDescriptorImageInfo ii{};
+    ii.sampler = g_dummySampler;
+    ii.imageView = g_dummyTex.view;
+    ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet w[2]{};
+    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[0].dstSet = set;
+    w[0].dstBinding = 0;
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    w[0].descriptorCount = 1;
+    w[0].pBufferInfo = &bi;
+    w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[1].dstSet = set;
+    w[1].dstBinding = 1;
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[1].descriptorCount = 1;
+    w[1].pImageInfo = &ii;
+    vkUpdateDescriptorSets(g_device, 2, w, 0, nullptr);
+
+    // No-cull depth pipeline: N64 winding varies, cast from both sides (depth-only).
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, getAoDepthPipeline(/*doCull=*/false, /*frontCW=*/0));
+    VkDeviceSize zero = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &cb.buf, &zero);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeLayout, 0, 1, &set, 0, nullptr);
+    vkCmdDraw(cmd, (uint32_t)vtxCount, 1, 0, 0);
 }
 
 extern "C" void SoH3D_Vk_EndShadowPass(void) {

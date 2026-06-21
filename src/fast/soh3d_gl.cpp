@@ -261,6 +261,14 @@ bool g_progFailed = false;
 GLuint g_shadowFbo = 0, g_shadowTex = 0;
 int g_shadowRes = 2048;
 
+// #72: N64 opaque world-space caster triangles for this frame, set by the interpreter
+// (SoH3D_GL_SetN64ShadowCasters) right before the render pass. 9 floats (3 xyz verts) per triangle.
+// Rendered into the shadow map alongside the SoH3D g_drawList casters so N64 geometry (N64 Link,
+// unreplaced actors, scene) also casts a sun shadow. g_n64CasterVbo is a small reused VBO.
+const float* g_n64ShadowCasters = nullptr;
+size_t g_n64ShadowCasterTris = 0;
+GLuint g_n64CasterVbo = 0;
+
 // --- Ambient occlusion: a screen-space SSAO over a private camera-view depth render of the SoH3D
 // content (so it stays pixel-aligned with the visible draw and never has to blit Fast3D's
 // MSAA/renderbuffer depth). g_aoProgram is a separate full-screen shader. ---
@@ -1038,6 +1046,42 @@ static bool ensureShadowFbo() {
     return true;
 }
 
+// #72: store this frame's N64 opaque world-space caster triangles (set by the interpreter just
+// before the render pass). Positions are WORLD-space; the shadow loop draws them with mp = lightVP.
+extern "C" void SoH3D_GL_SetN64ShadowCasters(const float* worldXYZ, size_t triCount) {
+    g_n64ShadowCasters = worldXYZ;
+    g_n64ShadowCasterTris = (worldXYZ && triCount) ? triCount : 0;
+}
+
+// #72: draw the captured N64 caster triangle soup into the currently-bound shadow depth FBO. The
+// positions are already WORLD-space, so model = identity and mp = lightVP. Depth-only: uSkin/uLit/
+// uShadowOn are forced off (renderShadowMap already set uShadowOn=0). Reuses a small VBO. Assumes
+// g_program is current and the shadow FBO + viewport are bound by the caller.
+static void SoH3D_GL_ShadowCasterTris(const float* worldXYZ, size_t triCount, const float* lightVP) {
+    if (!worldXYZ || triCount == 0) return;
+    if (!g_n64CasterVbo) glGenBuffers(1, &g_n64CasterVbo);
+
+    float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    glUniformMatrix4fv(g_uMP, 1, GL_FALSE, lightVP); // positions are world-space -> clip = lightVP*world
+    glUniformMatrix4fv(g_uMV, 1, GL_FALSE, identity);
+    glUniform1f(g_uSkin, 0.0f); // no skinning: shader uses aPos directly
+    glUniform1f(g_uLit, 0.0f);
+    glUniform1f(g_uAlphaRef, 0.0f);
+    glUniform1f(g_uDepthOffset, 0.0f);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE); // N64 winding varies; cast from both sides (depth-only)
+
+    glBindBuffer(GL_ARRAY_BUFFER, g_n64CasterVbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(triCount * 9 * sizeof(float)), worldXYZ, GL_STREAM_DRAW);
+    // Only attribute 0 (aPos) is consumed (uSkin/uLit off). Disable the others so they don't read a
+    // previous model's VBO; drawOne re-enables + re-points all of them on the next visible draw.
+    glEnableVertexAttribArray(0);
+    for (int a = 1; a <= 5; a++) glDisableVertexAttribArray(a);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(triCount * 3));
+}
+
 // Render the shadow casters' depth from the light's POV into g_shadowFbo. Assumes the main-pass
 // GL state (g_vao, g_program, depth test) is already installed by beginPass; restores the game's
 // FBO + viewport before returning. invertY is forced OFF here so the stored depth matches the
@@ -1074,6 +1118,9 @@ static void renderShadowMap(GLint gameFbo, const GLint vp[4], const float lightV
         drawOne(*m, depthMP, it.mv, /*lit=*/0, /*invertY=*/0, 255, 255, 255, 255, /*aspectAdj=*/1.0f, pose,
                 it.boneCount, it.midMask);
     }
+    // #72: also render N64 opaque world-space casters (N64 Link, unreplaced actors, scene mesh) so
+    // they cast a sun shadow too, not just the SoH3D model path above.
+    SoH3D_GL_ShadowCasterTris(g_n64ShadowCasters, g_n64ShadowCasterTris, lightVP);
     glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)gameFbo);
     glViewport(vp[0], vp[1], vp[2], vp[3]);
 }
@@ -1368,6 +1415,9 @@ extern "C" void SoH3D_GL_RenderPass(void) {
                 mat4Mul(depthMP, lightVP, it.mv); // model -> light-clip = lightVP * (model -> world)
                 SoH3D_Vk_ShadowCasterDraw(it.modelId, depthMP, it.mv, poseOf(it), it.boneCount, it.midMask);
             }
+            // #72: also record N64 opaque world-space casters into the open shadow pass
+            // (declared in fast/soh3d_vk.h, defined in soh3d_vk.cpp).
+            SoH3D_Vk_ShadowCasterTris(g_n64ShadowCasters, g_n64ShadowCasterTris, lightVP);
             SoH3D_Vk_EndShadowPass();
             shadowsOn = true;
         }
