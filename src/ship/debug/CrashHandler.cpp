@@ -138,6 +138,15 @@ void CrashHandler::PrintRegisters(ucontext_t* ctx) {
 }
 
 static void ErrorHandler(int sig, siginfo_t* sigInfo, void* data) {
+    // Guard against re-entry: this handler itself allocates (backtrace_symbols, demangle, strings),
+    // so if the crash corrupted the heap a nested fault would recurse forever / hang. On the second
+    // entry, terminate immediately and async-signal-safely.
+    static volatile sig_atomic_t sHandling = 0;
+    if (sHandling) {
+        _exit(128 + sig);
+    }
+    sHandling = 1;
+
     std::shared_ptr<CrashHandler> crashHandler = Context::GetRawInstance()->GetCrashHandler();
     char intToCharBuffer[16];
 
@@ -204,8 +213,14 @@ static void ErrorHandler(int sig, siginfo_t* sigInfo, void* data) {
     crashHandler->PrintCommon();
 
     Context::GetRawInstance()->GetLogger()->flush();
-    spdlog::shutdown();
-    exit(1);
+    // Use _exit, NOT exit(): the crash frequently fires DURING normal teardown (~Context) with the
+    // heap already corrupted and the malloc lock held (e.g. the window-close Vulkan/Wayland swapchain
+    // teardown double-free). exit() would re-run atexit handlers and global destructors against that
+    // heap and deadlock — leaving the process running forever after the window is closed. _exit
+    // terminates immediately without touching the heap or re-entering teardown. spdlog::shutdown()
+    // is skipped for the same reason; the flush above is best-effort and the crash text is already
+    // on stderr.
+    _exit(1);
 }
 
 static void ShutdownHandler(int sig, siginfo_t* sigInfo, void* data) {
