@@ -259,7 +259,8 @@ bool g_progFailed = false;
 
 // --- Sun-shadow map (depth render from the light) ---
 GLuint g_shadowFbo = 0, g_shadowTex = 0;
-int g_shadowRes = 2048;
+int g_shadowRes = 4096; // 4K depth: keeps texel density ~constant despite the larger frustum below, so
+                        // distant actors gain shadows without the near ones turning blocky (was 2048).
 
 // #72: N64 opaque world-space caster triangles for this frame, set by the interpreter
 // (SoH3D_GL_SetN64ShadowCasters) right before the render pass. 9 floats (3 xyz verts) per triangle.
@@ -508,7 +509,11 @@ extern "C" int gSoH3dShadowCastAll = 0;
 // soh3d.c. hasFocus stays 0 until first set (no shadows on the title/no-scene frames).
 extern "C" float gSoH3dShadowFocus[3] = { 0.0f, 0.0f, 0.0f };
 extern "C" int gSoH3dShadowHasFocus = 0;
-extern "C" float gSoH3dShadowRadius = 240.0f;   // half-size of the ortho box around the focus (world units)
+extern "C" float gSoH3dShadowRadius = 600.0f;   // half-size of the ortho box around the focus (world units).
+                                                // 600 (was 240) covers distant actors so they cast shadows
+                                                // too — the small box clipped anything >240u from the look-at
+                                                // out of the shadow map (the "distant actors no shadow" bug).
+                                                // g_shadowRes bumped to 4096 to hold texel density. REPL `shadow rad`.
 extern "C" float gSoH3dShadowDist = 1600.0f;    // light "camera" pullback along the sun dir
 extern "C" float gSoH3dShadowBias = 0.0030f;    // depth-compare bias (acne vs peter-panning)
 extern "C" float gSoH3dShadowStrength = 0.55f;  // how dark the shadowed area gets (0..1)
