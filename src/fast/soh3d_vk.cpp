@@ -48,6 +48,13 @@ extern "C" float gSoH3dAoRadius;   // SSAO sample radius in PIXELS
 extern "C" float gSoH3dAoStrength; // how dark fully-occluded fragments get (0..1)
 extern "C" float gSoH3dAoBias;     // min depth delta to count an occluder
 extern "C" float gSoH3dAoMaxDiff;  // depth delta beyond which a neighbour is a silhouette, not a crease
+// Dynamic sun-shadow tunables, owned by the GL pass (soh3d_gl.cpp), driven by the REPL `shadow` /
+// RmlUi Graphics menu. Mirror the GL backend so the toggle works under Vulkan too (#72). The
+// world->light-clip matrix (computeLightVP) is computed by the GL dispatcher and handed to us.
+extern "C" int gSoH3dShadowEnable;   // -1 uninit (resolved by the GL dispatcher), 0 off, 1 on
+extern "C" int gSoH3dShadowHasFocus; // 0 until soh3d.c sets the focus point (no shadows pre-scene)
+extern "C" float gSoH3dShadowBias;
+extern "C" float gSoH3dShadowStrength;
 static int vkFaceCullOn() {
     if (gSoH3dFaceCull < 0) {
         const char* e = getenv("SOH3D_FACECULL");
@@ -98,6 +105,7 @@ layout(location=5) in vec4 aColor;
 layout(location=0) out vec2 vUv;
 layout(location=1) out vec4 vColor;
 layout(location=2) out vec3 vNrmView;
+layout(location=3) out vec3 vWorld;
 layout(binding=0, std140) uniform UBO {
     mat4 uMP;
     mat4 uMV;
@@ -106,6 +114,8 @@ layout(binding=0, std140) uniform UBO {
     vec4 uParams;    // x=invertY(+1/-1) y=lit z=alphaRef w=depthOffset
     vec4 uTintSkin;  // xyz=tint w=skin(0/1)
     vec4 uExtra;     // x=per-draw alpha (1=opaque) y=texcoord scroll U z=scroll V (cloud drift, #28b)
+    mat4 uLightVP;   // WORLD -> sun light-clip (dynamic shadow); unused when uShadow.x==0
+    vec4 uShadow;    // x=shadowOn y=bias z=strength w=texel (1/shadowRes)
 } ubo;
 void main() {
     vColor = aColor;
@@ -127,6 +137,7 @@ void main() {
     if (ubo.uLightDir.w > 0.5) c.z = c.w; // skybox: pin to far plane (Vulkan far = z/w = 1)
     gl_Position = c;
     vNrmView = mat3(ubo.uMV) * nM; // world-space normal (uMV is model->world; see soh3d_gl.cpp)
+    vWorld = (ubo.uMV * vec4(sp, 1.0)).xyz; // world-space position for the shadow projection
     // CMB/PICA UVs are top-origin. Texture SAMPLING maps v=0 -> data row 0 identically in GL and
     // Vulkan (the bottom-left/top-left API difference is framebuffer-only, NOT texture data), so the
     // same 1-v flip GL uses is required here too. (Visible only on detailed texels - face/emblem -
@@ -139,6 +150,7 @@ const char* kFrag = R"(#version 450
 layout(location=0) in vec2 vUv;
 layout(location=1) in vec4 vColor;
 layout(location=2) in vec3 vNrmView;
+layout(location=3) in vec3 vWorld;
 layout(location=0) out vec4 frag;
 layout(binding=0, std140) uniform UBO {
     mat4 uMP;
@@ -148,8 +160,27 @@ layout(binding=0, std140) uniform UBO {
     vec4 uParams;
     vec4 uTintSkin;
     vec4 uExtra;
+    mat4 uLightVP;
+    vec4 uShadow;  // x=on y=bias z=strength w=texel
 } ubo;
 layout(binding=1) uniform sampler2D uTex;
+layout(binding=2) uniform sampler2D uShadowMap;
+// Fraction of this fragment that is LIT (1 = fully lit, 0 = in shadow), 3x3 PCF. The light-clip ->
+// depth/texcoord mapping matches the depth render (kVert's c.z [0,1] convert + Vulkan Y-down NDC),
+// so p = (lc.xyz/lc.w)*0.5+0.5 indexes both the same as the GL path (soh3d_gl.cpp shadowLit).
+float shadowLit() {
+    vec4 lc = ubo.uLightVP * vec4(vWorld, 1.0);
+    vec3 p = lc.xyz / lc.w;
+    p = p * 0.5 + 0.5;
+    if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0 || p.z > 1.0) return 1.0; // outside box = lit
+    float lit = 0.0;
+    for (int y = -1; y <= 1; y++)
+        for (int x = -1; x <= 1; x++) {
+            float d = texture(uShadowMap, p.xy + vec2(float(x), float(y)) * ubo.uShadow.w).r;
+            lit += (p.z - ubo.uShadow.y > d) ? 0.0 : 1.0;
+        }
+    return lit / 9.0;
+}
 void main() {
     vec4 t = texture(uTex, vUv);
     if (t.a < ubo.uParams.z) discard;
@@ -159,11 +190,13 @@ void main() {
         float hl = dot(normalize(vNrmView), normalize(ubo.uLightDir.xyz)) * 0.5 + 0.5;
         shade = ubo.uTintSkin.xyz * (0.55 + 0.45 * hl);
     }
+    if (ubo.uShadow.x > 0.5) // dynamic sun-shadow: darken by the shadowed fraction (lit + unlit draws)
+        shade *= (1.0 - ubo.uShadow.z * (1.0 - shadowLit()));
     frag = vec4(t.rgb * vColor.rgb * shade, t.a * vColor.a * ubo.uExtra.x); // uExtra.x = per-draw alpha
 }
 )";
 
-// std140 UBO layout matching the shader block (2224 bytes).
+// std140 UBO layout matching the shader block.
 struct VkUbo {
     float uMP[16];
     float uMV[16];
@@ -171,7 +204,9 @@ struct VkUbo {
     float uLightDir[4];
     float uParams[4];
     float uTintSkin[4];
-    float uExtra[4]; // x = per-draw alpha (1 = opaque); y/z = texcoord scroll U/V (cloud drift, #28b)
+    float uExtra[4];   // x = per-draw alpha (1 = opaque); y/z = texcoord scroll U/V (cloud drift, #28b)
+    float uLightVP[16]; // WORLD -> sun light-clip (dynamic shadow); identity when shadows off
+    float uShadow[4];   // x=on y=bias z=strength w=texel
 };
 
 struct VkTex {
@@ -266,6 +301,23 @@ uint32_t g_aoW = 0, g_aoH = 0;
 bool g_aoResReady = false, g_aoResFailed = false;
 bool g_aoPrepassActive = false;
 constexpr VkFormat kAoDepthFormat = VK_FORMAT_D32_SFLOAT;
+
+// ---- Dynamic sun-shadow state ----
+// Square depth map rendered from the sun direction (reuses g_aoDepthRP — same depth-only render
+// pass). The model fragment shader projects each world fragment into light-clip and PCF-samples it.
+VkImage g_shadowImg = VK_NULL_HANDLE;
+VkDeviceMemory g_shadowMem = VK_NULL_HANDLE;
+VkImageView g_shadowView = VK_NULL_HANDLE;
+VkFramebuffer g_shadowFb = VK_NULL_HANDLE;
+uint32_t g_shadowDim = 0;
+constexpr uint32_t kShadowRes = 2048; // matches the GL backend's g_shadowRes
+bool g_shadowPassActive = false;
+// Per-RenderPass shadow state set by SoH3D_Vk_SetShadow, consumed by SoH3D_Vk_DrawModel.
+bool g_shadowOn = false;
+float g_shadowLightVP[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+// 1x1 dummy depth texture bound to the model shader's shadow sampler when shadows are off (the
+// sampler is statically used, so it must always be valid even though uShadow.x gates the sampling).
+VkTex g_dummyDepth{};
 
 // Depth-only fragment shader: only alpha-test discard (no colour attachment in the depth RP). The
 // vertex shader (kVert, reused) computes gl_Position identically to the visible draw -> pixel-aligned.
@@ -536,7 +588,7 @@ bool ensureResources(const SoH3DVkContext& ctx) {
     g_vsMod = makeModule(vsSpv);
     g_fsMod = makeModule(fsSpv);
 
-    VkDescriptorSetLayoutBinding binds[2]{};
+    VkDescriptorSetLayoutBinding binds[3]{};
     binds[0].binding = 0;
     binds[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     binds[0].descriptorCount = 1;
@@ -545,9 +597,13 @@ bool ensureResources(const SoH3DVkContext& ctx) {
     binds[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     binds[1].descriptorCount = 1;
     binds[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    binds[2].binding = 2; // shadow map (dynamic sun-shadow); dummy depth when shadows off
+    binds[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    binds[2].descriptorCount = 1;
+    binds[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo dli{};
     dli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dli.bindingCount = 2;
+    dli.bindingCount = 3;
     dli.pBindings = binds;
     vkCreateDescriptorSetLayout(g_device, &dli, nullptr, &g_setLayout);
 
@@ -575,7 +631,7 @@ bool ensureResources(const SoH3DVkContext& ctx) {
         ps[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         ps[0].descriptorCount = kMaxGroupsPerFrame;
         ps[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        ps[1].descriptorCount = kMaxGroupsPerFrame;
+        ps[1].descriptorCount = kMaxGroupsPerFrame * 2; // model draws use 2 samplers (tex + shadow)
         VkDescriptorPoolCreateInfo dpi{};
         dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         dpi.maxSets = kMaxGroupsPerFrame;
@@ -586,6 +642,64 @@ bool ensureResources(const SoH3DVkContext& ctx) {
 
     uploadTexture(g_dummyTex, 1, 1, nullptr); // 1x1 white for untextured groups
     g_dummySampler = getSampler(0x2901, 0x2901);
+
+    // 1x1 dummy depth image for the model shader's shadow sampler when shadows are off. Never
+    // sampled meaningfully (uShadow.x gates it), but must be a valid bound resource in READ layout.
+    {
+        VkImageCreateInfo ii{};
+        ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ii.imageType = VK_IMAGE_TYPE_2D;
+        ii.format = kAoDepthFormat;
+        ii.extent = { 1, 1, 1 };
+        ii.mipLevels = 1;
+        ii.arrayLayers = 1;
+        ii.samples = VK_SAMPLE_COUNT_1_BIT;
+        ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        vkCreateImage(g_device, &ii, nullptr, &g_dummyDepth.image);
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(g_device, g_dummyDepth.image, &req);
+        VkMemoryAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = findMemType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        vkAllocateMemory(g_device, &ai, nullptr, &g_dummyDepth.mem);
+        vkBindImageMemory(g_device, g_dummyDepth.image, g_dummyDepth.mem, 0);
+        VkImageViewCreateInfo vi{};
+        vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vi.image = g_dummyDepth.image;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = kAoDepthFormat;
+        vi.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+        vkCreateImageView(g_device, &vi, nullptr, &g_dummyDepth.view);
+        oneShot([&](VkCommandBuffer cmd) {
+            VkImageMemoryBarrier b{};
+            b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            b.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = g_dummyDepth.image;
+            b.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                                 0, nullptr, 0, nullptr, 1, &b);
+        });
+    }
+
+    // Nearest/clamp sampler for the AO depth + shadow map (shared; created here so shadows work
+    // even when AO is off). PCF in the shader samples explicit offsets, so NEAREST is correct.
+    {
+        VkSamplerCreateInfo sci{};
+        sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxLod = 0.0f;
+        vkCreateSampler(g_device, &sci, nullptr, &g_aoDepthSampler);
+    }
+
     g_resReady = true;
     fprintf(stderr, "[SoH3D_VK] resources ready (ubo stride %llu)\n", (unsigned long long)g_uboStride);
     return true;
@@ -966,14 +1080,6 @@ bool ensureAoResources() {
         return false;
     }
 
-    VkSamplerCreateInfo sci{};
-    sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
-    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sci.maxLod = 0.0f;
-    vkCreateSampler(g_device, &sci, nullptr, &g_aoDepthSampler);
-
     g_aoResReady = true;
     fprintf(stderr, "[SoH3D_VK] AO resources ready\n");
     return true;
@@ -1138,6 +1244,167 @@ bool ensureAoDepth(uint32_t w, uint32_t h) {
     return true;
 }
 
+// (Re)create the square shadow depth map + framebuffer (on g_aoDepthRP) at the given resolution.
+bool ensureShadowMap(uint32_t dim) {
+    if (dim == 0)
+        return false;
+    if (g_shadowImg != VK_NULL_HANDLE && g_shadowDim == dim)
+        return true;
+    if (g_shadowImg != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(g_device);
+        vkDestroyFramebuffer(g_device, g_shadowFb, nullptr);
+        vkDestroyImageView(g_device, g_shadowView, nullptr);
+        vkDestroyImage(g_device, g_shadowImg, nullptr);
+        vkFreeMemory(g_device, g_shadowMem, nullptr);
+        g_shadowFb = VK_NULL_HANDLE;
+        g_shadowView = VK_NULL_HANDLE;
+        g_shadowImg = VK_NULL_HANDLE;
+        g_shadowMem = VK_NULL_HANDLE;
+    }
+    VkImageCreateInfo ii{};
+    ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = kAoDepthFormat;
+    ii.extent = { dim, dim, 1 };
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(g_device, &ii, nullptr, &g_shadowImg) != VK_SUCCESS)
+        return false;
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(g_device, g_shadowImg, &req);
+    VkMemoryAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = findMemType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    vkAllocateMemory(g_device, &ai, nullptr, &g_shadowMem);
+    vkBindImageMemory(g_device, g_shadowImg, g_shadowMem, 0);
+
+    VkImageViewCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image = g_shadowImg;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = kAoDepthFormat;
+    vi.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+    vkCreateImageView(g_device, &vi, nullptr, &g_shadowView);
+
+    VkFramebufferCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fci.renderPass = g_aoDepthRP;
+    fci.attachmentCount = 1;
+    fci.pAttachments = &g_shadowView;
+    fci.width = dim;
+    fci.height = dim;
+    fci.layers = 1;
+    vkCreateFramebuffer(g_device, &fci, nullptr, &g_shadowFb);
+    g_shadowDim = dim;
+    fprintf(stderr, "[SoH3D_VK] shadow map %ux%u ready\n", dim, dim);
+    return true;
+}
+
+// Record one model's depth-only groups into the currently-open depth render pass (AO pre-pass or
+// shadow map). mp16 is the model->clip for that pass (camera clip for AO, light clip for shadow).
+// Assumes the caller has begun the render pass and set viewport/scissor.
+void recordDepthDraw(int modelId, const float* mp16, const float* mv16, int invertY, float aspectAdj,
+                     const float* boneData, int boneCnt, unsigned long long midMask) {
+    VkModel* m = ensureUploaded(modelId);
+    if (!m)
+        return;
+    Ring& ring = g_rings[g_ctx.frameIndex];
+    VkCommandBuffer cmd = g_ctx.cmd;
+
+    VkUbo base{};
+    memcpy(base.uMP, mp16, sizeof(base.uMP));
+    base.uMP[0] *= aspectAdj;
+    base.uMP[4] *= aspectAdj;
+    base.uMP[8] *= aspectAdj;
+    base.uMP[12] *= aspectAdj;
+    memcpy(base.uMV, mv16 ? mv16 : mp16, sizeof(base.uMV));
+    for (int k = 0; k < 32; k++)
+        for (int e = 0; e < 16; e++)
+            base.uBones[k * 16 + e] = (e % 5 == 0) ? 1.0f : 0.0f;
+    if (boneData && boneCnt > 0) {
+        int nb = boneCnt < 32 ? boneCnt : 32;
+        for (int k = 0; k < nb; k++) {
+            const float* s = boneData + k * 16;
+            float* d = base.uBones + k * 16;
+            for (int r = 0; r < 4; r++)
+                for (int col = 0; col < 4; col++)
+                    d[col * 4 + r] = s[r * 4 + col];
+        }
+    }
+    base.uParams[0] = invertY ? -1.0f : 1.0f;
+    base.uTintSkin[3] = (boneData && boneCnt > 0) ? 1.0f : 0.0f;
+
+    int frontCW = (invertY != 0) ^ (gSoH3dFaceCullFlip != 0);
+    bool vboBound = false;
+    for (const VkGroup& grp : m->groups) {
+        if (grp.cull)
+            continue;
+        if (grp.meshId >= 0 && grp.meshId < 64 && !((midMask >> grp.meshId) & 1ull))
+            continue;
+        if (ring.offset + g_uboStride > ring.capacity)
+            return;
+
+        VkUbo ubo = base;
+        ubo.uParams[2] = grp.alphaTest ? grp.alphaRef : 0.0f; // alpha-test cutout depth
+        const VkDeviceSize uboOff = ring.offset;
+        memcpy((uint8_t*)ring.mapped + uboOff, &ubo, sizeof(ubo));
+        ring.offset += g_uboStride;
+
+        VkDescriptorSetAllocateInfo dai{};
+        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dai.descriptorPool = ring.pool;
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &g_setLayout;
+        VkDescriptorSet set;
+        if (vkAllocateDescriptorSets(g_device, &dai, &set) != VK_SUCCESS)
+            return;
+        VkDescriptorBufferInfo bi{};
+        bi.buffer = ring.ubo;
+        bi.offset = uboOff;
+        bi.range = sizeof(VkUbo);
+        VkImageView view = g_dummyTex.view;
+        VkSampler samp = g_dummySampler;
+        if (grp.texIndex >= 0 && grp.texIndex < (int)m->textures.size()) {
+            view = m->textures[grp.texIndex].view;
+            samp = getSampler(grp.wrapS, grp.wrapT);
+        }
+        VkDescriptorImageInfo ii{};
+        ii.sampler = samp;
+        ii.imageView = view;
+        ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet w[2]{}; // binding 2 (shadow) is unused by the depth shader -> not written
+        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[0].dstSet = set;
+        w[0].dstBinding = 0;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        w[0].descriptorCount = 1;
+        w[0].pBufferInfo = &bi;
+        w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[1].dstSet = set;
+        w[1].dstBinding = 1;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[1].descriptorCount = 1;
+        w[1].pImageInfo = &ii;
+        vkUpdateDescriptorSets(g_device, 2, w, 0, nullptr);
+
+        bool doCull = grp.faceCull && vkFaceCullOn();
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, getAoDepthPipeline(doCull, frontCW));
+        if (!vboBound) {
+            VkDeviceSize zero = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &m->vbo, &zero);
+            vboBound = true;
+        }
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeLayout, 0, 1, &set, 0, nullptr);
+        vkCmdDraw(cmd, grp.count, 1, grp.first, 0);
+    }
+}
+
 // Reset the per-frame UBO ring + descriptor pool once per RenderPass cycle (see g_frameStarted).
 void startFrameOnce() {
     if (g_frameStarted)
@@ -1262,6 +1529,14 @@ extern "C" void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* 
     base.uExtra[0] = a8 / 255.0f;          // per-draw opacity (dawn/dusk dome cross-fade); 1 = opaque
     base.uExtra[1] = uvOffU;               // texcoord scroll U (cloud-band drift, #28b); 0 = none
     base.uExtra[2] = uvOffV;               // texcoord scroll V
+    // Dynamic sun-shadow: world->light-clip matrix + tunables (set per RenderPass by SetShadow). The
+    // shadow term darkens BOTH lit and unlit draws so characters cast onto the OoT3D ground.
+    if (g_shadowOn)
+        memcpy(base.uLightVP, g_shadowLightVP, sizeof(base.uLightVP));
+    base.uShadow[0] = g_shadowOn ? 1.0f : 0.0f;
+    base.uShadow[1] = gSoH3dShadowBias;
+    base.uShadow[2] = gSoH3dShadowStrength;
+    base.uShadow[3] = g_shadowDim ? 1.0f / (float)g_shadowDim : 0.0f;
     bool forceBlend = (a8 < 255);          // translucent draw -> alpha-over even if the material is opaque
 
     bool vboBound = false;
@@ -1305,7 +1580,13 @@ extern "C" void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* 
         ii.imageView = view;
         ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        VkWriteDescriptorSet w[2]{};
+        // Shadow map (binding 2): the live depth render when shadows are on, else the dummy depth.
+        VkDescriptorImageInfo si{};
+        si.sampler = g_aoDepthSampler;
+        si.imageView = (g_shadowOn && g_shadowView != VK_NULL_HANDLE) ? g_shadowView : g_dummyDepth.view;
+        si.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+
+        VkWriteDescriptorSet w[3]{};
         w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[0].dstSet = set;
         w[0].dstBinding = 0;
@@ -1318,7 +1599,13 @@ extern "C" void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* 
         w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w[1].descriptorCount = 1;
         w[1].pImageInfo = &ii;
-        vkUpdateDescriptorSets(g_device, 2, w, 0, nullptr);
+        w[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[2].dstSet = set;
+        w[2].dstBinding = 2;
+        w[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[2].descriptorCount = 1;
+        w[2].pImageInfo = &si;
+        vkUpdateDescriptorSets(g_device, 3, w, 0, nullptr);
 
         // Translucent draw over an opaque material: synthesize a standard alpha-over pipeline (the
         // VkGroup blend-factor defaults are SRC_ALPHA / ONE_MINUS_SRC_ALPHA) so uExtra.x composites,
@@ -1350,6 +1637,7 @@ extern "C" void SoH3D_Vk_EndPass(void) {
     g_ctxValid = false;
     g_frameStarted = false; // next RenderPass cycle resets the ring afresh
     g_aoPrepassActive = false;
+    g_shadowOn = false; // each cycle re-establishes the shadow term via SetShadow
 }
 
 // --- AO offscreen pre-pass + composite -----------------------------------------------------------
@@ -1394,104 +1682,7 @@ extern "C" void SoH3D_Vk_DepthPrepassDraw(int modelId, const float* mp16, const 
                                           unsigned long long midMask, int sky) {
     if (!g_aoPrepassActive || sky) // sky goes to the far plane -> reads 1.0 -> no AO; just skip it
         return;
-    VkModel* m = ensureUploaded(modelId);
-    if (!m)
-        return;
-    Ring& ring = g_rings[g_ctx.frameIndex];
-    VkCommandBuffer cmd = g_ctx.cmd;
-
-    // Base UBO: same transforms/skin as the visible draw (lighting irrelevant for depth).
-    VkUbo base{};
-    memcpy(base.uMP, mp16, sizeof(base.uMP));
-    base.uMP[0] *= aspectAdj;
-    base.uMP[4] *= aspectAdj;
-    base.uMP[8] *= aspectAdj;
-    base.uMP[12] *= aspectAdj;
-    memcpy(base.uMV, mv16 ? mv16 : mp16, sizeof(base.uMV));
-    for (int k = 0; k < 32; k++)
-        for (int e = 0; e < 16; e++)
-            base.uBones[k * 16 + e] = (e % 5 == 0) ? 1.0f : 0.0f;
-    if (boneData && boneCnt > 0) {
-        int nb = boneCnt < 32 ? boneCnt : 32;
-        for (int k = 0; k < nb; k++) {
-            const float* s = boneData + k * 16;
-            float* d = base.uBones + k * 16;
-            for (int r = 0; r < 4; r++)
-                for (int col = 0; col < 4; col++)
-                    d[col * 4 + r] = s[r * 4 + col];
-        }
-    }
-    base.uParams[0] = invertY ? -1.0f : 1.0f;
-    base.uParams[1] = 0.0f; // unused (no lighting in depth)
-    base.uTintSkin[3] = (boneData && boneCnt > 0) ? 1.0f : 0.0f;
-    base.uLightDir[3] = 0.0f; // not sky (sky was skipped above)
-
-    int frontCW = (invertY != 0) ^ (gSoH3dFaceCullFlip != 0);
-    bool vboBound = false;
-    for (const VkGroup& grp : m->groups) {
-        if (grp.cull)
-            continue;
-        if (grp.meshId >= 0 && grp.meshId < 64 && !((midMask >> grp.meshId) & 1ull))
-            continue;
-        if (ring.offset + g_uboStride > ring.capacity)
-            return;
-
-        VkUbo ubo = base;
-        ubo.uParams[2] = grp.alphaTest ? grp.alphaRef : 0.0f; // alpha-test cutout depth
-        ubo.uParams[3] = 0.0f;
-        const VkDeviceSize uboOff = ring.offset;
-        memcpy((uint8_t*)ring.mapped + uboOff, &ubo, sizeof(ubo));
-        ring.offset += g_uboStride;
-
-        VkDescriptorSetAllocateInfo dai{};
-        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dai.descriptorPool = ring.pool;
-        dai.descriptorSetCount = 1;
-        dai.pSetLayouts = &g_setLayout;
-        VkDescriptorSet set;
-        if (vkAllocateDescriptorSets(g_device, &dai, &set) != VK_SUCCESS)
-            return;
-        VkDescriptorBufferInfo bi{};
-        bi.buffer = ring.ubo;
-        bi.offset = uboOff;
-        bi.range = sizeof(VkUbo);
-        VkImageView view = g_dummyTex.view;
-        VkSampler samp = g_dummySampler;
-        if (grp.texIndex >= 0 && grp.texIndex < (int)m->textures.size()) {
-            view = m->textures[grp.texIndex].view;
-            samp = getSampler(grp.wrapS, grp.wrapT);
-        }
-        VkDescriptorImageInfo ii{};
-        ii.sampler = samp;
-        ii.imageView = view;
-        ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        VkWriteDescriptorSet w[2]{};
-        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[0].dstSet = set;
-        w[0].dstBinding = 0;
-        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        w[0].descriptorCount = 1;
-        w[0].pBufferInfo = &bi;
-        w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[1].dstSet = set;
-        w[1].dstBinding = 1;
-        w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w[1].descriptorCount = 1;
-        w[1].pImageInfo = &ii;
-        vkUpdateDescriptorSets(g_device, 2, w, 0, nullptr);
-
-        bool doCull = grp.faceCull && vkFaceCullOn();
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, getAoDepthPipeline(doCull, frontCW));
-        vkCmdSetViewport(cmd, 0, 1, &g_ctx.viewport);
-        vkCmdSetScissor(cmd, 0, 1, &g_ctx.scissor);
-        if (!vboBound) {
-            VkDeviceSize zero = 0;
-            vkCmdBindVertexBuffers(cmd, 0, 1, &m->vbo, &zero);
-            vboBound = true;
-        }
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeLayout, 0, 1, &set, 0, nullptr);
-        vkCmdDraw(cmd, grp.count, 1, grp.first, 0);
-    }
+    recordDepthDraw(modelId, mp16, mv16, invertY, aspectAdj, boneData, boneCnt, midMask);
 }
 
 extern "C" void SoH3D_Vk_EndDepthPrepass(void) {
@@ -1521,6 +1712,73 @@ extern "C" void SoH3D_Vk_AoComposite(void) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_aoCompPipeLayout, 0, 1, &g_aoCompSet, 0,
                             nullptr);
     vkCmdDraw(cmd, 3, 1, 0, 0);
+}
+
+// --- Dynamic sun-shadow offscreen pass -----------------------------------------------------------
+
+// Begin the shadow depth map render (light's POV). Returns 0 if shadows are off / no focus yet /
+// resources unavailable. Ends the FB pass (offscreen pass can't nest), like the AO pre-pass.
+extern "C" int SoH3D_Vk_BeginShadowPass(void) {
+    g_shadowPassActive = false;
+    if (!gSoH3dShadowEnable || !gSoH3dShadowHasFocus || !Fast::g_activeVulkanApi)
+        return 0;
+    if (!Fast::g_activeVulkanApi->BeginSoH3DOffscreen(g_ctx))
+        return 0;
+    if (!ensureResources(g_ctx) || !ensureAoResources()) // ensureAoResources owns g_aoDepthRP + depth pipes
+        return 0;
+    startFrameOnce();
+    if (!ensureShadowMap(kShadowRes))
+        return 0;
+
+    VkClearValue clr{};
+    clr.depthStencil = { 1.0f, 0 }; // empty texels read far -> ground not under a caster is lit
+    VkRenderPassBeginInfo rp{};
+    rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rp.renderPass = g_aoDepthRP;
+    rp.framebuffer = g_shadowFb;
+    rp.renderArea.offset = { 0, 0 };
+    rp.renderArea.extent = { g_shadowDim, g_shadowDim };
+    rp.clearValueCount = 1;
+    rp.pClearValues = &clr;
+    vkCmdBeginRenderPass(g_ctx.cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    VkViewport vp{};
+    vp.x = 0.0f;
+    vp.y = 0.0f;
+    vp.width = (float)g_shadowDim;
+    vp.height = (float)g_shadowDim;
+    vp.minDepth = 0.0f;
+    vp.maxDepth = 1.0f;
+    VkRect2D sc{};
+    sc.offset = { 0, 0 };
+    sc.extent = { g_shadowDim, g_shadowDim };
+    vkCmdSetViewport(g_ctx.cmd, 0, 1, &vp);
+    vkCmdSetScissor(g_ctx.cmd, 0, 1, &sc);
+    g_shadowPassActive = true;
+    return 1;
+}
+
+// Record one shadow caster into the shadow map. mp16 = lightVP * (model->world); invertY forced 0
+// (the fragment shadow projection samples uLightVP*world directly, matching the GL path).
+extern "C" void SoH3D_Vk_ShadowCasterDraw(int modelId, const float* mp16, const float* mv16,
+                                          const float* boneData, int boneCnt, unsigned long long midMask) {
+    if (!g_shadowPassActive)
+        return;
+    recordDepthDraw(modelId, mp16, mv16, /*invertY=*/0, /*aspectAdj=*/1.0f, boneData, boneCnt, midMask);
+}
+
+extern "C" void SoH3D_Vk_EndShadowPass(void) {
+    if (!g_shadowPassActive)
+        return;
+    vkCmdEndRenderPass(g_ctx.cmd); // shadow map now in DEPTH_STENCIL_READ_ONLY_OPTIMAL
+    g_shadowPassActive = false;
+}
+
+// Enable/disable the shadow term for the upcoming visible model draws (set by the dispatcher after
+// the shadow map renders). lightVP16 = world->light-clip (computeLightVP); ignored when on == 0.
+extern "C" void SoH3D_Vk_SetShadow(int on, const float* lightVP16) {
+    g_shadowOn = (on != 0);
+    if (g_shadowOn && lightVP16)
+        memcpy(g_shadowLightVP, lightVP16, sizeof(g_shadowLightVP));
 }
 
 #endif // ENABLE_VULKAN

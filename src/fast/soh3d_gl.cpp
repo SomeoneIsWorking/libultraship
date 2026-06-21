@@ -1331,10 +1331,14 @@ extern "C" void SoH3D_GL_RenderPass(void) {
     if (SoH3D_Vk_Active()) {
         std::vector<float> lerped;
         float step = gSoH3dInterpStep;
-        // Resolve the AO master toggle the same way the GL path does (env default, CVar override).
+        // Resolve the AO + shadow master toggles the same way the GL path does (env default, CVar).
         if (gSoH3dAoEnable < 0) {
             const char* e = getenv("SOH3D_AO");
             gSoH3dAoEnable = CVarGetInteger("gSoH3d.AO", (e && e[0] == '0') ? 0 : 1);
+        }
+        if (gSoH3dShadowEnable < 0) {
+            const char* e = getenv("SOH3D_SHADOW");
+            gSoH3dShadowEnable = CVarGetInteger("gSoH3d.Shadows", (e && e[0] == '0') ? 0 : 1);
         }
         // Resolve this item's interpolated skin pose (shared by the depth pre-pass + visible draw).
         auto poseOf = [&](const DrawItem& it) -> const float* {
@@ -1351,6 +1355,23 @@ extern "C" void SoH3D_GL_RenderPass(void) {
             return pose;
         };
 
+        // (0) Dynamic sun-shadow map (own offscreen render pass, from the light's POV). Only lit
+        // casters by default (gSoH3dShadowCastAll). Skipped internally if shadows off / no focus.
+        bool shadowsOn = false;
+        float lightVP[16];
+        if (SoH3D_Vk_BeginShadowPass()) {
+            computeLightVP(lightVP);
+            for (const DrawItem& it : g_drawList) {
+                if (it.sky) continue;
+                if (!gSoH3dShadowCastAll && !it.lit) continue;
+                float depthMP[16];
+                mat4Mul(depthMP, lightVP, it.mv); // model -> light-clip = lightVP * (model -> world)
+                SoH3D_Vk_ShadowCasterDraw(it.modelId, depthMP, it.mv, poseOf(it), it.boneCount, it.midMask);
+            }
+            SoH3D_Vk_EndShadowPass();
+            shadowsOn = true;
+        }
+
         // (1) AO depth pre-pass (own offscreen render pass): SoH3D content depth only. Skipped
         // internally when AO is off / unavailable (BeginDepthPrepass returns 0).
         if (SoH3D_Vk_BeginDepthPrepass()) {
@@ -1362,8 +1383,10 @@ extern "C" void SoH3D_GL_RenderPass(void) {
             SoH3D_Vk_EndDepthPrepass();
         }
 
-        // (2) main FB pass: visible model draws, then (3) the SSAO composite inside the same pass.
+        // (2) main FB pass: visible model draws (sampling the shadow map per SetShadow), then (3)
+        // the SSAO composite inside the same pass.
         SoH3D_Vk_BeginPass();
+        SoH3D_Vk_SetShadow(shadowsOn ? 1 : 0, lightVP);
         for (const DrawItem& it : g_drawList) {
             SoH3D_Vk_DrawModel(it.modelId, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.a, it.aspectAdj,
                                poseOf(it), it.boneCount, it.midMask, it.sky, it.uvOffU, it.uvOffV);

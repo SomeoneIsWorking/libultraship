@@ -49,6 +49,19 @@ void SoH3D_Vk_DepthPrepassDraw(int modelId, const float* mp16, const float* mv16
 void SoH3D_Vk_EndDepthPrepass(void);
 void SoH3D_Vk_AoComposite(void);
 
+// --- Dynamic sun-shadows (the Vulkan counterpart of soh3d_gl.cpp's renderShadowMap/shadowLit) ---
+// The shadow map is rendered from the light's POV in its OWN offscreen render pass (before the AO
+// pre-pass / main pass); the visible model draws then PCF-sample it. The dispatcher drives:
+//   if (BeginShadowPass()) { for each lit non-sky caster ShadowCasterDraw(lightVP*mv,...);
+//                            EndShadowPass(); SetShadow(1, lightVP); }
+//   ... AO pre-pass ... BeginPass(); DrawModel(...) (samples the shadow map per SetShadow); ...
+// BeginShadowPass returns 0 (skip shadows) when off / no focus / unavailable.
+int SoH3D_Vk_BeginShadowPass(void);
+void SoH3D_Vk_ShadowCasterDraw(int modelId, const float* mp16, const float* mv16, const float* boneData,
+                               int boneCnt, unsigned long long midMask);
+void SoH3D_Vk_EndShadowPass(void);
+void SoH3D_Vk_SetShadow(int on, const float* lightVP16);
+
 // Mirror of SoH3D_GL_RequestEvictRange for the Vulkan model store (the GL request forwards here):
 // drop cached uploads with id in [lo,hi) at the next BeginPass so they re-upload at the new size.
 void SoH3D_Vk_RequestEvictRange(int lo, int hi);
