@@ -13,11 +13,13 @@
 
 #ifdef __APPLE__
 #include <SDL_hints.h>
+#include <SDL_keyboard.h>
 #include <SDL_video.h>
 #include <imgui_impl_metal.h>
 #include <imgui_impl_sdl2.h>
 #else
 #include <SDL2/SDL_hints.h>
+#include <SDL2/SDL_keyboard.h>
 #include <SDL2/SDL_video.h>
 #endif
 
@@ -301,6 +303,7 @@ void Fast3dGui::ImGuiWMNewFrame() {
         case WindowBackend::FAST3D_SDL_VULKAN:
 #endif
             ImGui_ImplSDL2_NewFrame();
+            UpdateSdlTextInput();
             break;
 #ifdef ENABLE_DX11
         case WindowBackend::FAST3D_DXGI_DX11:
@@ -310,6 +313,28 @@ void Fast3dGui::ImGuiWMNewFrame() {
         default:
             break;
     }
+}
+
+void Fast3dGui::UpdateSdlTextInput() {
+    // SohRmlUi::Init clears SDL's startup default-on text input so the IME doesn't eat gameplay
+    // keys (held S -> ś š ş ß §, swallowed before the game reads it). But ImGui 1.91.9b's SDL2
+    // backend never (re)enables SDL text input on its own (it dropped that in 2023, see the backend
+    // changelog), so an ImGui InputText would get no SDL_TEXTINPUT characters once it's off. Mirror
+    // ImGui's intent here: text input ON iff an ImGui text widget wants it. While the RmlUi menu is
+    // up it owns text input itself (RmlUi_Platform_SDL Start/Stop on field focus), so defer to it.
+    if (mRml && mRml->IsVisible()) {
+        return;
+    }
+    const bool want = ImGui::GetIO().WantTextInput;
+    if (want == mTextInputActive) {
+        return;
+    }
+    if (want) {
+        SDL_StartTextInput();
+    } else {
+        SDL_StopTextInput();
+    }
+    mTextInputActive = want;
 }
 
 void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {

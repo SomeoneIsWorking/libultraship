@@ -186,7 +186,17 @@ class Fast3dGui : public Ship::Gui {
     GuiWindowInitData mImpl;                 ///< Backend-specific window/context handles passed to Init().
     std::unique_ptr<Ship::SohRmlUi> mRml;    ///< RmlUi menu runtime (OpenGL backend only).
 
+    /// Tracks whether SDL text input is currently enabled, so UpdateSdlTextInput() only toggles on
+    /// change. Init'd false to match SohRmlUi::Init having cleared SDL's startup default-on state.
+    bool mTextInputActive = false;
+
   private:
+    /** @brief Syncs SDL text input to whether an ImGui text widget wants keyboard text, so the
+     *         IME stays off during gameplay yet ImGui InputText fields still get characters.
+     *         Complements SohRmlUi::Init clearing SDL's startup default-on; defers to RmlUi while
+     *         its menu is open. See mTextInputActive. */
+    void UpdateSdlTextInput();
+
     /** @brief Applies any pending resolution or MSAA changes to the render target. */
     void ApplyResolutionChanges();
 
