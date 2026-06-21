@@ -138,6 +138,12 @@ class GfxRenderingAPIVulkan : public GfxRenderingAPI {
     // dynamic state it needs to record interleaved draws. Returns false if no drawable target.
     bool BeginSoH3DPass(SoH3DVkContext& out);
 
+    // Like BeginSoH3DPass but does NOT open the FB render pass (it ends any open one). Used by the
+    // SoH3D AO/shadow offscreen passes, which must record their OWN render pass into the same
+    // command buffer (render passes cannot nest). After the offscreen pass, BeginSoH3DPass reopens
+    // the FB pass for the visible draws + composite.
+    bool BeginSoH3DOffscreen(SoH3DVkContext& out);
+
     const char* GetName() override;
     int GetMaxTextureSize() override;
     GfxClipParameters GetClipParameters() override;

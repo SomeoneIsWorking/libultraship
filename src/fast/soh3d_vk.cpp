@@ -41,6 +41,13 @@ extern "C" int gSoH3dLightEnable;
 // env SOH3D_FACECULL (default ON). gSoH3dFaceCullFlip flips the front-face winding convention.
 extern "C" int gSoH3dFaceCull;
 extern "C" int gSoH3dFaceCullFlip;
+// Screen-space AO tunables, owned by the GL pass (soh3d_gl.cpp) and driven by the REPL `ao*` /
+// RmlUi Graphics menu. Mirror the GL backend so the toggle works under Vulkan too (#72).
+extern "C" int gSoH3dAoEnable;     // -1 uninit (resolved by the GL dispatcher), 0 off, 1 on
+extern "C" float gSoH3dAoRadius;   // SSAO sample radius in PIXELS
+extern "C" float gSoH3dAoStrength; // how dark fully-occluded fragments get (0..1)
+extern "C" float gSoH3dAoBias;     // min depth delta to count an occluder
+extern "C" float gSoH3dAoMaxDiff;  // depth delta beyond which a neighbour is a silhouette, not a crease
 static int vkFaceCullOn() {
     if (gSoH3dFaceCull < 0) {
         const char* e = getenv("SOH3D_FACECULL");
@@ -48,6 +55,10 @@ static int vkFaceCullOn() {
     }
     return gSoH3dFaceCull;
 }
+
+// Deferred model-cache eviction, defined at file scope below; forward-declared so the in-namespace
+// startFrameOnce() can call it.
+static void applyPendingEvict();
 
 namespace {
 
@@ -224,7 +235,90 @@ VkSampler g_dummySampler = VK_NULL_HANDLE;
 VkDeviceSize g_uboStride = 0;
 std::vector<Ring> g_rings; // per frame-in-flight
 
-constexpr uint32_t kMaxGroupsPerFrame = 4096;
+// Reset the per-frame UBO ring + descriptor pool exactly once per RenderPass cycle. The AO depth
+// pre-pass and the main pass both record draws into the same ring; whichever begins first does the
+// reset (guarded by this flag), so the prepass's UBO writes are not wiped by the main BeginPass.
+bool g_frameStarted = false;
+
+constexpr uint32_t kMaxGroupsPerFrame = 8192; // doubled headroom: AO records a 2nd depth pass of groups
+
+// ---- Screen-space AO (mirror of soh3d_gl.cpp aoPass) ----
+// Private depth render pass (depth-only): re-renders the SoH3D content's depth with the SAME camera
+// transforms as the visible draw, into a private depth image. A full-screen SSAO triangle then
+// samples it inside the main pass and MULTIPLY-blends onto the scene colour. Empty/far texels read
+// 1.0 (untouched), so only OoT3D pixels are darkened. See the GL backend for the algorithm rationale.
+VkRenderPass g_aoDepthRP = VK_NULL_HANDLE;        // single depth attachment, CLEAR -> READ_ONLY
+VkShaderModule g_aoDepthFs = VK_NULL_HANDLE;      // depth-only frag (alpha-test discard only)
+std::map<uint32_t, VkPipeline> g_aoDepthPipes;    // key: (doCull<<1)|frontCW
+VkShaderModule g_aoCompVs = VK_NULL_HANDLE, g_aoCompFs = VK_NULL_HANDLE;
+VkDescriptorSetLayout g_aoCompSetLayout = VK_NULL_HANDLE;
+VkPipelineLayout g_aoCompPipeLayout = VK_NULL_HANDLE;
+VkPipeline g_aoCompPipe = VK_NULL_HANDLE;
+VkDescriptorPool g_aoCompPool = VK_NULL_HANDLE;
+VkDescriptorSet g_aoCompSet = VK_NULL_HANDLE;
+VkSampler g_aoDepthSampler = VK_NULL_HANDLE;
+// Private depth image (sized to cover the viewport extent, incl. any offset).
+VkImage g_aoDepthImg = VK_NULL_HANDLE;
+VkDeviceMemory g_aoDepthMem = VK_NULL_HANDLE;
+VkImageView g_aoDepthView = VK_NULL_HANDLE;
+VkFramebuffer g_aoDepthFb = VK_NULL_HANDLE;
+uint32_t g_aoW = 0, g_aoH = 0;
+bool g_aoResReady = false, g_aoResFailed = false;
+bool g_aoPrepassActive = false;
+constexpr VkFormat kAoDepthFormat = VK_FORMAT_D32_SFLOAT;
+
+// Depth-only fragment shader: only alpha-test discard (no colour attachment in the depth RP). The
+// vertex shader (kVert, reused) computes gl_Position identically to the visible draw -> pixel-aligned.
+const char* kAoDepthFrag = R"(#version 450
+layout(location=0) in vec2 vUv;
+layout(binding=0, std140) uniform UBO {
+    mat4 uMP; mat4 uMV; mat4 uBones[32];
+    vec4 uLightDir; vec4 uParams; vec4 uTintSkin; vec4 uExtra;
+} ubo;
+layout(binding=1) uniform sampler2D uTex;
+void main() {
+    if (texture(uTex, vUv).a < ubo.uParams.z) discard;
+}
+)";
+
+const char* kAoCompVert = R"(#version 450
+void main() {
+    vec2 p = vec2((gl_VertexIndex == 2) ? 3.0 : -1.0, (gl_VertexIndex == 1) ? 3.0 : -1.0);
+    gl_Position = vec4(p, 0.0, 1.0);
+}
+)";
+
+// SSAO composite: golden-angle spiral over the private depth, multiply-darken creases (range check
+// rejects silhouette edges). Identical math to soh3d_gl.cpp kAoFrag; params via push constants.
+const char* kAoCompFrag = R"(#version 450
+layout(location=0) out vec4 frag;
+layout(binding=0) uniform sampler2D uAoDepth;
+layout(push_constant) uniform PC {
+    vec2 uTexel; float uRadius; float uStrength; float uBias; float uMaxDiff;
+} pc;
+void main() {
+    vec2 uv = gl_FragCoord.xy * pc.uTexel;
+    float d0 = texture(uAoDepth, uv).r;
+    if (d0 >= 0.99999) { frag = vec4(1.0); return; } // no SoH3D content here -> no AO
+    float occ = 0.0;
+    for (int i = 0; i < 12; i++) {
+        float a = float(i) * 2.3998277;            // golden-angle spiral
+        float r = pc.uRadius * (float(i) + 0.5) / 12.0;
+        vec2 off = vec2(cos(a), sin(a)) * r * pc.uTexel;
+        float di = texture(uAoDepth, uv + off).r;
+        float diff = d0 - di;                       // >0 => neighbour closer to camera
+        if (diff > pc.uBias)
+            occ += clamp(1.0 - (diff - pc.uBias) / pc.uMaxDiff, 0.0, 1.0);
+    }
+    float ao = 1.0 - pc.uStrength * (occ / 12.0);
+    frag = vec4(vec3(ao), 1.0);
+}
+)";
+
+struct AoPush {
+    float texel[2];
+    float radius, strength, bias, maxDiff;
+};
 
 uint32_t findMemType(uint32_t bits, VkMemoryPropertyFlags want) {
     VkPhysicalDeviceMemoryProperties mp;
@@ -683,6 +777,378 @@ VkModel* ensureUploaded(int modelId) {
     return &m;
 }
 
+// Fill the model vertex-input state (6 attrs) into the supplied structs. Shared by the model and
+// AO-depth pipelines (same vertex layout).
+void fillVertexInput(VkPipelineVertexInputStateCreateInfo& vin, VkVertexInputBindingDescription& binding,
+                     VkVertexInputAttributeDescription attrs[6]) {
+    binding = {};
+    binding.binding = 0;
+    binding.stride = sizeof(SoH3DGlVtx);
+    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    attrs[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, (uint32_t)offsetof(SoH3DGlVtx, pos) };
+    attrs[1] = { 1, 0, VK_FORMAT_R32G32B32_SFLOAT, (uint32_t)offsetof(SoH3DGlVtx, nrm) };
+    attrs[2] = { 2, 0, VK_FORMAT_R32G32_SFLOAT, (uint32_t)offsetof(SoH3DGlVtx, uv) };
+    attrs[3] = { 3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, (uint32_t)offsetof(SoH3DGlVtx, boneIds) };
+    attrs[4] = { 4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, (uint32_t)offsetof(SoH3DGlVtx, weights) };
+    attrs[5] = { 5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, (uint32_t)offsetof(SoH3DGlVtx, color) };
+    vin = {};
+    vin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vin.vertexBindingDescriptionCount = 1;
+    vin.pVertexBindingDescriptions = &binding;
+    vin.vertexAttributeDescriptionCount = 6;
+    vin.pVertexAttributeDescriptions = attrs;
+}
+
+// One-time AO pipelines/shaders/render-pass/sampler (size-independent). The per-frame depth image
+// is built/resized separately by ensureAoDepth.
+bool ensureAoResources() {
+    if (g_aoResReady)
+        return true;
+    if (g_aoResFailed)
+        return false;
+
+    // --- Depth-only render pass: clear -> store, finalLayout readable in a later fragment shader. ---
+    VkAttachmentDescription da{};
+    da.format = kAoDepthFormat;
+    da.samples = VK_SAMPLE_COUNT_1_BIT;
+    da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    da.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    da.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    da.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    da.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    VkAttachmentReference dref{};
+    dref.attachment = 0;
+    dref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.pDepthStencilAttachment = &dref;
+    VkSubpassDependency deps[2]{};
+    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass = 0;
+    deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    deps[0].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    deps[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    deps[1].srcSubpass = 0;
+    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    VkRenderPassCreateInfo rpci{};
+    rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpci.attachmentCount = 1;
+    rpci.pAttachments = &da;
+    rpci.subpassCount = 1;
+    rpci.pSubpasses = &sub;
+    rpci.dependencyCount = 2;
+    rpci.pDependencies = deps;
+    if (vkCreateRenderPass(g_device, &rpci, nullptr, &g_aoDepthRP) != VK_SUCCESS) {
+        g_aoResFailed = true;
+        return false;
+    }
+
+    // --- Shaders ---
+    std::vector<uint32_t> dfs, cvs, cfs;
+    if (!CompileGlsl(EShLangFragment, kAoDepthFrag, dfs) || !CompileGlsl(EShLangVertex, kAoCompVert, cvs) ||
+        !CompileGlsl(EShLangFragment, kAoCompFrag, cfs)) {
+        g_aoResFailed = true;
+        return false;
+    }
+    g_aoDepthFs = makeModule(dfs);
+    g_aoCompVs = makeModule(cvs);
+    g_aoCompFs = makeModule(cfs);
+
+    // --- Composite descriptor set layout (one combined image sampler) + push-constant layout. ---
+    VkDescriptorSetLayoutBinding cb{};
+    cb.binding = 0;
+    cb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    cb.descriptorCount = 1;
+    cb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo cli{};
+    cli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    cli.bindingCount = 1;
+    cli.pBindings = &cb;
+    vkCreateDescriptorSetLayout(g_device, &cli, nullptr, &g_aoCompSetLayout);
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr.offset = 0;
+    pcr.size = sizeof(AoPush);
+    VkPipelineLayoutCreateInfo pli{};
+    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &g_aoCompSetLayout;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pcr;
+    vkCreatePipelineLayout(g_device, &pli, nullptr, &g_aoCompPipeLayout);
+
+    VkDescriptorPoolSize ps{};
+    ps.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    ps.descriptorCount = 1;
+    VkDescriptorPoolCreateInfo dpi{};
+    dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpi.maxSets = 1;
+    dpi.poolSizeCount = 1;
+    dpi.pPoolSizes = &ps;
+    vkCreateDescriptorPool(g_device, &dpi, nullptr, &g_aoCompPool);
+
+    // --- Composite pipeline (full-screen triangle, no vertex input, multiply blend). ---
+    VkPipelineShaderStageCreateInfo cst[2]{};
+    cst[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cst[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    cst[0].module = g_aoCompVs;
+    cst[0].pName = "main";
+    cst[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cst[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    cst[1].module = g_aoCompFs;
+    cst[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo cvin{};
+    cvin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    VkPipelineInputAssemblyStateCreateInfo cia{};
+    cia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    cia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo cvp{};
+    cvp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    cvp.viewportCount = 1;
+    cvp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo crs{};
+    crs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    crs.polygonMode = VK_POLYGON_MODE_FILL;
+    crs.cullMode = VK_CULL_MODE_NONE;
+    crs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    crs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo cms{};
+    cms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    cms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo cds{};
+    cds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    cds.depthTestEnable = VK_FALSE;
+    cds.depthWriteEnable = VK_FALSE;
+    cds.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+    VkPipelineColorBlendAttachmentState ccba{};
+    ccba.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    ccba.blendEnable = VK_TRUE;
+    // Multiply: scene *= ao. Matches the GL glBlendFunc(GL_ZERO, GL_SRC_COLOR): dst' = src*0 + dst*src.
+    ccba.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+    ccba.dstColorBlendFactor = VK_BLEND_FACTOR_SRC_COLOR;
+    ccba.colorBlendOp = VK_BLEND_OP_ADD;
+    ccba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    ccba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    ccba.alphaBlendOp = VK_BLEND_OP_ADD;
+    VkPipelineColorBlendStateCreateInfo ccb{};
+    ccb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    ccb.attachmentCount = 1;
+    ccb.pAttachments = &ccba;
+    VkDynamicState cdyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo cdynS{};
+    cdynS.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    cdynS.dynamicStateCount = 2;
+    cdynS.pDynamicStates = cdyn;
+    VkGraphicsPipelineCreateInfo cpci{};
+    cpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    cpci.stageCount = 2;
+    cpci.pStages = cst;
+    cpci.pVertexInputState = &cvin;
+    cpci.pInputAssemblyState = &cia;
+    cpci.pViewportState = &cvp;
+    cpci.pRasterizationState = &crs;
+    cpci.pMultisampleState = &cms;
+    cpci.pDepthStencilState = &cds;
+    cpci.pColorBlendState = &ccb;
+    cpci.pDynamicState = &cdynS;
+    cpci.layout = g_aoCompPipeLayout;
+    cpci.renderPass = g_renderPass; // the FB render pass (composite draws inside the main pass)
+    cpci.subpass = 0;
+    if (vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &cpci, nullptr, &g_aoCompPipe) != VK_SUCCESS) {
+        g_aoResFailed = true;
+        return false;
+    }
+
+    VkSamplerCreateInfo sci{};
+    sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sci.maxLod = 0.0f;
+    vkCreateSampler(g_device, &sci, nullptr, &g_aoDepthSampler);
+
+    g_aoResReady = true;
+    fprintf(stderr, "[SoH3D_VK] AO resources ready\n");
+    return true;
+}
+
+// Depth-only pipeline for the AO pre-pass, keyed on cull state (mirrors getPipeline's cull logic).
+VkPipeline getAoDepthPipeline(bool doCull, int frontCW) {
+    uint32_t key = (doCull ? 2u : 0u) | (doCull && frontCW ? 1u : 0u);
+    auto it = g_aoDepthPipes.find(key);
+    if (it != g_aoDepthPipes.end())
+        return it->second;
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = g_vsMod; // reuse the model vertex shader (same gl_Position math)
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = g_aoDepthFs;
+    stages[1].pName = "main";
+
+    VkVertexInputBindingDescription binding{};
+    VkVertexInputAttributeDescription attrs[6]{};
+    VkPipelineVertexInputStateCreateInfo vin{};
+    fillVertexInput(vin, binding, attrs);
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.depthClampEnable = VK_TRUE;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = doCull ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+    rs.frontFace = frontCW ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 0; // depth-only RP has no colour attachment
+    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dynS{};
+    dynS.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynS.dynamicStateCount = 2;
+    dynS.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo pci{};
+    pci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pci.stageCount = 2;
+    pci.pStages = stages;
+    pci.pVertexInputState = &vin;
+    pci.pInputAssemblyState = &ia;
+    pci.pViewportState = &vp;
+    pci.pRasterizationState = &rs;
+    pci.pMultisampleState = &ms;
+    pci.pDepthStencilState = &ds;
+    pci.pColorBlendState = &cb;
+    pci.pDynamicState = &dynS;
+    pci.layout = g_pipeLayout; // same UBO+sampler set layout as the model pipeline
+    pci.renderPass = g_aoDepthRP;
+    pci.subpass = 0;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &pci, nullptr, &pipe);
+    g_aoDepthPipes[key] = pipe;
+    return pipe;
+}
+
+// (Re)create the private depth image + framebuffer sized to cover the viewport extent. Points the
+// composite descriptor set at the new view. Waits for idle on resize (the old image may be in use).
+bool ensureAoDepth(uint32_t w, uint32_t h) {
+    if (w == 0 || h == 0)
+        return false;
+    if (g_aoDepthImg != VK_NULL_HANDLE && g_aoW == w && g_aoH == h)
+        return true;
+    if (g_aoDepthImg != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(g_device);
+        vkDestroyFramebuffer(g_device, g_aoDepthFb, nullptr);
+        vkDestroyImageView(g_device, g_aoDepthView, nullptr);
+        vkDestroyImage(g_device, g_aoDepthImg, nullptr);
+        vkFreeMemory(g_device, g_aoDepthMem, nullptr);
+        g_aoDepthFb = VK_NULL_HANDLE;
+        g_aoDepthView = VK_NULL_HANDLE;
+        g_aoDepthImg = VK_NULL_HANDLE;
+        g_aoDepthMem = VK_NULL_HANDLE;
+    }
+    VkImageCreateInfo ii{};
+    ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = kAoDepthFormat;
+    ii.extent = { w, h, 1 };
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(g_device, &ii, nullptr, &g_aoDepthImg) != VK_SUCCESS)
+        return false;
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(g_device, g_aoDepthImg, &req);
+    VkMemoryAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = findMemType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    vkAllocateMemory(g_device, &ai, nullptr, &g_aoDepthMem);
+    vkBindImageMemory(g_device, g_aoDepthImg, g_aoDepthMem, 0);
+
+    VkImageViewCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image = g_aoDepthImg;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = kAoDepthFormat;
+    vi.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+    vkCreateImageView(g_device, &vi, nullptr, &g_aoDepthView);
+
+    VkFramebufferCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fci.renderPass = g_aoDepthRP;
+    fci.attachmentCount = 1;
+    fci.pAttachments = &g_aoDepthView;
+    fci.width = w;
+    fci.height = h;
+    fci.layers = 1;
+    vkCreateFramebuffer(g_device, &fci, nullptr, &g_aoDepthFb);
+
+    if (g_aoCompSet == VK_NULL_HANDLE) {
+        VkDescriptorSetAllocateInfo dai{};
+        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dai.descriptorPool = g_aoCompPool;
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &g_aoCompSetLayout;
+        vkAllocateDescriptorSets(g_device, &dai, &g_aoCompSet);
+    }
+    VkDescriptorImageInfo dii{};
+    dii.sampler = g_aoDepthSampler;
+    dii.imageView = g_aoDepthView;
+    dii.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet wr{};
+    wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wr.dstSet = g_aoCompSet;
+    wr.dstBinding = 0;
+    wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wr.descriptorCount = 1;
+    wr.pImageInfo = &dii;
+    vkUpdateDescriptorSets(g_device, 1, &wr, 0, nullptr);
+
+    g_aoW = w;
+    g_aoH = h;
+    fprintf(stderr, "[SoH3D_VK] AO depth %ux%u ready\n", w, h);
+    return true;
+}
+
+// Reset the per-frame UBO ring + descriptor pool once per RenderPass cycle (see g_frameStarted).
+void startFrameOnce() {
+    if (g_frameStarted)
+        return;
+    applyPendingEvict(); // drop any models flagged for reload before any draw records this frame
+    Ring& r = g_rings[g_ctx.frameIndex];
+    r.offset = 0;
+    vkResetDescriptorPool(g_device, r.pool, 0);
+    g_frameStarted = true;
+}
+
 } // namespace
 
 extern "C" int SoH3D_Vk_Active(void) {
@@ -732,13 +1198,12 @@ extern "C" void SoH3D_Vk_BeginPass(void) {
         return;
     if (!ensureResources(g_ctx))
         return;
-    applyPendingEvict(); // drop any models flagged for reload (e.g. stair size changed) before drawing
     g_ctxValid = true;
-    // Reset this frame-in-flight's UBO ring + descriptor pool (the backend's in-flight fence,
-    // waited at StartFrame, guarantees the previous use of this index has completed).
-    Ring& r = g_rings[g_ctx.frameIndex];
-    r.offset = 0;
-    vkResetDescriptorPool(g_device, r.pool, 0);
+    // Reset this frame-in-flight's UBO ring + descriptor pool exactly once per cycle (the AO depth
+    // pre-pass may have begun the frame already; startFrameOnce guards against a double reset that
+    // would wipe the prepass's UBO writes). The backend's in-flight fence (waited at StartFrame)
+    // guarantees the previous use of this index has completed.
+    startFrameOnce();
 }
 
 extern "C" void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* mv16, int lit, int invertY,
@@ -883,6 +1348,179 @@ extern "C" void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* 
 
 extern "C" void SoH3D_Vk_EndPass(void) {
     g_ctxValid = false;
+    g_frameStarted = false; // next RenderPass cycle resets the ring afresh
+    g_aoPrepassActive = false;
+}
+
+// --- AO offscreen pre-pass + composite -----------------------------------------------------------
+
+// Begin the private depth render pass (clear to far). Returns 0 if AO is off / unavailable, in which
+// case the caller skips the prepass draws + composite. Ends the FB pass (offscreen pass can't nest).
+extern "C" int SoH3D_Vk_BeginDepthPrepass(void) {
+    g_aoPrepassActive = false;
+    if (!gSoH3dAoEnable || !Fast::g_activeVulkanApi)
+        return 0;
+    if (!Fast::g_activeVulkanApi->BeginSoH3DOffscreen(g_ctx))
+        return 0;
+    if (!ensureResources(g_ctx) || !ensureAoResources())
+        return 0;
+    startFrameOnce(); // the prepass records the first draws this cycle -> own the ring reset
+    // Size the private depth image to cover the viewport extent (incl. any offset), so the
+    // composite's gl_FragCoord indexes it directly.
+    uint32_t w = (uint32_t)(g_ctx.viewport.x + g_ctx.viewport.width);
+    uint32_t h = (uint32_t)(g_ctx.viewport.y + g_ctx.viewport.height);
+    if (!ensureAoDepth(w, h))
+        return 0;
+
+    VkClearValue clr{};
+    clr.depthStencil = { 1.0f, 0 };
+    VkRenderPassBeginInfo rp{};
+    rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rp.renderPass = g_aoDepthRP;
+    rp.framebuffer = g_aoDepthFb;
+    rp.renderArea.offset = { 0, 0 };
+    rp.renderArea.extent = { g_aoW, g_aoH };
+    rp.clearValueCount = 1;
+    rp.pClearValues = &clr;
+    vkCmdBeginRenderPass(g_ctx.cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdSetViewport(g_ctx.cmd, 0, 1, &g_ctx.viewport);
+    vkCmdSetScissor(g_ctx.cmd, 0, 1, &g_ctx.scissor);
+    g_aoPrepassActive = true;
+    return 1;
+}
+
+extern "C" void SoH3D_Vk_DepthPrepassDraw(int modelId, const float* mp16, const float* mv16, int invertY,
+                                          float aspectAdj, const float* boneData, int boneCnt,
+                                          unsigned long long midMask, int sky) {
+    if (!g_aoPrepassActive || sky) // sky goes to the far plane -> reads 1.0 -> no AO; just skip it
+        return;
+    VkModel* m = ensureUploaded(modelId);
+    if (!m)
+        return;
+    Ring& ring = g_rings[g_ctx.frameIndex];
+    VkCommandBuffer cmd = g_ctx.cmd;
+
+    // Base UBO: same transforms/skin as the visible draw (lighting irrelevant for depth).
+    VkUbo base{};
+    memcpy(base.uMP, mp16, sizeof(base.uMP));
+    base.uMP[0] *= aspectAdj;
+    base.uMP[4] *= aspectAdj;
+    base.uMP[8] *= aspectAdj;
+    base.uMP[12] *= aspectAdj;
+    memcpy(base.uMV, mv16 ? mv16 : mp16, sizeof(base.uMV));
+    for (int k = 0; k < 32; k++)
+        for (int e = 0; e < 16; e++)
+            base.uBones[k * 16 + e] = (e % 5 == 0) ? 1.0f : 0.0f;
+    if (boneData && boneCnt > 0) {
+        int nb = boneCnt < 32 ? boneCnt : 32;
+        for (int k = 0; k < nb; k++) {
+            const float* s = boneData + k * 16;
+            float* d = base.uBones + k * 16;
+            for (int r = 0; r < 4; r++)
+                for (int col = 0; col < 4; col++)
+                    d[col * 4 + r] = s[r * 4 + col];
+        }
+    }
+    base.uParams[0] = invertY ? -1.0f : 1.0f;
+    base.uParams[1] = 0.0f; // unused (no lighting in depth)
+    base.uTintSkin[3] = (boneData && boneCnt > 0) ? 1.0f : 0.0f;
+    base.uLightDir[3] = 0.0f; // not sky (sky was skipped above)
+
+    int frontCW = (invertY != 0) ^ (gSoH3dFaceCullFlip != 0);
+    bool vboBound = false;
+    for (const VkGroup& grp : m->groups) {
+        if (grp.cull)
+            continue;
+        if (grp.meshId >= 0 && grp.meshId < 64 && !((midMask >> grp.meshId) & 1ull))
+            continue;
+        if (ring.offset + g_uboStride > ring.capacity)
+            return;
+
+        VkUbo ubo = base;
+        ubo.uParams[2] = grp.alphaTest ? grp.alphaRef : 0.0f; // alpha-test cutout depth
+        ubo.uParams[3] = 0.0f;
+        const VkDeviceSize uboOff = ring.offset;
+        memcpy((uint8_t*)ring.mapped + uboOff, &ubo, sizeof(ubo));
+        ring.offset += g_uboStride;
+
+        VkDescriptorSetAllocateInfo dai{};
+        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dai.descriptorPool = ring.pool;
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &g_setLayout;
+        VkDescriptorSet set;
+        if (vkAllocateDescriptorSets(g_device, &dai, &set) != VK_SUCCESS)
+            return;
+        VkDescriptorBufferInfo bi{};
+        bi.buffer = ring.ubo;
+        bi.offset = uboOff;
+        bi.range = sizeof(VkUbo);
+        VkImageView view = g_dummyTex.view;
+        VkSampler samp = g_dummySampler;
+        if (grp.texIndex >= 0 && grp.texIndex < (int)m->textures.size()) {
+            view = m->textures[grp.texIndex].view;
+            samp = getSampler(grp.wrapS, grp.wrapT);
+        }
+        VkDescriptorImageInfo ii{};
+        ii.sampler = samp;
+        ii.imageView = view;
+        ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet w[2]{};
+        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[0].dstSet = set;
+        w[0].dstBinding = 0;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        w[0].descriptorCount = 1;
+        w[0].pBufferInfo = &bi;
+        w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[1].dstSet = set;
+        w[1].dstBinding = 1;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[1].descriptorCount = 1;
+        w[1].pImageInfo = &ii;
+        vkUpdateDescriptorSets(g_device, 2, w, 0, nullptr);
+
+        bool doCull = grp.faceCull && vkFaceCullOn();
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, getAoDepthPipeline(doCull, frontCW));
+        vkCmdSetViewport(cmd, 0, 1, &g_ctx.viewport);
+        vkCmdSetScissor(cmd, 0, 1, &g_ctx.scissor);
+        if (!vboBound) {
+            VkDeviceSize zero = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &m->vbo, &zero);
+            vboBound = true;
+        }
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeLayout, 0, 1, &set, 0, nullptr);
+        vkCmdDraw(cmd, grp.count, 1, grp.first, 0);
+    }
+}
+
+extern "C" void SoH3D_Vk_EndDepthPrepass(void) {
+    if (!g_aoPrepassActive)
+        return;
+    vkCmdEndRenderPass(g_ctx.cmd); // depth image now in DEPTH_STENCIL_READ_ONLY_OPTIMAL
+    g_aoPrepassActive = false;
+}
+
+// Full-screen SSAO multiply onto the scene colour, recorded INSIDE the main FB pass (after the
+// visible model draws). Sampled from the private depth written by the prepass.
+extern "C" void SoH3D_Vk_AoComposite(void) {
+    if (!g_ctxValid || !gSoH3dAoEnable || !g_aoResReady || g_aoCompSet == VK_NULL_HANDLE || g_aoW == 0)
+        return;
+    VkCommandBuffer cmd = g_ctx.cmd;
+    AoPush pc{};
+    pc.texel[0] = 1.0f / (float)g_aoW;
+    pc.texel[1] = 1.0f / (float)g_aoH;
+    pc.radius = gSoH3dAoRadius;
+    pc.strength = gSoH3dAoStrength;
+    pc.bias = gSoH3dAoBias;
+    pc.maxDiff = gSoH3dAoMaxDiff;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_aoCompPipe);
+    vkCmdSetViewport(cmd, 0, 1, &g_ctx.viewport);
+    vkCmdSetScissor(cmd, 0, 1, &g_ctx.scissor);
+    vkCmdPushConstants(cmd, g_aoCompPipeLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_aoCompPipeLayout, 0, 1, &g_aoCompSet, 0,
+                            nullptr);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
 }
 
 #endif // ENABLE_VULKAN

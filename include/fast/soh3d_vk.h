@@ -8,9 +8,9 @@
 // render pass (GfxRenderingAPIVulkan::BeginSoH3DPass), so the OoT3D content interleaves
 // depth-correctly with the N64 geometry.
 //
-// NOTE: shadows + screen-space AO (the GL pass's extra offscreen passes) are not ported here yet;
-// this renders the core textured / skinned / half-Lambert-lit content. Those enhancements are a
-// follow-up. Build-structure NOTE: the C-ABI entry points currently live in soh3d_gl.cpp (compiled
+// NOTE: screen-space AO IS ported here (an offscreen depth pre-pass + an in-pass SSAO composite,
+// see SoH3D_Vk_BeginDepthPrepass/AoComposite). Dynamic sun-shadows (the GL pass's other offscreen
+// pass) are still GL-only — a follow-up. Build-structure NOTE: the C-ABI entry points currently live in soh3d_gl.cpp (compiled
 // only with ENABLE_OPENGL); a no-GL build (macOS) will need that bookkeeping extracted to a shared
 // TU. See the dispatch block in soh3d_gl.cpp.
 #pragma once
@@ -35,6 +35,19 @@ void SoH3D_Vk_DrawModel(int modelId, const float* mp16, const float* mv16, int l
                         const float* boneData, int boneCnt, unsigned long long midMask, int sky,
                         float uvOffU, float uvOffV);
 void SoH3D_Vk_EndPass(void);
+
+// --- Screen-space ambient occlusion (the Vulkan counterpart of soh3d_gl.cpp's aoPass) ---
+// A render pass cannot be nested inside the main FB pass, so AO is recorded as a SEPARATE
+// offscreen render pass BEFORE the main SoH3D draws, then composited as a full-screen multiply
+// INSIDE the main pass after them. The dispatcher (SoH3D_GL_RenderPass) drives this sequence:
+//   if (BeginDepthPrepass()) { for each non-sky item DepthPrepassDraw(...); EndDepthPrepass(); }
+//   BeginPass(); for each item DrawModel(...); AoComposite(); EndPass();
+// BeginDepthPrepass returns 0 (skip the AO passes) when AO is off or resources are unavailable.
+int SoH3D_Vk_BeginDepthPrepass(void);
+void SoH3D_Vk_DepthPrepassDraw(int modelId, const float* mp16, const float* mv16, int invertY, float aspectAdj,
+                               const float* boneData, int boneCnt, unsigned long long midMask, int sky);
+void SoH3D_Vk_EndDepthPrepass(void);
+void SoH3D_Vk_AoComposite(void);
 
 // Mirror of SoH3D_GL_RequestEvictRange for the Vulkan model store (the GL request forwards here):
 // drop cached uploads with id in [lo,hi) at the next BeginPass so they re-upload at the new size.

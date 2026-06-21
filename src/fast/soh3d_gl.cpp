@@ -1326,23 +1326,49 @@ extern "C" void SoH3D_GL_RenderPass(void) {
 
 #ifdef ENABLE_VULKAN
     // Vulkan backend active: dispatch the GPU submission to soh3d_vk.cpp. The per-item pose
-    // interpolation is identical to the GL path below (shadows/AO are not yet ported there).
+    // interpolation is identical to the GL path below. Screen-space AO is ported (offscreen depth
+    // pre-pass + SSAO composite); dynamic shadows are still GL-only.
     if (SoH3D_Vk_Active()) {
-        SoH3D_Vk_BeginPass();
         std::vector<float> lerped;
         float step = gSoH3dInterpStep;
-        for (const DrawItem& it : g_drawList) {
+        // Resolve the AO master toggle the same way the GL path does (env default, CVar override).
+        if (gSoH3dAoEnable < 0) {
+            const char* e = getenv("SOH3D_AO");
+            gSoH3dAoEnable = CVarGetInteger("gSoH3d.AO", (e && e[0] == '0') ? 0 : 1);
+        }
+        // Resolve this item's interpolated skin pose (shared by the depth pre-pass + visible draw).
+        auto poseOf = [&](const DrawItem& it) -> const float* {
             const float* pose = it.bones.empty() ? nullptr : it.bones.data();
             if (pose && step < 0.999f && !it.prevBones.empty() && it.prevBones.size() == it.bones.size()) {
                 auto mit = g_models.find(it.modelId);
-                const float* bd = (mit != g_models.end() && !mit->second.bind.empty()) ? mit->second.bind.data() : nullptr;
-                const float* bi = (mit != g_models.end() && !mit->second.binv.empty()) ? mit->second.binv.data() : nullptr;
+                const float* bd =
+                    (mit != g_models.end() && !mit->second.bind.empty()) ? mit->second.bind.data() : nullptr;
+                const float* bi =
+                    (mit != g_models.end() && !mit->second.binv.empty()) ? mit->second.binv.data() : nullptr;
                 interpSkinPose(it.prevBones.data(), it.bones.data(), bd, bi, step, it.bones.size(), lerped);
                 pose = lerped.data();
             }
-            SoH3D_Vk_DrawModel(it.modelId, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.a, it.aspectAdj,
-                               pose, it.boneCount, it.midMask, it.sky, it.uvOffU, it.uvOffV);
+            return pose;
+        };
+
+        // (1) AO depth pre-pass (own offscreen render pass): SoH3D content depth only. Skipped
+        // internally when AO is off / unavailable (BeginDepthPrepass returns 0).
+        if (SoH3D_Vk_BeginDepthPrepass()) {
+            for (const DrawItem& it : g_drawList) {
+                if (it.sky) continue;
+                SoH3D_Vk_DepthPrepassDraw(it.modelId, it.mp, it.mv, it.invertY, it.aspectAdj, poseOf(it),
+                                          it.boneCount, it.midMask, it.sky);
+            }
+            SoH3D_Vk_EndDepthPrepass();
         }
+
+        // (2) main FB pass: visible model draws, then (3) the SSAO composite inside the same pass.
+        SoH3D_Vk_BeginPass();
+        for (const DrawItem& it : g_drawList) {
+            SoH3D_Vk_DrawModel(it.modelId, it.mp, it.mv, it.lit, it.invertY, it.r, it.g, it.b, it.a, it.aspectAdj,
+                               poseOf(it), it.boneCount, it.midMask, it.sky, it.uvOffU, it.uvOffV);
+        }
+        SoH3D_Vk_AoComposite();
         SoH3D_Vk_EndPass();
         g_drawList.clear();
         return;

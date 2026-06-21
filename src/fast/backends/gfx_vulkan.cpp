@@ -2666,6 +2666,23 @@ bool GfxRenderingAPIVulkan::BeginSoH3DPass(SoH3DVkContext& out) {
     return true;
 }
 
+bool GfxRenderingAPIVulkan::BeginSoH3DOffscreen(SoH3DVkContext& out) {
+    if (!mFrameAcquired)
+        return false;
+    EndPassIfOpen(); // close the FB pass so the offscreen pass can begin its own render pass
+    out.device = mDevice;
+    out.physicalDevice = mPhysicalDevice;
+    out.graphicsQueue = mGraphicsQueue;
+    out.commandPool = mCommandPool;
+    out.cmd = mCommandBuffers[mCurrentFrame];
+    out.renderPass = mFbRenderPass;
+    out.viewport = mCurrentViewport;
+    out.scissor = mCurrentScissor;
+    out.frameIndex = mCurrentFrame;
+    out.framesInFlight = kMaxFramesInFlight;
+    return true;
+}
+
 void GfxRenderingAPIVulkan::FlushCommandsAndWait() {
     if (!mFrameAcquired)
         return;
