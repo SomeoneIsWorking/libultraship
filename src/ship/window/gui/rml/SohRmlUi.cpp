@@ -198,6 +198,15 @@ bool SohRmlUi::Init(void* sdlWindow, void* glContext, int width, int height, boo
     mSystemInterface = std::make_unique<SystemInterface_SDL>();
     mSystemInterface->SetWindow(static_cast<SDL_Window*>(sdlWindow));
 
+    // SDL starts a process with text input (IME) ENABLED by default. During gameplay no RmlUi text
+    // field is focused, so the live IME makes Wayland/KDE compositors pop an "alternative
+    // character"/accent-compose widget when a key is held (e.g. holding S shows ś š ş ß §), which
+    // swallows the keypress before the game reads it -> held movement keys appear dead. RmlUi only
+    // (re)enables text input when a text field is actually focused (ActivateKeyboard) and disables it
+    // on blur, so clearing the startup default-on state here is sufficient and keeps the invariant
+    // "text input is ON iff editing a field". Reuses DeactivateKeyboard() for the SDL2/3-correct call.
+    mSystemInterface->DeactivateKeyboard();
+
     // Interfaces must be installed before Rml::Initialise().
     Rml::SetSystemInterface(mSystemInterface.get());
     Rml::SetRenderInterface(renderInterface);
